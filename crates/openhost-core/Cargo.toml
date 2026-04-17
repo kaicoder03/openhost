@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
+curve25519-dalek = { workspace = true }
 chacha20poly1305 = { workspace = true }
 crypto_box = { workspace = true }
 hkdf = { workspace = true }
@@ -23,6 +24,7 @@ zeroize = { workspace = true }
 subtle = { workspace = true }
 zbase32 = { workspace = true }
 base64 = { workspace = true }
+hex = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true }
@@ -31,4 +33,3 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-hex = "0.4"

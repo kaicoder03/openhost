@@ -1,0 +1,52 @@
+{
+  "description": "openhost crypto test vectors. Every implementation MUST pass all of these to claim v1 conformance.",
+  "version": "openhost1",
+  "encoding_notes": [
+    "All byte strings are hex-encoded.",
+    "Sealed-box outputs are non-deterministic (ephemeral sender keypair is random); conformance tests verify roundtrip rather than specific ciphertext bytes.",
+    "Allowlist HMAC takes the first 16 bytes of the 32-byte HMAC-SHA256 output.",
+    "auth_bytes is HKDF-SHA256 with salt 'openhost-auth-v1' and info 'openhost-auth-v1', over a 32-byte TLS exporter secret, producing 32 bytes."
+  ],
+  "allowlist_hmac": [
+    {
+      "name": "empty_salt_all_zero_pubkey",
+      "salt_hex": "",
+      "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash_hex": "33ad0a1c607ec03b09e6cd9893680ce2"
+    },
+    {
+      "name": "ascii_salt_all_0xab_pubkey",
+      "salt_ascii": "openhost-salt-v1",
+      "pubkey_hex": "abababababababababababababababababababababababababababababababab",
+      "hash_hex": "22aaa1b670d8f19f2ea1eb07d8910062"
+    }
+  ],
+  "channel_binding": [
+    {
+      "name": "auth_bytes_from_32byte_exporter",
+      "tls_exporter_secret_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "hkdf_salt_ascii": "openhost-auth-v1",
+      "hkdf_info_ascii": "openhost-auth-v1",
+      "auth_bytes_hex": "cd16d9d228e86291e7f7b2b0e9010ac7f29bf36ccf0c63185eb6bff4ff740692"
+    }
+  ],
+  "x25519_from_ed25519": [
+    {
+      "name": "rfc8032_vector1_pair_roundtrips_sealed_box",
+      "ed25519_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "behavior": "public_key_to_x25519 applied to the RFC 8032 #1 Ed25519 public key MUST equal signing_key_to_x25519(sk).public_key() (public-key-derivation consistency). The resulting keypair MUST successfully round-trip a sealed-box plaintext of arbitrary length."
+    }
+  ],
+  "constants": {
+    "PUBLIC_KEY_LEN": 32,
+    "SIGNING_KEY_LEN": 32,
+    "XPUBLIC_KEY_LEN": 32,
+    "XSECRET_KEY_LEN": 32,
+    "ALLOWLIST_HASH_LEN": 16,
+    "AUTH_BYTES_LEN": 32,
+    "SEAL_OVERHEAD": 48,
+    "AUTH_HKDF_SALT_ASCII": "openhost-auth-v1",
+    "AUTH_HKDF_INFO_ASCII": "openhost-auth-v1",
+    "AUTH_EXPORTER_LABEL_ASCII": "EXPORTER-openhost-auth-v1"
+  }
+}

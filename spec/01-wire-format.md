@@ -47,7 +47,9 @@ A host publishes a signed DNS packet as a BEP44 mutable item on the Mainline DHT
 - The total signed packet **MUST** fit in 1000 bytes (the BEP44 limit).
 - `ts` is the publication time in seconds since the Unix epoch. Clients **MUST** reject records where `|now - ts| > 7200` (two hours).
 - `fp` is the SHA-256 fingerprint of the daemon's DTLS certificate, encoded as lowercase hex. The daemon **SHOULD** rotate this certificate daily or on restart.
-- Each `<clienthash>` is 16 bytes of HMAC-SHA256 keyed by a per-host salt (published within `@` record as `salt=<hex>`), applied to the client's public key. Unpaired observers see only the existence of ICE records, not which client they belong to.
+- Each `<clienthash>` is 16 bytes of HMAC-SHA256 keyed by a per-host salt (published within the `@` record as `salt=<hex>`), applied to the client's 32-byte Ed25519 public key. Unpaired observers see only the existence of ICE records, not which client they belong to. The 16 bytes are encoded as z-base-32 (≈26 characters) in the record name.
+- Per-client ICE candidate ciphertext is a libsodium-compatible **sealed box** (`crypto_box_seal`): anonymous X25519 ephemeral sender to the recipient client's X25519 public key, with the XSalsa20-Poly1305 AEAD. The output is `ephemeral_pk || XSalsa20-Poly1305(shared_key, nonce = Blake2b-24(ephemeral_pk || recipient_pk), plaintext)`.
+- The client's X25519 public key is derived from its Ed25519 identity via the Edwards-to-Montgomery conversion (libsodium's `crypto_sign_ed25519_pk_to_curve25519`), so clients and hosts maintain only one keypair.
 - The `_allow` record contains the same hashed client keys for the daemon's own dedupe and for clients to verify they are on the allowlist before attempting a connection.
 - `_disc` is informational; clients **MUST** try all substrates they know about regardless of the record's contents.
 

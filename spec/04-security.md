@@ -68,7 +68,7 @@ openhost uses only well-audited, standard primitives:
 | Purpose | Primitive | Crate / reference |
 |---|---|---|
 | Identity signatures | Ed25519 (RFC 8032, strict verification) | `ed25519-dalek` v2 |
-| Sealed-box encryption (per-client ICE blobs) | X25519 + XChaCha20-Poly1305 | `crypto_box` |
+| Sealed-box encryption (per-client ICE blobs) | libsodium `crypto_box_seal` (X25519 + XSalsa20-Poly1305) | `crypto_box` with `seal` feature |
 | Channel binding | HKDF-SHA256 over TLS exporter (RFC 5705) | `hkdf`, `sha2` |
 | HMAC for allowlist hashing | HMAC-SHA256 | `hmac`, `sha2` |
 | Transport encryption | DTLS 1.3 | provided by the WebRTC implementation |

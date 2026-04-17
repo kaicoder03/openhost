@@ -20,8 +20,9 @@ readme = "README.md"
 # Crypto primitives
 ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
 x25519-dalek = { version = "2", features = ["zeroize", "static_secrets"] }
+curve25519-dalek = "4"
 chacha20poly1305 = "0.10"
-crypto_box = "0.9"
+crypto_box = { version = "0.9", features = ["seal"] }
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
@@ -31,6 +32,7 @@ subtle = "2"
 # Encoding / formats
 zbase32 = "0.1"
 base64 = "0.22"
+hex = "0.4"
 
 # RNG — aligned with ed25519-dalek v2.x (rand_core 0.6)
 rand = { version = "0.8", features = ["std_rng"] }
