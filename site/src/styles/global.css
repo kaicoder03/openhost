@@ -49,10 +49,25 @@
   --color-danger-500: #ff6b6b;
 }
 
-/* Landing-page fine-tuning. Starlight's docs pages inherit its own defaults. */
+/* Landing-page fine-tuning. */
 :root {
   --landing-radius: 0.75rem;
   --landing-radius-lg: 1.25rem;
+}
+
+/* Starlight uses --sl-font for site chrome; align with our display family so
+   the "openhost" wordmark in Starlight's header matches the landing nav. */
+:root {
+  --sl-font: var(--font-sans);
+  --sl-font-system: var(--font-sans);
+}
+
+/* Brand wordmark in Starlight's header */
+.site-title,
+a.site-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 /* Reduced-motion: pause the animated SVG dashes */
