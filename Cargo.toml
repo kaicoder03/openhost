@@ -11,26 +11,43 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/kaicoder03/openhost"
 readme = "README.md"
 
 [workspace.dependencies]
-ed25519-dalek = "2"
-x25519-dalek = "2"
+# Crypto primitives
+ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
+x25519-dalek = { version = "2", features = ["zeroize", "static_secrets"] }
 chacha20poly1305 = "0.10"
+crypto_box = "0.9"
 hkdf = "0.12"
+hmac = "0.12"
 sha2 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+subtle = "2"
+
+# Encoding / formats
+zbase32 = "0.1"
+base64 = "0.22"
+
+# RNG — aligned with ed25519-dalek v2.x (rand_core 0.6)
+rand = { version = "0.8", features = ["std_rng"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Protocol integrations (used by openhost-pkarr / -daemon at M2/M3)
 pkarr = "3"
 mainline = "4"
 webrtc = "0.17"
 tokio = { version = "1", features = ["full"] }
+
+# Common utilities
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_bytes = "0.11"
 anyhow = "1"
 thiserror = "2"
-zbase32 = "0.1"
 
 [profile.release]
 lto = "thin"
