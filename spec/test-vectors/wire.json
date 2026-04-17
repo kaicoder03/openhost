@@ -1,0 +1,102 @@
+{
+  "description": "openhost wire-framing test vectors. Every implementation MUST pass all of these to claim v1 conformance.",
+  "version": "openhost1",
+  "encoding_notes": [
+    "All byte strings are hex-encoded.",
+    "The wire format is: type (1 byte) | length (4 bytes little-endian) | payload (length bytes).",
+    "Implementations MUST accept partial inputs (return 'need more bytes') and MUST reject malformed inputs (unknown type, oversized length, non-empty payload for marker types)."
+  ],
+  "constants": {
+    "FRAME_HEADER_LEN": 5,
+    "MAX_PAYLOAD_LEN": 16777215
+  },
+  "frame_types": {
+    "REQUEST_HEAD": 1,
+    "REQUEST_BODY": 2,
+    "REQUEST_END": 3,
+    "RESPONSE_HEAD": 17,
+    "RESPONSE_BODY": 18,
+    "RESPONSE_END": 19,
+    "WS_UPGRADE": 32,
+    "WS_FRAME": 33,
+    "ERROR": 240,
+    "PING": 254,
+    "PONG": 255
+  },
+  "encode_roundtrip": [
+    {
+      "name": "empty_ping",
+      "frame_type": "PING",
+      "payload_hex": "",
+      "encoded_hex": "fe00000000"
+    },
+    {
+      "name": "empty_pong",
+      "frame_type": "PONG",
+      "payload_hex": "",
+      "encoded_hex": "ff00000000"
+    },
+    {
+      "name": "empty_request_end",
+      "frame_type": "REQUEST_END",
+      "payload_hex": "",
+      "encoded_hex": "0300000000"
+    },
+    {
+      "name": "request_head_short",
+      "frame_type": "REQUEST_HEAD",
+      "payload_ascii": "GET / HTTP/1.1\r\nHost: example\r\n\r\n",
+      "payload_hex": "474554202f20485454502f312e310d0a486f73743a206578616d706c650d0a0d0a",
+      "encoded_hex": "0121000000474554202f20485454502f312e310d0a486f73743a206578616d706c650d0a0d0a"
+    },
+    {
+      "name": "response_body_255_bytes",
+      "frame_type": "RESPONSE_BODY",
+      "payload_repeat_byte": "a5",
+      "payload_length": 255,
+      "encoded_header_hex": "12ff000000"
+    },
+    {
+      "name": "error_utf8",
+      "frame_type": "ERROR",
+      "payload_ascii": "upstream-unreachable",
+      "payload_hex": "757073747265616d2d756e726561636861626c65",
+      "encoded_hex": "f014000000757073747265616d2d756e726561636861626c65"
+    }
+  ],
+  "reject": [
+    {
+      "name": "unknown_type_code",
+      "encoded_hex": "0000000000",
+      "expect": "MalformedFrame: unknown type code"
+    },
+    {
+      "name": "oversized_length",
+      "encoded_hex": "1200000001",
+      "expect": "OversizedFrame: requested length 16777216 exceeds limit 16777215"
+    },
+    {
+      "name": "ping_with_body_forbidden",
+      "encoded_hex": "fe03000000000000",
+      "expect": "MalformedFrame: frame type forbids payload but length is non-zero"
+    },
+    {
+      "name": "request_end_with_body_forbidden",
+      "encoded_hex": "0301000000ff",
+      "expect": "MalformedFrame: frame type forbids payload but length is non-zero"
+    }
+  ],
+  "partial": [
+    {
+      "name": "header_incomplete",
+      "encoded_hex": "0100",
+      "expect": "need more bytes"
+    },
+    {
+      "name": "payload_incomplete",
+      "encoded_hex": "010a00000068656c6c",
+      "expect": "need more bytes",
+      "note": "REQUEST_HEAD claims 10 payload bytes but only 4 are present"
+    }
+  ]
+}
