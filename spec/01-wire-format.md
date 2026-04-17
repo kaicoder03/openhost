@@ -15,7 +15,7 @@ Conformance language follows [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) 
 Every openhost participant — hosts and clients alike — has an Ed25519 keypair.
 
 - **Private key:** 32 bytes, generated from a system CSPRNG. Stored in the platform keychain (macOS Keychain / iOS Keychain / Linux Secret Service / Windows Credential Manager). It **MUST NOT** leave the device on which it was generated.
-- **Public key:** 32 bytes, encoded for display and URLs in [z-base-32](https://philzimmermann.com/docs/human-oriented-base-32-encoding.txt) (no padding). A 32-byte key produces a 52-character z-base-32 string.
+- **Public key:** 32 bytes, encoded for display and URLs in [z-base-32](https://philzimmermann.com/docs/human-oriented-base-32-encoding.txt) (no padding). A 256-bit key encodes to 52 z-base-32 characters (`ceil(256 / 5) = 52`).
 
 **Canonical URL form:**
 
