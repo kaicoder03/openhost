@@ -1,0 +1,12 @@
+openhost
+Copyright 2026 openhost contributors
+
+This product is dual-licensed under either:
+  - Apache License, Version 2.0 (LICENSE-APACHE)
+  - MIT License (LICENSE-MIT)
+
+at the recipient's option.
+
+Portions of this software may depend on third-party libraries whose
+licenses are listed in each crate's or package's manifest. Attribution
+notices for those dependencies are preserved in their source distributions.

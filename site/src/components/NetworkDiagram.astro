@@ -1,0 +1,231 @@
+---
+// Animated SVG network diagram.
+// Three nodes: [ Phone ] ↔ [ DHT cloud + pubkey pill ] ↔ [ Home ].
+// Dashed lines animate to suggest handshake traffic. Honors prefers-reduced-motion via CSS.
+// No JavaScript — pure SVG + SMIL animation.
+
+interface Props {
+  pubkey?: string;
+}
+
+const { pubkey = "8sxbksnfnwbzrhfsw7w7rqbt1bsafseqkk7oy83y5rdiswoofbcy" } =
+  Astro.props;
+const short = `${pubkey.slice(0, 8)}…${pubkey.slice(-6)}`;
+---
+
+<figure
+  class="relative mx-auto w-full max-w-4xl"
+  aria-label="Diagram: a phone and a home server discover each other on the BitTorrent DHT and open a direct encrypted connection."
+>
+  <svg
+    viewBox="0 0 800 280"
+    role="img"
+    xmlns="http://www.w3.org/2000/svg"
+    class="h-auto w-full"
+  >
+    <defs>
+      <linearGradient id="oh-line" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" stop-color="#7C5CFF" stop-opacity="0.2" />
+        <stop offset="50%" stop-color="#7C5CFF" stop-opacity="1" />
+        <stop offset="100%" stop-color="#3ECF8E" stop-opacity="0.2" />
+      </linearGradient>
+      <radialGradient id="oh-glow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#7C5CFF" stop-opacity="0.35" />
+        <stop offset="100%" stop-color="#7C5CFF" stop-opacity="0" />
+      </radialGradient>
+      <filter id="oh-soft" x="-20%" y="-20%" width="140%" height="140%">
+        <feGaussianBlur stdDeviation="2" />
+      </filter>
+    </defs>
+
+    <!-- Background glow behind the center pubkey pill -->
+    <circle cx="400" cy="140" r="140" fill="url(#oh-glow)" />
+
+    <!-- DHT cloud: a field of small dots behind the pill -->
+    <g fill="#34343B" opacity="0.9">
+      <circle cx="330" cy="90" r="2" />
+      <circle cx="360" cy="70" r="1.5" />
+      <circle cx="390" cy="55" r="2" />
+      <circle cx="430" cy="60" r="1.5" />
+      <circle cx="470" cy="80" r="2" />
+      <circle cx="500" cy="100" r="1.5" />
+      <circle cx="330" cy="190" r="1.5" />
+      <circle cx="370" cy="210" r="2" />
+      <circle cx="420" cy="225" r="1.5" />
+      <circle cx="470" cy="210" r="2" />
+      <circle cx="500" cy="190" r="1.5" />
+      <circle cx="300" cy="140" r="1.5" />
+      <circle cx="510" cy="140" r="2" />
+    </g>
+
+    <!-- Left: phone -->
+    <g transform="translate(40 80)">
+      <rect
+        x="0"
+        y="0"
+        width="80"
+        height="120"
+        rx="14"
+        ry="14"
+        fill="#111114"
+        stroke="#34343B"
+        stroke-width="1.5"
+      />
+      <rect x="10" y="16" width="60" height="80" rx="4" fill="#0A0A0B" />
+      <rect x="30" y="104" width="20" height="3" rx="1.5" fill="#34343B" />
+      <text
+        x="40"
+        y="150"
+        text-anchor="middle"
+        fill="#8A8A94"
+        font-family="Inter Tight Variable, system-ui, sans-serif"
+        font-size="14"
+        font-weight="500">Client</text
+      >
+    </g>
+
+    <!-- Right: home / server -->
+    <g transform="translate(680 80)">
+      <rect
+        x="0"
+        y="0"
+        width="80"
+        height="120"
+        rx="8"
+        ry="8"
+        fill="#111114"
+        stroke="#34343B"
+        stroke-width="1.5"
+      />
+      <rect x="10" y="14" width="60" height="12" rx="2" fill="#0A0A0B" />
+      <rect x="10" y="32" width="60" height="12" rx="2" fill="#0A0A0B" />
+      <rect x="10" y="50" width="60" height="12" rx="2" fill="#0A0A0B" />
+      <circle cx="18" cy="20" r="2" fill="#3ECF8E" />
+      <circle cx="18" cy="38" r="2" fill="#3ECF8E" />
+      <circle cx="18" cy="56" r="2" fill="#8A8A94" />
+      <text
+        x="40"
+        y="150"
+        text-anchor="middle"
+        fill="#8A8A94"
+        font-family="Inter Tight Variable, system-ui, sans-serif"
+        font-size="14"
+        font-weight="500">Home</text
+      >
+    </g>
+
+    <!-- Left connecting line: client ↔ DHT cloud -->
+    <line
+      x1="130"
+      y1="140"
+      x2="290"
+      y2="140"
+      stroke="url(#oh-line)"
+      stroke-width="1.5"
+      stroke-dasharray="6 8"
+      stroke-linecap="round"
+      data-openhost-anim
+    >
+      <animate
+        attributeName="stroke-dashoffset"
+        from="0"
+        to="-56"
+        dur="4s"
+        repeatCount="indefinite"
+      />
+    </line>
+
+    <!-- Right connecting line: DHT cloud ↔ home -->
+    <line
+      x1="510"
+      y1="140"
+      x2="670"
+      y2="140"
+      stroke="url(#oh-line)"
+      stroke-width="1.5"
+      stroke-dasharray="6 8"
+      stroke-linecap="round"
+      data-openhost-anim
+    >
+      <animate
+        attributeName="stroke-dashoffset"
+        from="0"
+        to="-56"
+        dur="4s"
+        repeatCount="indefinite"
+      />
+    </line>
+
+    <!-- Pubkey pill in the center -->
+    <g transform="translate(400 140)">
+      <rect
+        x="-120"
+        y="-22"
+        width="240"
+        height="44"
+        rx="22"
+        ry="22"
+        fill="#111114"
+        stroke="#7C5CFF"
+        stroke-width="1.5"
+      />
+      <circle cx="-94" cy="0" r="5" fill="#7C5CFF" />
+      <circle
+        cx="-94"
+        cy="0"
+        r="5"
+        fill="none"
+        stroke="#7C5CFF"
+        stroke-width="1"
+        opacity="0.5"
+        data-openhost-anim
+      >
+        <animate
+          attributeName="r"
+          from="5"
+          to="14"
+          dur="2.5s"
+          repeatCount="indefinite"
+        />
+        <animate
+          attributeName="opacity"
+          from="0.6"
+          to="0"
+          dur="2.5s"
+          repeatCount="indefinite"
+        />
+      </circle>
+      <text
+        x="0"
+        y="5"
+        text-anchor="middle"
+        fill="#EDEDF0"
+        font-family="JetBrains Mono Variable, ui-monospace, monospace"
+        font-size="13"
+        letter-spacing="0.02em"
+        >{short}</text
+      >
+    </g>
+
+    <!-- Labels under center -->
+    <text
+      x="400"
+      y="232"
+      text-anchor="middle"
+      fill="#8A8A94"
+      font-family="Inter Tight Variable, system-ui, sans-serif"
+      font-size="13"
+      font-weight="500">BitTorrent Mainline DHT · Pkarr</text
+    >
+
+    <!-- Caption -->
+    <text
+      x="400"
+      y="258"
+      text-anchor="middle"
+      fill="#6B6B75"
+      font-family="Inter Variable, system-ui, sans-serif"
+      font-size="11">discovery · no server in the data path</text
+    >
+  </svg>
+</figure>

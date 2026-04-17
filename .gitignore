@@ -1,0 +1,44 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / Astro
+node_modules/
+site/dist/
+site/.astro/
+site/.vite/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Xcode
+*.xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Private planning / scratch — never commit
+.private/
+.claude/
+
+# Environment
+.env
+.env.local
+
+# OS noise
+Thumbs.db

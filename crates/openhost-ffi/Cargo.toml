@@ -1,0 +1,17 @@
+[package]
+name = "openhost-ffi"
+description = "C FFI surface over openhost-client, consumed by Swift (iOS/macOS) via an XCFramework."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lib]
+name = "openhost_ffi"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+openhost-client = { path = "../openhost-client" }

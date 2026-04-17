@@ -1,0 +1,15 @@
+[package]
+name = "openhost-pkarr"
+description = "Pkarr integration: publishes and resolves openhost signed DNS packets via public relays and the Mainline DHT."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+openhost-core = { path = "../openhost-core" }

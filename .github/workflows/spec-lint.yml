@@ -1,0 +1,23 @@
+name: Spec lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "spec/**"
+      - ".github/workflows/spec-lint.yml"
+      - ".markdownlint-cli2.yaml"
+  pull_request:
+    paths:
+      - "spec/**"
+      - ".markdownlint-cli2.yaml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npx --yes markdownlint-cli2 "spec/**/*.md"

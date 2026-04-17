@@ -1,0 +1,28 @@
+config:
+  default: true
+  # Allow long lines (prose often has URLs and code samples).
+  MD013: false
+  # Allow duplicate headings across a file (e.g., "Status" under multiple sections).
+  MD024:
+    siblings_only: true
+  # Frontmatter `title:` plus a top-level H1 is intentional — raw-markdown readers
+  # on GitHub see the H1; rendered pages use the frontmatter title.
+  MD025: false
+  # Allow inline HTML (used in the spec for tables and the diagram).
+  MD033: false
+  # Allow bare URLs in prose; the spec cites RFCs and BEPs frequently.
+  MD034: false
+  # Some fenced blocks are intentionally language-agnostic (e.g., sequence diagrams).
+  MD040: false
+  # Allow the first line to be non-H1 when frontmatter is present.
+  MD041: false
+  # Compact table pipe style is acceptable; we value dense tables in the spec.
+  MD060: false
+  # Blanks around lists — not worth bouncing PRs over.
+  MD032: false
+
+globs:
+  - "spec/**/*.md"
+
+ignores:
+  - "spec/test-vectors/**"

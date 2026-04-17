@@ -1,0 +1,189 @@
+---
+import Hero from "../components/Hero.astro";
+import FeatureCard from "../components/FeatureCard.astro";
+import ComparisonTable from "../components/ComparisonTable.astro";
+import "../styles/global.css";
+
+const base = import.meta.env.BASE_URL;
+const repo = "https://github.com/kaicoder03/openhost";
+const title = "openhost — Your home server. Reachable.";
+const description =
+  "Reach your self-hosted services from anywhere — end-to-end encrypted, no port forwarding, no tunnel service, no account. Addressed by your Ed25519 public key, discovered on the BitTorrent DHT.";
+---
+
+<!doctype html>
+<html lang="en" data-theme="dark" class="scroll-smooth">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" type="image/svg+xml" href={base + "favicon.svg"} />
+    <meta name="theme-color" content="#0A0A0B" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body class="bg-[var(--color-gray-950)] font-[family-name:var(--font-sans)] text-[var(--color-gray-100)] antialiased">
+    <!-- Top nav (thin, link-only) -->
+    <header class="sticky top-0 z-50 border-b border-[var(--color-gray-800)] bg-[var(--color-gray-950)]/70 backdrop-blur">
+      <nav class="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-4">
+        <a href={base} class="flex items-center gap-2 text-sm font-semibold tracking-tight text-[var(--color-gray-50)]">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" class="h-5 w-5 text-[var(--color-accent-400)]" aria-hidden="true">
+            <circle cx="12" cy="12" r="9"/>
+            <path d="M3.6 9h16.8M3.6 15h16.8M12 3a13 13 0 0 1 0 18M12 3a13 13 0 0 0 0 18"/>
+          </svg>
+          openhost
+        </a>
+        <div class="flex items-center gap-5 text-sm text-[var(--color-gray-300)]">
+          <a href={base + "start/what-is-openhost/"} class="hover:text-[var(--color-gray-50)]">Docs</a>
+          <a href={base + "spec/00-overview/"} class="hover:text-[var(--color-gray-50)]">Spec</a>
+          <a href={base + "start/comparison/"} class="hover:text-[var(--color-gray-50)]">Compare</a>
+          <a href={repo} class="inline-flex items-center gap-1.5 hover:text-[var(--color-gray-50)]">
+            <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
+              <path d="M12 .5a11.5 11.5 0 0 0-3.64 22.42c.57.1.78-.25.78-.56v-2c-3.2.7-3.87-1.36-3.87-1.36-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.75 1.18 1.75 1.18 1.02 1.75 2.68 1.25 3.34.96.1-.74.4-1.25.73-1.54-2.56-.29-5.25-1.28-5.25-5.7 0-1.26.45-2.28 1.18-3.08-.12-.3-.51-1.47.11-3.06 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.62 1.59.23 2.76.11 3.06.74.8 1.18 1.82 1.18 3.08 0 4.42-2.69 5.4-5.26 5.69.41.35.77 1.04.77 2.1v3.12c0 .31.2.67.79.56A11.5 11.5 0 0 0 12 .5z"/>
+            </svg>
+            GitHub
+          </a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      <Hero />
+
+      <!-- Feature grid -->
+      <section class="mx-auto mt-20 w-full max-w-6xl px-6 sm:mt-28">
+        <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <FeatureCard
+            icon="shield"
+            title="No port forwarding"
+            body="openhost hole-punches through NAT with WebRTC. Your router stays closed. Even behind carrier-grade NAT, the common cases just work."
+          />
+          <FeatureCard
+            icon="lock"
+            title="End-to-end encrypted"
+            body="DTLS 1.3 from your phone straight to your home daemon. Nothing in the middle — not us, not your ISP, not a relay — can read your traffic."
+          />
+          <FeatureCard
+            icon="key"
+            title="No accounts, no servers"
+            body="Your Ed25519 public key is your address. openhost runs no backend. We have no servers to shut down, nothing to leak, and nothing to charge you for."
+          />
+        </div>
+      </section>
+
+      <!-- Comparison -->
+      <section class="mx-auto mt-28 w-full max-w-6xl px-6 sm:mt-36">
+        <div class="mx-auto max-w-3xl text-center">
+          <h2 class="font-[family-name:var(--font-display)] text-3xl font-semibold tracking-tight text-[var(--color-gray-50)] sm:text-4xl">
+            Why openhost, and not the thing you're already using?
+          </h2>
+          <p class="mt-4 text-balance text-[var(--color-gray-300)]">
+            If you self-host, you've probably tried ngrok, Tailscale, Cloudflare Tunnel, or port forwarding with DDNS. Each works — and each trades away something a self-hoster actually cares about.
+          </p>
+        </div>
+
+        <div class="mt-10">
+          <ComparisonTable />
+        </div>
+
+        <div class="mx-auto mt-10 max-w-3xl rounded-2xl border border-[var(--color-gray-800)] bg-[var(--color-gray-900)]/50 p-6">
+          <p class="text-[var(--color-gray-300)]">
+            openhost is for people who already run the services they use. You've got Jellyfin, Home Assistant, a Gitea, maybe a personal dashboard — all on hardware you own, sitting on your home network. You want to reach them from your phone when you're out, and you want that to keep working in five years without depending on a company's roadmap. That's the only thing openhost tries to do well.
+          </p>
+          <p class="mt-4">
+            <a href={base + "start/comparison/"} class="inline-flex items-center gap-1.5 text-sm font-semibold text-[var(--color-accent-300)] hover:text-[var(--color-accent-200)]">
+              Read the full comparison
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" class="h-4 w-4" aria-hidden="true"><path d="M7 5l5 5-5 5"/></svg>
+            </a>
+          </p>
+        </div>
+      </section>
+
+      <!-- How it works (compact) -->
+      <section class="mx-auto mt-28 w-full max-w-6xl px-6 sm:mt-36">
+        <div class="grid gap-10 rounded-2xl border border-[var(--color-gray-800)] bg-[var(--color-gray-900)]/50 p-8 md:grid-cols-2 md:p-12">
+          <div>
+            <div class="text-xs font-semibold tracking-wide uppercase text-[var(--color-accent-400)]">
+              How it works
+            </div>
+            <h2 class="mt-3 font-[family-name:var(--font-display)] text-2xl font-semibold tracking-tight text-[var(--color-gray-50)] sm:text-3xl">
+              Three pieces of mature, boring technology.
+            </h2>
+            <p class="mt-4 text-[var(--color-gray-300)]">
+              A small daemon on your server publishes a signed DNS record to the BitTorrent Mainline DHT, keyed by your Ed25519 public key. Paired clients resolve it, negotiate a direct WebRTC connection, and speak HTTP over an end-to-end encrypted data channel.
+            </p>
+            <p class="mt-4 text-[var(--color-gray-400)]">
+              No new cryptography. No invented protocols. Every piece has years of production use outside of openhost.
+            </p>
+          </div>
+
+          <ol class="space-y-5 text-[var(--color-gray-200)]">
+            <li class="flex gap-4">
+              <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--color-accent-950)] text-xs font-semibold text-[var(--color-accent-300)]">1</span>
+              <div>
+                <div class="font-semibold">Pair once, at the kitchen table.</div>
+                <div class="text-sm text-[var(--color-gray-400)]">Scan a QR, confirm a 4-word phrase on both devices. Your client's pubkey is now on the host's allowlist.</div>
+              </div>
+            </li>
+            <li class="flex gap-4">
+              <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--color-accent-950)] text-xs font-semibold text-[var(--color-accent-300)]">2</span>
+              <div>
+                <div class="font-semibold">The server publishes, the DHT spreads.</div>
+                <div class="text-sm text-[var(--color-gray-400)]">Signed DNS record with ICE candidates and a DTLS fingerprint, refreshed every 30 minutes.</div>
+              </div>
+            </li>
+            <li class="flex gap-4">
+              <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--color-accent-950)] text-xs font-semibold text-[var(--color-accent-300)]">3</span>
+              <div>
+                <div class="font-semibold">Your client opens a direct connection.</div>
+                <div class="text-sm text-[var(--color-gray-400)]">WebRTC hole-punch, DTLS 1.3 handshake, pubkey-bound channel binding. HTTP starts flowing.</div>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <!-- CTA -->
+      <section class="mx-auto mt-28 w-full max-w-4xl px-6 pb-28 text-center sm:mt-36">
+        <h2 class="font-[family-name:var(--font-display)] text-3xl font-semibold tracking-tight text-[var(--color-gray-50)] sm:text-4xl">
+          Pre-alpha. Watch the repo.
+        </h2>
+        <p class="mt-4 text-[var(--color-gray-300)]">
+          The protocol is being finalized. Installers, apps, and the extension are in the works. Star the repo to follow along.
+        </p>
+        <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
+          <a
+            href={repo}
+            class="inline-flex items-center gap-2 rounded-lg border border-[var(--color-gray-800)] bg-[var(--color-gray-900)] px-5 py-3 text-sm font-semibold text-[var(--color-gray-100)] transition hover:border-[var(--color-accent-700)]"
+          >
+            <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
+              <path d="M12 .5a11.5 11.5 0 0 0-3.64 22.42c.57.1.78-.25.78-.56v-2c-3.2.7-3.87-1.36-3.87-1.36-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.75 1.18 1.75 1.18 1.02 1.75 2.68 1.25 3.34.96.1-.74.4-1.25.73-1.54-2.56-.29-5.25-1.28-5.25-5.7 0-1.26.45-2.28 1.18-3.08-.12-.3-.51-1.47.11-3.06 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.62 1.59.23 2.76.11 3.06.74.8 1.18 1.82 1.18 3.08 0 4.42-2.69 5.4-5.26 5.69.41.35.77 1.04.77 2.1v3.12c0 .31.2.67.79.56A11.5 11.5 0 0 0 12 .5z"/>
+            </svg>
+            View on GitHub
+          </a>
+          <a
+            href={base + "spec/00-overview/"}
+            class="inline-flex items-center gap-2 rounded-lg bg-[var(--color-accent-500)] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[var(--color-accent-400)]"
+          >
+            Read the spec
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="border-t border-[var(--color-gray-800)]">
+      <div class="mx-auto flex w-full max-w-6xl flex-col items-start justify-between gap-6 px-6 py-10 text-sm text-[var(--color-gray-400)] sm:flex-row sm:items-center">
+        <div>openhost contributors · Apache-2.0 / MIT</div>
+        <nav class="flex flex-wrap items-center gap-5">
+          <a href={base + "spec/00-overview/"} class="hover:text-[var(--color-gray-100)]">Specification</a>
+          <a href={base + "spec/04-security/"} class="hover:text-[var(--color-gray-100)]">Threat model</a>
+          <a href={base + "start/comparison/"} class="hover:text-[var(--color-gray-100)]">Comparison</a>
+          <a href={repo} class="hover:text-[var(--color-gray-100)]">GitHub</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>

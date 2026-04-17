@@ -1,0 +1,57 @@
+name: Bug report
+description: Report something broken in openhost (non-security).
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Please do not file security vulnerabilities here.** Use a private security advisory instead:
+        <https://github.com/kaicoder03/openhost/security/advisories/new>
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong? One or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps that reproduce the behavior.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: openhost version / commit
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "e.g. macOS 15.1, Linux (kernel 6.8), iOS 18.2"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, or anything else that helps

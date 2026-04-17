@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/openhost-core",
+    "crates/openhost-daemon",
+    "crates/openhost-client",
+    "crates/openhost-pkarr",
+    "crates/openhost-ffi",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/kaicoder03/openhost"
+readme = "README.md"
+
+[workspace.dependencies]
+ed25519-dalek = "2"
+x25519-dalek = "2"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+pkarr = "3"
+mainline = "4"
+webrtc = "0.17"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+zbase32 = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

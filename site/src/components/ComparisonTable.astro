@@ -1,0 +1,182 @@
+---
+// openhost vs alternatives. Pure HTML + CSS, no JS.
+// Data is defined here so the table is statically rendered; add a row by appending to `rows`.
+
+const columns = [
+  { key: "oh", label: "openhost", highlight: true },
+  { key: "ngrok", label: "ngrok" },
+  { key: "tailscale", label: "Tailscale Funnel" },
+  { key: "cloudflare", label: "Cloudflare Tunnel" },
+  { key: "portfwd", label: "Port forward + DDNS" },
+];
+
+type Cell = { text: string; strong?: boolean };
+type Row = { label: string } & Record<string, Cell>;
+
+const rows: Row[] = [
+  {
+    label: "Traffic path",
+    oh: { text: "End-to-end encrypted, direct", strong: true },
+    ngrok: { text: "Through ngrok servers" },
+    tailscale: { text: "Direct if possible; DERP relay fallback" },
+    cloudflare: { text: "Through Cloudflare edge (TLS terminated there)" },
+    portfwd: { text: "Direct" },
+  },
+  {
+    label: "Provider can see your data?",
+    oh: { text: "No — nothing in the middle", strong: true },
+    ngrok: { text: "Yes (TLS terminated at ngrok)" },
+    tailscale: { text: "Metadata at coord server" },
+    cloudflare: { text: "Yes (TLS terminated at edge)" },
+    portfwd: { text: "N/A — you are the provider" },
+  },
+  {
+    label: "Requires an account",
+    oh: { text: "No", strong: true },
+    ngrok: { text: "Yes" },
+    tailscale: { text: "Yes" },
+    cloudflare: { text: "Yes (+ domain on CF)" },
+    portfwd: { text: "No" },
+  },
+  {
+    label: "Requires a domain",
+    oh: { text: "No", strong: true },
+    ngrok: { text: "No (random URL free)" },
+    tailscale: { text: "No (uses *.ts.net)" },
+    cloudflare: { text: "Yes" },
+    portfwd: { text: "Optional" },
+  },
+  {
+    label: "Monthly cost",
+    oh: { text: "$0", strong: true },
+    ngrok: { text: "$5+ for a stable URL" },
+    tailscale: { text: "Free tier; paid for extras" },
+    cloudflare: { text: "Free with CF account" },
+    portfwd: { text: "$0 (domain extra)" },
+  },
+  {
+    label: "Works behind CGNAT",
+    oh: { text: "Yes (WebRTC hole-punch)", strong: true },
+    ngrok: { text: "Yes (tunnel)" },
+    tailscale: { text: "Yes (DERP relay)" },
+    cloudflare: { text: "Yes (tunnel)" },
+    portfwd: { text: "No" },
+  },
+  {
+    label: "Opens a port on your router",
+    oh: { text: "No", strong: true },
+    ngrok: { text: "No" },
+    tailscale: { text: "No" },
+    cloudflare: { text: "No" },
+    portfwd: { text: "Yes" },
+  },
+  {
+    label: "Provider can change terms / shut down",
+    oh: { text: "No provider to change terms", strong: true },
+    ngrok: { text: "Yes" },
+    tailscale: { text: "Yes" },
+    cloudflare: { text: "Yes" },
+    portfwd: { text: "N/A" },
+  },
+  {
+    label: "Protocol is open / any client works",
+    oh: { text: "Yes", strong: true },
+    ngrok: { text: "No" },
+    tailscale: { text: "No" },
+    cloudflare: { text: "No" },
+    portfwd: { text: "Yes (plain HTTP)" },
+  },
+  {
+    label: "Address is stable forever",
+    oh: { text: "Yes (your pubkey)", strong: true },
+    ngrok: { text: "Paid tier only" },
+    tailscale: { text: "Tied to your Tailscale account" },
+    cloudflare: { text: "Tied to your CF account + domain" },
+    portfwd: { text: "Tied to your domain" },
+  },
+];
+---
+
+<div class="overflow-hidden rounded-2xl border border-[var(--color-gray-800)]">
+  <!-- Desktop table (md+) -->
+  <table class="hidden w-full table-fixed border-collapse text-left text-sm md:table">
+    <thead>
+      <tr class="bg-[var(--color-gray-900)] text-[var(--color-gray-400)]">
+        <th class="w-56 px-4 py-3 text-xs font-semibold tracking-wide uppercase"></th>
+        {columns.map((col) => (
+          <th
+            class:list={[
+              "px-4 py-3 text-xs font-semibold tracking-wide uppercase",
+              col.highlight && "text-[var(--color-accent-300)]",
+            ]}
+          >
+            {col.label}
+          </th>
+        ))}
+      </tr>
+    </thead>
+    <tbody>
+      {rows.map((row, idx) => (
+        <tr
+          class:list={[
+            "border-t border-[var(--color-gray-800)]",
+            idx % 2 === 1 && "bg-[var(--color-gray-900)]/40",
+          ]}
+        >
+          <th scope="row" class="px-4 py-3 align-top font-medium text-[var(--color-gray-200)]">
+            {row.label}
+          </th>
+          {columns.map((col) => {
+            const cell = row[col.key] as Cell;
+            return (
+              <td
+                class:list={[
+                  "px-4 py-3 align-top text-[var(--color-gray-300)]",
+                  col.highlight && "bg-[var(--color-accent-950)]/40 text-[var(--color-gray-100)]",
+                  cell.strong && col.highlight && "font-semibold",
+                ]}
+              >
+                {cell.text}
+              </td>
+            );
+          })}
+        </tr>
+      ))}
+    </tbody>
+  </table>
+
+  <!-- Mobile card-per-row stack -->
+  <div class="md:hidden">
+    {rows.map((row) => (
+      <div class="border-b border-[var(--color-gray-800)] p-4 last:border-b-0">
+        <div class="mb-3 text-xs font-semibold tracking-wide uppercase text-[var(--color-gray-400)]">
+          {row.label}
+        </div>
+        <ul class="space-y-2 text-sm">
+          {columns.map((col) => {
+            const cell = row[col.key] as Cell;
+            return (
+              <li
+                class:list={[
+                  "flex items-start justify-between gap-4 rounded-lg px-3 py-2",
+                  col.highlight
+                    ? "bg-[var(--color-accent-950)]/50 text-[var(--color-gray-100)]"
+                    : "text-[var(--color-gray-300)]",
+                ]}
+              >
+                <span
+                  class:list={[
+                    col.highlight && "font-semibold text-[var(--color-accent-300)]",
+                  ]}
+                >
+                  {col.label}
+                </span>
+                <span class="text-right">{cell.text}</span>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    ))}
+  </div>
+</div>
