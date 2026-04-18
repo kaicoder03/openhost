@@ -1,0 +1,28 @@
+# Minimal openhostd config — suitable for local development.
+#
+# Paths are relative to the process's CWD. For production use, make them
+# absolute and place them somewhere only the daemon user can write (a
+# typical choice is ~/.config/openhost/).
+
+[identity]
+store = { kind = "fs", path = "./.openhost/identity.key" }
+
+[pkarr]
+# Empty falls back to openhost_pkarr::DEFAULT_RELAYS plus the Mainline DHT.
+# Add more entries here to override; only HTTPS URLs are accepted.
+relays = ["https://pkarr.pubky.app"]
+
+# 30 minutes, per spec §1. Decrease only for testing — public relays
+# rate-limit fast republishers.
+republish_secs = 1800
+
+[dtls]
+cert_path = "./.openhost/dtls.pem"
+
+# 24 hours, per spec §2. Rotation triggers a republish so the new
+# fingerprint lands in the next signed record.
+rotate_secs = 86400
+
+[log]
+# Honoured as an EnvFilter string. RUST_LOG overrides at runtime.
+level = "info"

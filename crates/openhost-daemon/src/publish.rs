@@ -1,0 +1,300 @@
+//! Wires the daemon's live state into the `openhost-pkarr` publisher.
+//!
+//! The publisher signs and publishes a fresh [`OpenhostRecord`] every
+//! 30 minutes (or on demand via [`PublishService::trigger`]). This module's
+//! job is to expose a [`SharedState`] that the rest of the daemon can
+//! mutate — DTLS fingerprint on cert rotation (PR #5), `ice` blobs when
+//! a paired client's offer lands (PR #5), `allow` list when a new
+//! pairing completes (PR #7) — and have the publisher pick the latest
+//! snapshot on its next publish.
+//!
+//! The [`Transport`] handed to the underlying publisher is parameterised
+//! so integration tests can inject a fake without opening sockets. The
+//! normal path ([`start`]) wraps a real `pkarr::Client` built from the
+//! configured relay list and the Mainline DHT.
+
+use crate::config::PkarrConfig;
+use crate::error::{PublishError, Result as DaemonResult};
+use openhost_core::identity::SigningKey;
+use openhost_core::pkarr_record::{
+    IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
+};
+use openhost_pkarr::{
+    PkarrTransport, Publisher, PublisherHandle, RecordSource, Transport, DEFAULT_RELAYS,
+};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Mutable state shared between the publisher and the rest of the daemon.
+///
+/// Every field that later PRs will mutate is wrapped in a `RwLock`; every
+/// field the publisher must see consistently — i.e. the per-host salt
+/// that keys the allowlist HMAC — is immutable for the lifetime of this
+/// struct.
+///
+/// **Salt persistence:** this PR generates a fresh salt on every boot.
+/// That's safe because the `allow` list ships empty, so no client yet
+/// depends on the salt's stability. PR #7 (pairing + allowlist) will
+/// promote the salt to a persisted, identity-bound value; until then,
+/// randomising is the least-surprising default.
+pub struct SharedState {
+    dtls_fp: RwLock<[u8; DTLS_FINGERPRINT_LEN]>,
+    salt: [u8; SALT_LEN],
+    allow: RwLock<Vec<[u8; 16]>>,
+    ice: RwLock<Vec<IceBlob>>,
+    roles: String,
+}
+
+impl SharedState {
+    /// Build a new `SharedState` with the given DTLS fingerprint and a
+    /// freshly-generated random salt. `roles` defaults to `"server"`.
+    pub fn new(dtls_fp: [u8; DTLS_FINGERPRINT_LEN]) -> Self {
+        let mut salt = [0u8; SALT_LEN];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut salt);
+        Self {
+            dtls_fp: RwLock::new(dtls_fp),
+            salt,
+            allow: RwLock::new(Vec::new()),
+            ice: RwLock::new(Vec::new()),
+            roles: "server".to_string(),
+        }
+    }
+
+    /// Replace the DTLS fingerprint (for cert rotation). Callers MUST
+    /// follow up with [`PublishService::trigger`] or the published record
+    /// will pin to the previous fingerprint for up to the full republish
+    /// interval.
+    pub fn set_dtls_fp(&self, fp: [u8; DTLS_FINGERPRINT_LEN]) {
+        *self.dtls_fp.write().expect("dtls_fp lock poisoned") = fp;
+    }
+
+    /// Current DTLS fingerprint snapshot. Returned by copy; no lock is held.
+    pub fn dtls_fp(&self) -> [u8; DTLS_FINGERPRINT_LEN] {
+        *self.dtls_fp.read().expect("dtls_fp lock poisoned")
+    }
+
+    /// The immutable salt for this daemon's allowlist HMAC.
+    pub fn salt(&self) -> [u8; SALT_LEN] {
+        self.salt
+    }
+
+    /// Snapshot of the current allow list.
+    pub fn allow(&self) -> Vec<[u8; 16]> {
+        self.allow.read().expect("allow lock poisoned").clone()
+    }
+
+    /// Snapshot of the current ICE blob set.
+    pub fn ice(&self) -> Vec<IceBlob> {
+        self.ice.read().expect("ice lock poisoned").clone()
+    }
+
+    /// Build a fresh [`OpenhostRecord`] with `ts` set to **now**. This is
+    /// what the publisher calls on every tick.
+    pub fn snapshot_record(&self) -> OpenhostRecord {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        OpenhostRecord {
+            version: PROTOCOL_VERSION,
+            ts,
+            dtls_fp: self.dtls_fp(),
+            roles: self.roles.clone(),
+            salt: self.salt,
+            allow: self.allow(),
+            ice: self.ice(),
+            disc: String::new(),
+        }
+    }
+}
+
+/// The running publisher. Wraps [`PublisherHandle`] so callers don't need
+/// to depend on `openhost-pkarr` directly.
+pub struct PublishService {
+    handle: PublisherHandle,
+}
+
+impl PublishService {
+    /// Fire an immediate republish. Non-blocking; dropped if a publish is
+    /// already queued (per `openhost-pkarr::PublisherHandle::trigger`).
+    pub fn trigger(&self) {
+        self.handle.trigger();
+    }
+
+    /// Gracefully shut down the publisher.
+    pub async fn shutdown(self) {
+        self.handle.shutdown().await;
+    }
+}
+
+/// Start the publisher against a real `pkarr::Client`.
+pub async fn start(
+    cfg: &PkarrConfig,
+    identity: Arc<SigningKey>,
+    state: Arc<SharedState>,
+) -> DaemonResult<PublishService> {
+    let transport = build_default_transport(cfg)?;
+    Ok(start_with_transport(cfg, identity, state, transport))
+}
+
+/// Start the publisher against an already-constructed [`Transport`].
+/// Used by integration tests that inject a fake transport.
+pub fn start_with_transport(
+    cfg: &PkarrConfig,
+    identity: Arc<SigningKey>,
+    state: Arc<SharedState>,
+    transport: Arc<dyn Transport>,
+) -> PublishService {
+    let record_source: RecordSource = {
+        let state = state.clone();
+        Box::new(move || state.snapshot_record())
+    };
+
+    let publisher = Publisher::new(transport, identity, record_source, None)
+        .with_interval(Duration::from_secs(cfg.republish_secs));
+
+    PublishService {
+        handle: publisher.spawn(),
+    }
+}
+
+fn build_default_transport(cfg: &PkarrConfig) -> DaemonResult<Arc<dyn Transport>> {
+    let relays: Vec<&str> = if cfg.relays.is_empty() {
+        DEFAULT_RELAYS.to_vec()
+    } else {
+        cfg.relays.iter().map(String::as_str).collect()
+    };
+
+    let mut builder = pkarr::Client::builder();
+    builder
+        .relays(&relays)
+        .map_err(|e| PublishError::ClientBuild(format!("invalid relay URL: {e}")))?;
+
+    let client = builder
+        .build()
+        .map_err(|e| PublishError::ClientBuild(e.to_string()))?;
+
+    Ok(Arc::new(PkarrTransport::new(Arc::new(client))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use openhost_pkarr::{PkarrError, Result as PkarrResult};
+    use pkarr::{SignedPacket, Timestamp};
+    use std::sync::Mutex;
+
+    const RFC_SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    #[derive(Default)]
+    struct FakeTransport {
+        calls: Mutex<Vec<[u8; DTLS_FINGERPRINT_LEN]>>,
+    }
+
+    #[async_trait]
+    impl Transport for FakeTransport {
+        async fn publish(&self, packet: &SignedPacket, _cas: Option<Timestamp>) -> PkarrResult<()> {
+            // Recover the dtls_fp by decoding the packet back into a SignedRecord.
+            let signed = openhost_pkarr::decode(packet).map_err(|_| PkarrError::NotFound)?;
+            self.calls.lock().unwrap().push(signed.record.dtls_fp);
+            Ok(())
+        }
+    }
+
+    fn test_cfg() -> PkarrConfig {
+        PkarrConfig {
+            relays: vec![],
+            republish_secs: 3600, // keep the ticker inert; only the initial publish fires
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_publish_carries_expected_fingerprint() {
+        let transport = Arc::new(FakeTransport::default());
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let expected_fp = [0x42u8; DTLS_FINGERPRINT_LEN];
+        let state = Arc::new(SharedState::new(expected_fp));
+
+        let service = start_with_transport(&test_cfg(), sk, state.clone(), transport.clone());
+
+        // Give the initial publish a moment to fire.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let calls = transport.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "expected exactly one initial publish");
+        assert_eq!(calls[0], expected_fp);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trigger_after_fp_mutation_publishes_new_fingerprint() {
+        let transport = Arc::new(FakeTransport::default());
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let state = Arc::new(SharedState::new([0x01; DTLS_FINGERPRINT_LEN]));
+
+        let service = start_with_transport(&test_cfg(), sk, state.clone(), transport.clone());
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        state.set_dtls_fp([0x02; DTLS_FINGERPRINT_LEN]);
+        service.trigger();
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let calls = transport.calls.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 2,
+            "expected initial + triggered publish, saw {}",
+            calls.len()
+        );
+        assert_eq!(calls[0], [0x01; DTLS_FINGERPRINT_LEN]);
+        assert_eq!(
+            calls.last().unwrap(),
+            &[0x02; DTLS_FINGERPRINT_LEN],
+            "latest publish must carry the rotated fingerprint"
+        );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn allow_and_ice_default_to_empty() {
+        let transport = Arc::new(FakeTransport::default());
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let state = Arc::new(SharedState::new([0x42; DTLS_FINGERPRINT_LEN]));
+
+        let service = start_with_transport(&test_cfg(), sk, state.clone(), transport.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let record = state.snapshot_record();
+        assert!(record.allow.is_empty());
+        assert!(record.ice.is_empty());
+        assert_eq!(record.roles, "server");
+        assert_eq!(record.version, PROTOCOL_VERSION);
+
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn salt_is_stable_per_shared_state() {
+        let state = SharedState::new([0; DTLS_FINGERPRINT_LEN]);
+        let s1 = state.salt();
+        let s2 = state.salt();
+        assert_eq!(s1, s2);
+
+        // Two independent states draw fresh salts.
+        let other = SharedState::new([0; DTLS_FINGERPRINT_LEN]);
+        assert_ne!(
+            s1,
+            other.salt(),
+            "two SharedState instances should have distinct random salts"
+        );
+    }
+}
