@@ -1,53 +1,58 @@
-//! Offer + answer record codec for the daemon's signalling loop (PR #7a).
+//! Offer + answer record codec for the daemon's signalling loop.
 //!
 //! # Overview
 //!
 //! Clients publish an ephemeral offer SDP by posting a `SignedPacket`
 //! under their own Ed25519 pubkey containing a TXT record at
-//! `_offer._<host-hash>`. The TXT value is a sealed-box ciphertext
-//! addressed to the daemon's Ed25519 identity (converted to X25519). The
-//! daemon polls known clients, reads the TXT, unseals it, and hands the
-//! inner SDP to [`crate::listener::PassivePeer::handle_offer`].
+//! `_offer-<host-hash>`. The TXT value is a sealed-box ciphertext
+//! addressed to the daemon's Ed25519 identity (converted to X25519).
+//! The daemon polls known clients, reads the TXT, unseals it, and
+//! hands the inner SDP to
+//! [`crate::listener::PassivePeer::handle_offer`].
 //!
-//! The daemon in turn publishes the answer back as an extra TXT record
-//! inside its own regular `_openhost` packet, at `_answer._<client-hash>`.
-//! The `_openhost` TXT bytes are completely unchanged; clients that only
-//! decode the main record don't notice. Client-side consumers that DO
-//! know their `client_hash` can look for the `_answer.*` TXT, unseal it
-//! against their own identity, and apply the answer SDP to their peer
-//! connection.
+//! The daemon publishes the answer back as an extra TXT record
+//! inside its own regular `_openhost` packet, at
+//! `_answer-<client-hash>`. The `_openhost` TXT bytes are completely
+//! unchanged; clients that only decode the main record don't notice.
+//! Client-side consumers that DO know their `client_hash` look for
+//! the `_answer-*` TXT, unseal it against their own identity, and
+//! apply the answer SDP to their peer connection.
 //!
-//! # Spec status
+//! Canonical reference: `spec/01-wire-format.md §3.3`.
 //!
-//! `spec/01-wire-format.md §3` describes the offer side only; the
-//! answer record is a PR #7a extension flagged `TODO(v0.1 freeze)` in
-//! the same file.
+//! # Wire format (v0.1)
 //!
-//! # Wire format
-//!
-//! Both TXT values are `base64url_no_pad(sealed_box_ciphertext)` where
-//! the sealed-box plaintext follows a domain-separated canonical form:
+//! Both TXT values are `base64url_no_pad(sealed_box_ciphertext)`.
+//! The sealed-box plaintext begins with a 1-byte `compression_tag`
+//! that determines the layout of the remaining bytes:
 //!
 //! ```text
-//! offer_plaintext  = 0x01
-//!                    || "openhost-offer-inner1"
-//!                    || client_pk               (32 bytes)
-//!                    || sdp_len                 (u32, big-endian)
-//!                    || offer_sdp               (sdp_len bytes, UTF-8)
+//! inner_plaintext = compression_tag || body
 //!
-//! answer_plaintext = 0x01
-//!                    || "openhost-answer-inner1"
-//!                    || daemon_pk               (32 bytes)
-//!                    || offer_sdp_hash          (32 bytes, SHA-256 of the
-//!                                                UTF-8 offer SDP this
-//!                                                answer is bound to)
-//!                    || sdp_len                 (u32, big-endian)
-//!                    || answer_sdp              (sdp_len bytes, UTF-8)
+//!   compression_tag : u8
+//!       0x01 = Uncompressed — `body` bytes follow verbatim (legacy).
+//!       0x02 = Zlib (RFC 1950) — `body` bytes are the zlib-encoded
+//!              form of the uncompressed body below. Decompressed
+//!              output MUST NOT exceed 65_536 bytes.
+//!       Other values MUST be rejected as malformed.
+//!
+//!   body (offer)  =  "openhost-offer-inner1"   (21 bytes)
+//!                 || client_pk                  (32 bytes)
+//!                 || sdp_len                    (u32 big-endian)
+//!                 || offer_sdp_utf8             (sdp_len bytes)
+//!
+//!   body (answer) =  "openhost-answer-inner1"  (22 bytes)
+//!                 || daemon_pk                  (32 bytes)
+//!                 || offer_sdp_hash             (32 bytes, SHA-256)
+//!                 || sdp_len                    (u32 big-endian)
+//!                 || answer_sdp_utf8            (sdp_len bytes)
 //! ```
 //!
-//! The inner `client_pk` / `daemon_pk` MUST match the outer BEP44 signer
-//! pubkey — cross-checked on decode so a hostile substrate cannot splice
-//! an offer signed under key A with inner plaintext claiming key B.
+//! v0.1+ encoders emit `compression_tag = 0x02`. Decoders accept
+//! both `0x01` and `0x02`. The inner `client_pk` / `daemon_pk` MUST
+//! match the outer BEP44 signer pubkey — cross-checked on decode so
+//! a hostile substrate cannot splice an offer signed under key A
+//! with inner plaintext claiming key B.
 
 use crate::codec::{BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME, OPENHOST_TXT_TTL};
 use crate::error::{PkarrError, Result};

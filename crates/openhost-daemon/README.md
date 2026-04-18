@@ -182,28 +182,12 @@ shared DTLS-exporter-derived bytes is dropped before any forwarded
 request reaches the upstream — this closes the RFC 8844 unknown-key-
 share attack surface.
 
-**Authorization is NOT applied yet.** The current binding check proves
-the client holds the private key corresponding to the pubkey it
-presented. It does *not* verify whether that pubkey is allowed to
-connect. Any Ed25519 keypair passes binding today; the `_allow` record
-allowlist gating lands in PR #7. If you deploy an openhost daemon right
-now with a `[forward]` section pointing at a sensitive upstream, any
-client that can find your Pkarr record can reach that upstream.
-
-**Implementation-vs-spec drift.** Two deviations from spec §3 step 9
-are flagged `TODO(v0.1 freeze)` and will reconcile at the v0.1 cut:
-
-- Message order is inverted (daemon sends `AuthNonce`; client signs
-  first with `AuthClient`; daemon replies with `AuthHost`). Necessary
-  because PR #5.5 ships before PR #7's offer-record plumbing — without
-  an offer record the daemon has no source of truth for `client_pk`
-  before the client speaks.
-- Binding bytes fold into HKDF `info`, not the DTLS exporter `context`.
-  `webrtc-dtls` v0.17.x rejects a non-empty exporter `context`
-  (`ContextUnsupported`). Cryptographically equivalent (exporter secret
-  is session-unique; HKDF still commits to `host_pk || client_pk ||
-  nonce`). The spec text is authoritative once the upstream DTLS crate
-  accepts a non-empty context.
+**Authorization** is applied via the pairing allowlist (spec §7, also
+§7b). A client whose pubkey isn't in the daemon's pair DB is dropped
+at offer-poll time. Channel binding itself proves key possession only,
+not authorization — the allowlist layer on top enforces "yes, this
+specific pubkey is invited." See the pairing section above for CLI
+mutation + SIGHUP reload.
 
 ## Forwarding to a local HTTP service (PR #6)
 

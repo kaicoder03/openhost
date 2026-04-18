@@ -17,26 +17,24 @@
 //! || nonce)` with its Ed25519 identity key. The verifier derives the
 //! same `auth_bytes` from its own exporter and checks the signature.
 //!
-//! # TODO(v0.1 freeze)
+//! Two design choices canonicalized at v0.1 (see
+//! `spec/01-wire-format.md §3 step 9`):
 //!
-//! 1. Message order is **client-first**. Spec §3 step 9 reads
-//!    "daemon signs first, client replies." We invert that here so PR #5.5
-//!    can ship without PR #7's offer-record plumbing: without an offer
-//!    record, the daemon has no source of truth for `client_pk` before
-//!    the client speaks. Once PR #7 lands, the spec text and this flow
-//!    should reunify.
-//! 2. Binding bytes are folded into HKDF `info`, not the DTLS exporter
-//!    `context`. webrtc-dtls v0.17.x returns `ContextUnsupported` for a
-//!    non-empty `context`. Equivalent security (exporter secret is
-//!    session-unique; HKDF still commits to `host_pk || client_pk ||
-//!    nonce`) but the spec text layers it the other way.
+//! 1. **Client-first message order.** `AuthClient` carries the client
+//!    pubkey as its 32-byte prefix, so the daemon doesn't need to
+//!    pre-resolve `client_pk` from the offer record at DTLS-setup time.
+//! 2. **Empty DTLS exporter `context`.** webrtc-dtls v0.17.x rejects
+//!    non-empty `context` with `ContextUnsupported`. Binding bytes
+//!    (`host_pk || client_pk || nonce`) fold into HKDF `info` instead —
+//!    cryptographically equivalent.
 //!
 //! # What this module does NOT do
 //!
-//! - **Authorization.** Any syntactically valid Ed25519 keypair passes
-//!   binding — PR #5.5 proves the signer holds the corresponding private
-//!   key, nothing more. The allowlist lands in PR #7 and is what
-//!   determines whether `client_pk` is *allowed* to connect.
+//! - **Authorization.** Binding proves the signer holds the private
+//!   key corresponding to its stated `client_pk`, nothing more.
+//!   Allowlist enforcement lives in
+//!   [`crate::publish::SharedState::is_client_allowed`] and gates the
+//!   offer-poll path (see PR #7b).
 
 use ed25519_dalek::Signature;
 use openhost_core::crypto::auth_bytes_bound;

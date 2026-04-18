@@ -181,9 +181,9 @@ async fn daemon_polls_scripted_offer_and_publishes_answer() -> DaemonResult<()> 
     // can exceed the remaining room under the BEP44 1000-byte cap
     // alongside the main `_openhost` record. In that case the encoder
     // evicts the answer and the test sees no `_answer` TXT on the wire.
-    // Trickling ICE candidates separately over pkarr is out of scope
-    // for PR #7a (tracked as a `TODO(v0.1 freeze)` against
-    // `spec/01-wire-format.md §3`).
+    // Splitting ICE trickle into separate pkarr records is tracked as
+    // post-v0.1 work — see `CHANGELOG.md` "Known limitations in 0.1.0"
+    // and `spec/01-wire-format.md §3.3`.
     let expected_hash =
         openhost_core::crypto::allowlist_hash(&app.state().salt(), &client_pk.to_bytes());
     let got = wait_until(Duration::from_secs(10), || {
