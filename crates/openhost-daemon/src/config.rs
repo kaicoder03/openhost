@@ -160,8 +160,16 @@ impl Config {
 }
 
 /// Canonical path for the config file — `~/.config/openhost/config.toml`
-/// on Linux; the platform equivalent on macOS. Intended for the CLI's
-/// default when `--config` is omitted.
+/// on Linux; the platform equivalent on macOS / Windows. Intended for
+/// the CLI's default when `--config` is omitted.
+///
+/// The empty qualifier + empty organisation in [`directories::ProjectDirs`]
+/// is an explicit choice: openhost has no backing company / TLD / reverse-DNS
+/// identifier, so a bare `"openhost"` top-level directory on every platform
+/// keeps paths predictable and greppable. This is a **stable** convention —
+/// changing it silently orphans every user's existing identity + cert files,
+/// so treat it as a protocol-visible value and bump a major version before
+/// touching.
 pub fn default_path() -> PathBuf {
     directories::ProjectDirs::from("", "", "openhost")
         .map(|dirs| dirs.config_dir().join("config.toml"))

@@ -51,7 +51,6 @@ enum IdentityCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_tracing("info");
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -80,6 +79,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run => {
+            // Only the long-running subcommand needs structured logs —
+            // installing a subscriber for `identity show` / `rotate` would
+            // interleave their stdout with any `info!`-level lines an
+            // internal dep might emit during identity load.
+            init_tracing(&cfg.log.level);
             let app = App::build(cfg).await?;
             app.run().await?;
         }

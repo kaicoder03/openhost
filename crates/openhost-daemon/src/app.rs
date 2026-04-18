@@ -111,10 +111,16 @@ async fn init_common(cfg: &Config) -> Result<(Arc<SigningKey>, DtlsCertificate, 
     let (cert, rotated) =
         dtls_cert::load_or_generate(&cfg.dtls.cert_path, cfg.rotate_interval()).await?;
     if rotated {
+        // TODO(M3.2): when PR #5 introduces the WebRTC listener, cert
+        // rotation opens a window in which a client that resolved under
+        // the old `fp` dials the new cert and fails the DTLS handshake.
+        // Decide whether the listener keeps the previous cert alive for
+        // N minutes after rotation, or clients simply retry on failure.
+        // Neither requires changes this PR (no listener yet).
         tracing::info!("openhostd: DTLS certificate generated");
     }
 
-    let state = Arc::new(SharedState::new(cert.fingerprint_sha256));
+    let state = Arc::new(SharedState::new(&identity, cert.fingerprint_sha256));
 
     Ok((Arc::new(identity), cert, state))
 }

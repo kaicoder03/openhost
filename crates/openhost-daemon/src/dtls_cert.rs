@@ -246,7 +246,10 @@ mod tests {
             .await
             .unwrap();
 
-        // A zero-second rotation window forces every call to rotate.
+        // A zero-second rotation window forces every call to rotate. This
+        // is a test-only shortcut — `config::validate` rejects
+        // `rotate_secs == 0`, so production code can't hit this path. Do
+        // not "fix" the apparent inconsistency by adding a zero-check here.
         let (c2, rotated) = load_or_generate(&path, Duration::from_secs(0))
             .await
             .unwrap();

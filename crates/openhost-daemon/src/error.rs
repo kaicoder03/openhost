@@ -110,8 +110,4 @@ pub enum PublishError {
     /// The pkarr crate failed to build a `Client` from the configured relays.
     #[error("failed to build pkarr client: {0}")]
     ClientBuild(String),
-
-    /// Publisher state mutex was poisoned.
-    #[error("publisher shared-state lock was poisoned")]
-    Poisoned,
 }

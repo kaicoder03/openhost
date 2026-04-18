@@ -46,7 +46,7 @@ rcgen = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
-rand = { workspace = true }
+hkdf = { workspace = true }
 
 # Underlying pkarr client for the real Transport
 pkarr = { workspace = true }

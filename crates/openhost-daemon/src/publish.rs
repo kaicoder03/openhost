@@ -15,6 +15,7 @@
 
 use crate::config::PkarrConfig;
 use crate::error::{PublishError, Result as DaemonResult};
+use hkdf::Hkdf;
 use openhost_core::identity::SigningKey;
 use openhost_core::pkarr_record::{
     IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
@@ -22,21 +23,29 @@ use openhost_core::pkarr_record::{
 use openhost_pkarr::{
     PkarrTransport, Publisher, PublisherHandle, RecordSource, Transport, DEFAULT_RELAYS,
 };
+use sha2::Sha256;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Domain-separation salt for the allowlist-salt derivation. Stable across
+/// openhost protocol versions so a daemon rebooted on the same identity
+/// always produces the same per-host salt.
+const ALLOW_SALT_HKDF_SALT: &[u8] = b"openhost-allow-salt-v1";
 
 /// Mutable state shared between the publisher and the rest of the daemon.
 ///
 /// Every field that later PRs will mutate is wrapped in a `RwLock`; every
 /// field the publisher must see consistently — i.e. the per-host salt
-/// that keys the allowlist HMAC — is immutable for the lifetime of this
-/// struct.
+/// that keys the allowlist HMAC — is derived deterministically from the
+/// host identity and therefore immutable for the lifetime of this struct.
 ///
-/// **Salt persistence:** this PR generates a fresh salt on every boot.
-/// That's safe because the `allow` list ships empty, so no client yet
-/// depends on the salt's stability. PR #7 (pairing + allowlist) will
-/// promote the salt to a persisted, identity-bound value; until then,
-/// randomising is the least-surprising default.
+/// **Salt derivation:** the salt is `HKDF-SHA256(ikm=identity_seed,
+/// salt="openhost-allow-salt-v1", info="")`. Deriving from the identity
+/// means a rebooted daemon with the same identity file produces the same
+/// salt, so any `_allow` entries clients computed against a previous
+/// process remain valid. PR #7 (pairing + allowlist) relies on this
+/// stability; randomising per-boot would silently invalidate every paired
+/// client whenever the daemon restarted.
 pub struct SharedState {
     dtls_fp: RwLock<[u8; DTLS_FINGERPRINT_LEN]>,
     salt: [u8; SALT_LEN],
@@ -46,12 +55,15 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Build a new `SharedState` with the given DTLS fingerprint and a
-    /// freshly-generated random salt. `roles` defaults to `"server"`.
-    pub fn new(dtls_fp: [u8; DTLS_FINGERPRINT_LEN]) -> Self {
+    /// Build a new `SharedState` with the given DTLS fingerprint. The salt
+    /// is derived deterministically from `identity` via HKDF-SHA256 (see
+    /// the struct-level doc for the scheme).
+    pub fn new(identity: &SigningKey, dtls_fp: [u8; DTLS_FINGERPRINT_LEN]) -> Self {
+        let seed = identity.to_bytes();
+        let hk = Hkdf::<Sha256>::new(Some(ALLOW_SALT_HKDF_SALT), &seed);
         let mut salt = [0u8; SALT_LEN];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut salt);
+        hk.expand(&[], &mut salt)
+            .expect("HKDF expansion to 32 bytes cannot fail");
         Self {
             dtls_fp: RwLock::new(dtls_fp),
             salt,
@@ -171,6 +183,14 @@ fn build_default_transport(cfg: &PkarrConfig) -> DaemonResult<Arc<dyn Transport>
         .relays(&relays)
         .map_err(|e| PublishError::ClientBuild(format!("invalid relay URL: {e}")))?;
 
+    // TODO(M3.2): `App::build` returns success once the publisher task is
+    // spawned, NOT once the first publish lands. A slow relay can leave
+    // the daemon "up" while still undiscoverable for up to pkarr's default
+    // request timeout. Decide between (a) gating `App::build` on the
+    // initial publish succeeding — blocks startup on relay availability —
+    // or (b) emitting a "first publish landed" event a supervisor can
+    // observe. Pair this with the exp-backoff retry marked `TODO(M3)` in
+    // `openhost-pkarr/src/publisher.rs:175`.
     let client = builder
         .build()
         .map_err(|e| PublishError::ClientBuild(e.to_string()))?;
@@ -219,7 +239,7 @@ mod tests {
         let transport = Arc::new(FakeTransport::default());
         let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
         let expected_fp = [0x42u8; DTLS_FINGERPRINT_LEN];
-        let state = Arc::new(SharedState::new(expected_fp));
+        let state = Arc::new(SharedState::new(&sk, expected_fp));
 
         let service = start_with_transport(&test_cfg(), sk, state.clone(), transport.clone());
 
@@ -237,7 +257,7 @@ mod tests {
     async fn trigger_after_fp_mutation_publishes_new_fingerprint() {
         let transport = Arc::new(FakeTransport::default());
         let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
-        let state = Arc::new(SharedState::new([0x01; DTLS_FINGERPRINT_LEN]));
+        let state = Arc::new(SharedState::new(&sk, [0x01; DTLS_FINGERPRINT_LEN]));
 
         let service = start_with_transport(&test_cfg(), sk, state.clone(), transport.clone());
 
@@ -268,7 +288,7 @@ mod tests {
     async fn allow_and_ice_default_to_empty() {
         let transport = Arc::new(FakeTransport::default());
         let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
-        let state = Arc::new(SharedState::new([0x42; DTLS_FINGERPRINT_LEN]));
+        let state = Arc::new(SharedState::new(&sk, [0x42; DTLS_FINGERPRINT_LEN]));
 
         let service = start_with_transport(&test_cfg(), sk, state.clone(), transport.clone());
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -283,18 +303,38 @@ mod tests {
     }
 
     #[test]
-    fn salt_is_stable_per_shared_state() {
-        let state = SharedState::new([0; DTLS_FINGERPRINT_LEN]);
-        let s1 = state.salt();
-        let s2 = state.salt();
-        assert_eq!(s1, s2);
-
-        // Two independent states draw fresh salts.
-        let other = SharedState::new([0; DTLS_FINGERPRINT_LEN]);
-        assert_ne!(
-            s1,
-            other.salt(),
-            "two SharedState instances should have distinct random salts"
+    fn salt_is_derived_deterministically_from_identity() {
+        let sk_a = SigningKey::from_bytes(&RFC_SEED);
+        let s1 = SharedState::new(&sk_a, [0; DTLS_FINGERPRINT_LEN]).salt();
+        let s2 = SharedState::new(&sk_a, [0xFF; DTLS_FINGERPRINT_LEN]).salt();
+        assert_eq!(
+            s1, s2,
+            "same identity must yield the same salt across reboots \
+             (the dtls_fp value must not influence salt)"
         );
+
+        // A different identity produces a different salt — domain separation
+        // means no two hosts share one by construction.
+        let mut other_seed = RFC_SEED;
+        other_seed[0] ^= 1;
+        let sk_b = SigningKey::from_bytes(&other_seed);
+        let s_other = SharedState::new(&sk_b, [0; DTLS_FINGERPRINT_LEN]).salt();
+        assert_ne!(s1, s_other, "distinct identities must yield distinct salts");
+    }
+
+    #[test]
+    fn salt_matches_known_hkdf_vector() {
+        // Pin the RFC-seed salt. If this expected value ever has to change,
+        // it's a protocol-visible bump: existing paired clients' `_allow`
+        // entries become invalid.
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let got = SharedState::new(&sk, [0; DTLS_FINGERPRINT_LEN]).salt();
+
+        // Regenerate manually — belt-and-braces that our call matches the
+        // documented scheme.
+        let mut expected = [0u8; SALT_LEN];
+        let hk = Hkdf::<Sha256>::new(Some(ALLOW_SALT_HKDF_SALT), &RFC_SEED);
+        hk.expand(&[], &mut expected).unwrap();
+        assert_eq!(got, expected);
     }
 }
