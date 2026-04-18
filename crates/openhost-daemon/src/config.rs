@@ -82,13 +82,40 @@ pub struct DtlsConfig {
     pub rotate_secs: u64,
 }
 
-/// Reserved — wired up in PR #6.
+/// Localhost forward configuration (PR #6). Spec §7.12 mitigation +
+/// §4.1 header rules are applied inside [`crate::forward::Forwarder`].
+///
+/// If `target` is `None`, the daemon keeps PR #5's stub 502 response
+/// path. If set, inbound `REQUEST_*` frames get forwarded to the
+/// configured URL.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardConfig {
-    /// Upstream target, e.g. `http://127.0.0.1:8080`.
+    /// Upstream target, e.g. `http://127.0.0.1:8080`. Must be an
+    /// `http://` URL; HTTPS upstreams are not supported in this PR.
     #[serde(default)]
     pub target: Option<String>,
+
+    /// Value to pin on the outbound `Host` header (spec §4.1). If
+    /// absent, derived from `target`'s authority at `Forwarder` build
+    /// time.
+    #[serde(default)]
+    pub host_override: Option<String>,
+
+    /// Maximum buffered request body size in bytes. Requests exceeding
+    /// this cap trigger a framing-violation teardown. Defaults to
+    /// [`DEFAULT_MAX_BODY_BYTES`] (16 MiB).
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+/// Default value for [`ForwardConfig::max_body_bytes`]. Chosen to match
+/// the frame codec's `MAX_PAYLOAD_LEN` (16 MiB − 1) so a full-size
+/// request body fits in a single `REQUEST_BODY` frame plus overhead.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn default_max_body_bytes() -> usize {
+    DEFAULT_MAX_BODY_BYTES
 }
 
 /// Logging configuration.
@@ -143,6 +170,19 @@ impl Config {
         for url in &self.pkarr.relays {
             if !url.starts_with("https://") {
                 return Err(ConfigError::InvalidRelayUrl { url: url.clone() }.into());
+            }
+        }
+        if let Some(forward) = &self.forward {
+            if let Some(target) = &forward.target {
+                if !target.starts_with("http://") {
+                    return Err(ConfigError::Invalid(
+                        "forward.target must be an http:// URL (HTTPS upstreams not supported yet)",
+                    )
+                    .into());
+                }
+            }
+            if forward.max_body_bytes == 0 {
+                return Err(ConfigError::Invalid("forward.max_body_bytes must be > 0").into());
             }
         }
         Ok(())

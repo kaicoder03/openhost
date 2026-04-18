@@ -20,10 +20,11 @@
 //! in [`PassivePeer::wire_dtls_state_observer`].
 
 use crate::error::ListenerError;
+use crate::forward::{ForwardResponse, Forwarder};
 use crate::publish::SharedState;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use openhost_core::identity::SigningKey;
-use openhost_core::wire::{Frame, FrameType};
+use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
 use tokio::sync::Mutex;
@@ -94,6 +95,11 @@ pub struct PassivePeer {
     state: Arc<SharedState>,
     active: Arc<Mutex<HashMap<PcKey, Arc<RTCPeerConnection>>>>,
     offer_timeout_secs: u64,
+    /// Localhost forwarder. `None` falls back to the PR #5 stub
+    /// (`HTTP/1.1 502 Bad Gateway` on every `REQUEST_HEAD`) — a daemon
+    /// without a `[forward]` config section stays serviceable as a
+    /// pkarr-only host discovery target.
+    forwarder: Option<Arc<Forwarder>>,
 }
 
 impl PassivePeer {
@@ -106,6 +112,7 @@ impl PassivePeer {
         certificate: RTCCertificate,
         identity: Arc<SigningKey>,
         state: Arc<SharedState>,
+        forwarder: Option<Arc<Forwarder>>,
     ) -> Result<Self, ListenerError> {
         // rustls 0.23+ requires a CryptoProvider before any TLS / DTLS
         // session is established. Install ring once per process; the
@@ -127,6 +134,7 @@ impl PassivePeer {
             state,
             active: Arc::new(Mutex::new(HashMap::new())),
             offer_timeout_secs: DEFAULT_OFFER_TIMEOUT_SECS,
+            forwarder,
         })
     }
 
@@ -190,7 +198,7 @@ impl PassivePeer {
         // peer-connection-state prune hook BEFORE applying the remote
         // description — webrtc-rs fires handlers off internal event loops
         // that can race the DTLS handshake start.
-        wire_data_channel_handler(Arc::clone(&pc));
+        wire_data_channel_handler(Arc::clone(&pc), self.forwarder.clone());
         wire_dtls_state_observer(Arc::clone(&pc));
         wire_prune_on_terminal_state(Arc::clone(&pc), Arc::clone(&self.active));
 
@@ -336,24 +344,44 @@ fn wire_prune_on_terminal_state(
 
 /// Register the `on_data_channel` handler that converts raw
 /// DataChannel messages into framed responses.
-fn wire_data_channel_handler(pc: Arc<RTCPeerConnection>) {
+fn wire_data_channel_handler(pc: Arc<RTCPeerConnection>, forwarder: Option<Arc<Forwarder>>) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let label = dc.label().to_string();
+        let forwarder = forwarder.clone();
         Box::pin(async move {
             tracing::debug!(label, "openhostd: data channel opened");
-            wire_frame_loop(dc).await;
+            wire_frame_loop(dc, forwarder).await;
         })
     }));
 }
 
+/// Per-data-channel request assembly state. Populated on `RequestHead`,
+/// appended to on `RequestBody`, consumed on `RequestEnd`.
+#[derive(Default)]
+struct RequestInProgress {
+    head_payload: Option<Vec<u8>>,
+    body: BytesMut,
+}
+
+impl RequestInProgress {
+    fn reset(&mut self) {
+        self.head_payload = None;
+        self.body.clear();
+    }
+}
+
 /// Attach a `on_message` handler to `dc` that accumulates bytes, decodes
-/// frames, and replies `502 Bad Gateway` to every `REQUEST_HEAD`.
-async fn wire_frame_loop(dc: Arc<RTCDataChannel>) {
+/// frames, and either forwards via the configured forwarder or (if no
+/// forwarder is configured) falls back to the PR #5 stub 502 response.
+async fn wire_frame_loop(dc: Arc<RTCDataChannel>, forwarder: Option<Arc<Forwarder>>) {
     let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let dc_handler = Arc::clone(&dc);
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let buffer = Arc::clone(&buffer);
+        let request = Arc::clone(&request);
         let dc = Arc::clone(&dc_handler);
+        let forwarder = forwarder.clone();
         Box::pin(async move {
             let mut buf = buffer.lock().await;
             buf.extend_from_slice(&msg.data);
@@ -361,15 +389,22 @@ async fn wire_frame_loop(dc: Arc<RTCDataChannel>) {
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
                         buf.drain(..consumed);
-                        if let Err(err) = handle_frame(&frame, &dc).await {
-                            tracing::warn!(?err, "openhostd: failed to send response frame");
+                        let outcome =
+                            handle_frame(&frame, &dc, &request, forwarder.as_deref()).await;
+                        if let FrameOutcome::Teardown = outcome {
+                            let _ = dc.close().await;
+                            buf.clear();
+                            request.lock().await.reset();
+                            break;
                         }
                     }
                     Ok(None) => break,
                     Err(err) => {
                         tracing::warn!(?err, "openhostd: malformed frame; tearing down channel");
+                        let _ = send_error_frame(&dc, "malformed frame").await;
                         let _ = dc.close().await;
                         buf.clear();
+                        request.lock().await.reset();
                         break;
                     }
                 }
@@ -378,15 +413,147 @@ async fn wire_frame_loop(dc: Arc<RTCDataChannel>) {
     }));
 }
 
-/// Handle one decoded inbound frame. For this PR every `REQUEST_HEAD`
-/// is answered with a `502 Bad Gateway`; body/end/keepalive/error
-/// frames are silently dropped until PR #6 wires the forwarder.
-async fn handle_frame(frame: &Frame, dc: &RTCDataChannel) -> Result<(), webrtc::Error> {
-    if frame.frame_type != FrameType::RequestHead {
-        // Ignore body/end/keepalive/error for now. PR #6 will stitch
-        // REQUEST_BODY → REQUEST_END into an upstream hyper call.
-        return Ok(());
+enum FrameOutcome {
+    Continue,
+    Teardown,
+}
+
+/// Dispatch one decoded inbound frame. Accumulates request state across
+/// `RequestHead` → `RequestBody*` → `RequestEnd`. When `RequestEnd`
+/// arrives the forwarder (if configured) runs; otherwise the PR #5 stub
+/// 502 response fires.
+async fn handle_frame(
+    frame: &Frame,
+    dc: &RTCDataChannel,
+    request: &Arc<Mutex<RequestInProgress>>,
+    forwarder: Option<&Forwarder>,
+) -> FrameOutcome {
+    match frame.frame_type {
+        FrameType::RequestHead => {
+            let mut req = request.lock().await;
+            req.head_payload = Some(frame.payload.clone());
+            req.body.clear();
+            FrameOutcome::Continue
+        }
+        FrameType::RequestBody => {
+            let mut req = request.lock().await;
+            if req.head_payload.is_none() {
+                tracing::warn!("openhostd: REQUEST_BODY before REQUEST_HEAD; tearing down");
+                let _ = send_error_frame(dc, "REQUEST_BODY before REQUEST_HEAD").await;
+                return FrameOutcome::Teardown;
+            }
+            let cap = forwarder
+                .map(Forwarder::max_body_bytes)
+                .unwrap_or(usize::MAX);
+            if req.body.len().saturating_add(frame.payload.len()) > cap {
+                tracing::warn!(cap, "openhostd: request body exceeded cap; tearing down");
+                let _ = send_error_frame(dc, "request body too large").await;
+                return FrameOutcome::Teardown;
+            }
+            req.body.extend_from_slice(&frame.payload);
+            FrameOutcome::Continue
+        }
+        FrameType::RequestEnd => {
+            let (head, body) = {
+                let mut req = request.lock().await;
+                match req.head_payload.take() {
+                    Some(h) => (h, std::mem::take(&mut req.body)),
+                    None => {
+                        tracing::warn!("openhostd: REQUEST_END without REQUEST_HEAD; tearing down");
+                        let _ = send_error_frame(dc, "REQUEST_END without REQUEST_HEAD").await;
+                        return FrameOutcome::Teardown;
+                    }
+                }
+            };
+            match forwarder {
+                Some(fwd) => match fwd.forward(&head, body.freeze()).await {
+                    Ok(resp) => {
+                        if let Err(err) = emit_response(dc, resp).await {
+                            tracing::warn!(?err, "openhostd: failed to emit response frames");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "openhostd: forwarder failed; replying 502");
+                        let _ = emit_stub_502(dc).await;
+                    }
+                },
+                None => {
+                    // PR #5 stub path — no forwarder configured.
+                    let _ = emit_stub_502(dc).await;
+                }
+            }
+            FrameOutcome::Continue
+        }
+        FrameType::Ping => {
+            let pong = Frame::new(FrameType::Pong, Vec::new()).expect("Pong is empty");
+            let mut out = Vec::with_capacity(5);
+            pong.encode(&mut out);
+            if let Err(err) = dc.send(&Bytes::from(out)).await {
+                tracing::warn!(?err, "openhostd: failed to send Pong");
+            }
+            FrameOutcome::Continue
+        }
+        FrameType::Error => {
+            let payload = String::from_utf8_lossy(&frame.payload);
+            tracing::warn!(
+                client_error = %payload,
+                "openhostd: client sent ERROR frame; tearing down channel"
+            );
+            FrameOutcome::Teardown
+        }
+        // Keepalive responses from the client are fine to ignore — the
+        // daemon doesn't currently initiate Pings.
+        FrameType::Pong => FrameOutcome::Continue,
+        // Response frames coming from the CLIENT side are protocol
+        // violations; REQUEST_* is the only direction we accept.
+        FrameType::ResponseHead
+        | FrameType::ResponseBody
+        | FrameType::ResponseEnd
+        | FrameType::WsUpgrade
+        | FrameType::WsFrame => {
+            tracing::warn!(
+                ?frame.frame_type,
+                "openhostd: client sent unexpected frame type; tearing down"
+            );
+            let _ = send_error_frame(dc, "unexpected frame type from client").await;
+            FrameOutcome::Teardown
+        }
     }
+}
+
+/// Emit a forwarder response as `RESPONSE_HEAD` + `RESPONSE_BODY*` +
+/// `RESPONSE_END`. The body is chunked across multiple frames when it
+/// exceeds `MAX_PAYLOAD_LEN`.
+async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(), webrtc::Error> {
+    let head =
+        Frame::new(FrameType::ResponseHead, resp.head_bytes).expect("response head is well-formed");
+    let mut out = Vec::with_capacity(1024);
+    head.encode(&mut out);
+
+    // Chunk the body into RESPONSE_BODY frames bounded by the wire
+    // codec's per-frame max.
+    let body = resp.body;
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = (offset + MAX_PAYLOAD_LEN).min(body.len());
+        let slice = body.slice(offset..end);
+        let body_frame = Frame::new(FrameType::ResponseBody, slice.to_vec())
+            .expect("chunk length bounded by MAX_PAYLOAD_LEN");
+        body_frame.encode(&mut out);
+        offset = end;
+    }
+
+    let end_frame = Frame::new(FrameType::ResponseEnd, Vec::new()).expect("ResponseEnd empty");
+    end_frame.encode(&mut out);
+
+    dc.send(&Bytes::from(out)).await?;
+    Ok(())
+}
+
+/// Emit the PR #5 stub response: HTTP 502 head + empty body. Used when
+/// no forwarder is configured AND as the fallback when the forwarder
+/// errors (upstream unreachable, body too large, etc.).
+async fn emit_stub_502(dc: &RTCDataChannel) -> Result<(), webrtc::Error> {
     let response_head = Frame::new(FrameType::ResponseHead, RESPONSE_502_HEAD.to_vec())
         .expect("502 head payload is well-formed");
     let response_end =
@@ -395,6 +562,18 @@ async fn handle_frame(frame: &Frame, dc: &RTCDataChannel) -> Result<(), webrtc::
     let mut out = Vec::with_capacity(RESPONSE_502_HEAD.len() + 16);
     response_head.encode(&mut out);
     response_end.encode(&mut out);
+    dc.send(&Bytes::from(out)).await?;
+    Ok(())
+}
+
+/// Send a spec §5 `ERROR` frame with a short diagnostic string. Best
+/// effort — failure is logged by the caller but doesn't prevent
+/// teardown.
+async fn send_error_frame(dc: &RTCDataChannel, reason: &str) -> Result<(), webrtc::Error> {
+    let frame = Frame::new(FrameType::Error, reason.as_bytes().to_vec())
+        .expect("error diagnostic is well-formed");
+    let mut out = Vec::with_capacity(5 + reason.len());
+    frame.encode(&mut out);
     dc.send(&Bytes::from(out)).await?;
     Ok(())
 }

@@ -61,6 +61,14 @@ rcgen = { version = "0.13", features = ["pem"] }
 directories = "5"
 tempfile = "3"
 
+# Localhost forward HTTP client (openhost-daemon, M6.1)
+# `hyper` + `http` already enter the tree transitively via pkarr → reqwest;
+# listed here to pin the versions the daemon compiles against directly.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

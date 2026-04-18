@@ -32,6 +32,10 @@ pub enum DaemonError {
     #[error(transparent)]
     Listener(#[from] ListenerError),
 
+    /// The localhost forwarder failed.
+    #[error(transparent)]
+    Forward(#[from] ForwardError),
+
     /// Low-level I/O failure not caught by a more specific variant.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -118,6 +122,45 @@ pub enum PublishError {
     /// The pkarr crate failed to build a `Client` from the configured relays.
     #[error("failed to build pkarr client: {0}")]
     ClientBuild(String),
+}
+
+/// Localhost forwarder failures.
+#[derive(Debug, Error)]
+pub enum ForwardError {
+    /// The configured `forward.target` could not be parsed as an HTTP URI.
+    #[error("forward.target is not a valid http:// URL: {0}")]
+    TargetParse(String),
+
+    /// Inbound `REQUEST_HEAD` payload is malformed (not valid HTTP/1.1
+    /// text, unsupported method, wrong HTTP version, etc.).
+    #[error("inbound request head is malformed: {0}")]
+    HeadParse(&'static str),
+
+    /// Inbound request body exceeded the configured
+    /// `forward.max_body_bytes` cap.
+    #[error("request body exceeded {cap} byte cap")]
+    BodyTooLarge {
+        /// The configured maximum in bytes.
+        cap: usize,
+    },
+
+    /// Request asserts `Upgrade: websocket`; per spec §4 line 162,
+    /// websockets are gated by explicit per-path config and this PR
+    /// doesn't ship that gating yet.
+    #[error("Upgrade: websocket is not supported by this daemon (gating is a future PR)")]
+    WebSocketUnsupported,
+
+    /// Upstream refused the connection, timed out, or returned an
+    /// unrecoverable protocol error.
+    #[error("upstream request failed: {0}")]
+    UpstreamUnreachable(String),
+
+    /// Upstream response is something the forwarder cannot translate
+    /// into the openhost frame codec (e.g. a `101 Switching Protocols`
+    /// where we don't support the upgrade, or a response head that
+    /// exceeds `MAX_PAYLOAD_LEN` after sanitisation).
+    #[error("upstream response cannot be forwarded: {0}")]
+    UpstreamResponse(&'static str),
 }
 
 /// WebRTC listener failures.
