@@ -248,11 +248,14 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
             // Expected while real webrtc-rs answer sizes exceed the
             // BEP44 cap even with fragmentation. See module docs.
         }
-        Ok(_) => {
-            // If this starts passing the real-SDP size gap is closed;
-            // upgrade this test or retire it.
-        }
-        Err(other) => panic!("expected PollAnswerTimeout or Ok; got {other:?}"),
+        Ok(_) => panic!(
+            "dial unexpectedly succeeded — the residual BEP44-size gap \
+             post-PR#15 appears to have closed on this configuration. \
+             Retire this test (or upgrade it to a full HTTP round-trip \
+             assertion) rather than letting it keep passing without \
+             checking what actually works."
+        ),
+        Err(other) => panic!("expected PollAnswerTimeout; got {other:?}"),
     }
 
     let expected_hash =

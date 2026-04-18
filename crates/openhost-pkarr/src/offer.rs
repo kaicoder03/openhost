@@ -173,7 +173,11 @@ const FRAGMENT_HEADER_LEN: usize = 5;
 /// inside BEP44's 1000-byte packet cap.
 pub const MAX_FRAGMENT_PAYLOAD_BYTES: usize = 180;
 
-/// Maximum `chunk_total` we emit or accept. Bounded by `u8` on the wire.
+/// Maximum number of fragments per answer. Bounded by the `u8`
+/// `chunk_total` field on the wire (so 255 is both the hard ceiling
+/// and `u8::MAX`). At [`MAX_FRAGMENT_PAYLOAD_BYTES`] = 180 this caps
+/// the sealed ciphertext per answer at 45,900 bytes — well past
+/// anything a plausible WebRTC answer produces.
 pub const MAX_FRAGMENT_TOTAL: u8 = 255;
 
 fn encode_fragment(idx: u8, total: u8, payload: &[u8]) -> Vec<u8> {
@@ -221,6 +225,15 @@ fn decode_fragment(bytes: &[u8]) -> Result<DecodedFragment> {
         ));
     }
     let payload_len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+    if payload_len == 0 {
+        // A zero-length payload is meaningless — a well-formed fragment
+        // always carries at least one byte of the sealed ciphertext.
+        // Rejecting here defends against padding-by-empty-fragments
+        // that would otherwise waste decoder work.
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment payload_len is zero",
+        ));
+    }
     if payload_len > MAX_FRAGMENT_PAYLOAD_BYTES {
         return Err(PkarrError::MalformedCanonical(
             "answer fragment payload exceeds per-fragment cap",
@@ -504,17 +517,30 @@ pub fn encode_with_answers(
         per_answer_records.push(named);
     }
 
+    // Flatten once up-front. Eviction moves `records_start` forward to
+    // the first byte of the next answer's fragment set — no per-retry
+    // re-collection needed.
+    let flat_records: Vec<&(String, String)> = per_answer_records
+        .iter()
+        .flat_map(|answer| answer.iter())
+        .collect();
+    let mut answer_start_offsets: Vec<usize> = Vec::with_capacity(sorted.len() + 1);
+    let mut running = 0usize;
+    for answer in &per_answer_records {
+        answer_start_offsets.push(running);
+        running += answer.len();
+    }
+    answer_start_offsets.push(running);
+
     // Try with ALL answers first. pkarr's own signer enforces the
     // 1000-byte BEP44 cap and returns `SignedPacketBuildError::PacketTooLarge`
     // BEFORE we get a packet back, so we need to drop entries and
     // retry rather than post-hoc inspecting `encoded_packet().len()`.
     let mut keep_from = 0usize;
     loop {
-        let records: Vec<&(String, String)> = per_answer_records[keep_from..]
-            .iter()
-            .flat_map(|answer| answer.iter())
-            .collect();
-        match build_packet(&main_txt, ts, &records, &keypair) {
+        let records_start = answer_start_offsets[keep_from];
+        let records = &flat_records[records_start..];
+        match build_packet(&main_txt, ts, records, &keypair) {
             Ok(packet) => {
                 // Defensive: also re-check our own ceiling in case the
                 // pkarr crate's check moves in a future release.
@@ -628,6 +654,14 @@ pub fn decode_answer_fragments_from_packet(
         "{ANSWER_TXT_PREFIX}{}",
         zbase32::encode_full_bytes(&client_hash)
     );
+
+    // TODO(perf): replace the per-fragment `collect_single_txt` probes
+    // with a single pass over `packet.all_resource_records()` that
+    // bucket-sorts matching names by their numeric `-<idx>` suffix.
+    // Today this walks the packet's RR list `chunk_total` times — fine
+    // for the 1–3 fragments we see in practice, O(N²) in the
+    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
+    // reassembly per dial attempt) so the refactor is deferred.
 
     // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
     let first_name = format!("{base}-0");
@@ -1533,6 +1567,66 @@ mod tests {
         assert!(
             matches!(err, PkarrError::MalformedCanonical(m) if m.contains("missing")),
             "expected missing-fragment error, got {err:?}",
+        );
+    }
+
+    /// Defense against a packet where a non-zero fragment's envelope
+    /// `chunk_idx` disagrees with the numeric suffix of its DNS name
+    /// (e.g. `_answer-<hash>-1` carries envelope idx=2). Spec §3.3
+    /// requires consistency and the decoder must reject, otherwise an
+    /// attacker who controls the publisher key could trivially rewire
+    /// the reassembly order.
+    #[test]
+    fn fragment_reassembly_detects_label_envelope_idx_disagreement() {
+        let sk = host_sk();
+        let client_pk = client_sk().public_key();
+        let salt = [0x33u8; SALT_LEN];
+        let signed = reference_signed();
+
+        // Two well-formed fragments claiming total = 2, but the second
+        // fragment's envelope claims idx=0 (duplicate) even though its
+        // DNS label suffix is `-1`.
+        let frag0 = encode_fragment(0, 2, b"zero");
+        let frag_wrong = encode_fragment(0, 2, b"oops");
+        let client_hash = allowlist_hash(&salt, &client_pk.to_bytes());
+        let label = zbase32::encode_full_bytes(&client_hash);
+        let base = format!("{ANSWER_TXT_PREFIX}{label}");
+
+        let main_blob = {
+            let canonical = signed.record.canonical_signing_bytes().unwrap();
+            let mut b = Vec::with_capacity(64 + canonical.len());
+            b.extend_from_slice(&signed.signature.to_bytes());
+            b.extend_from_slice(&canonical);
+            URL_SAFE_NO_PAD.encode(&b)
+        };
+        let seed = Zeroizing::new(sk.to_bytes());
+        let keypair = Keypair::from_secret_key(&seed);
+        let ts = Timestamp::from(signed.record.ts * MICROS_PER_SECOND);
+        let packet = SignedPacket::builder()
+            .timestamp(ts)
+            .txt(
+                Name::new_unchecked(OPENHOST_TXT_NAME),
+                TXT::try_from(main_blob.as_str()).unwrap(),
+                OPENHOST_TXT_TTL,
+            )
+            .txt(
+                Name::new_unchecked(&format!("{base}-0")),
+                TXT::try_from(URL_SAFE_NO_PAD.encode(&frag0).as_str()).unwrap(),
+                OFFER_TXT_TTL,
+            )
+            .txt(
+                Name::new_unchecked(&format!("{base}-1")),
+                TXT::try_from(URL_SAFE_NO_PAD.encode(&frag_wrong).as_str()).unwrap(),
+                OFFER_TXT_TTL,
+            )
+            .sign(&keypair)
+            .unwrap();
+
+        let err = decode_answer_fragments_from_packet(&packet, &salt, &client_pk)
+            .expect_err("label/envelope idx disagreement must be rejected");
+        assert!(
+            matches!(err, PkarrError::MalformedCanonical(m) if m.contains("disagrees with its DNS label suffix")),
+            "expected label-mismatch error, got {err:?}",
         );
     }
 
