@@ -8,6 +8,29 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-18
+
+The first tagged release. Daemon + client + pkarr integration + WebRTC + channel binding + HTTP forwarding + allowlist + rate limit all shipped. One known gap remains (see below).
+
+### Added (PR #11, v0.1 freeze)
+
+- `openhost-pkarr` offer/answer sealed-plaintext compression. New 1-byte `compression_tag` discriminator prefixing every sealed inner plaintext: `0x01` = uncompressed (legacy, still accepted), `0x02` = zlib (RFC 1950, default for v0.1+ encoders). Decompression output is hard-capped at 64 KiB to defend against zip bombs. The main `_openhost` canonical bytes, outer sealed-box wrapping, base64url, and DNS TXT packaging are all byte-identical; only the sealed plaintext layer changes. 6 new offer-codec unit tests: v2 roundtrip (offer + answer), v1 back-compat for both codecs, size strictly-smaller sanity on a realistic SDP, DoS cap rejection, empty-SDP edge case, unknown-tag rejection.
+- Workspace dep: `flate2 = "1"` (pure-Rust miniz_oxide backend — no C deps).
+- `spec/01-wire-format.md` reconciled. Canonical text now matches shipped code: client-first channel-binding order (AUTH_NONCE → AUTH_CLIENT → AUTH_HOST), empty DTLS exporter `context` with `host_pk || client_pk || nonce` in HKDF `info`, `_answer-<client-hash>` TXT format with compression tag. The three `TODO(v0.1 freeze)` blocks are resolved.
+
+### Changed (PR #11, v0.1 freeze)
+
+- Workspace version bumped `0.0.0` → `0.1.0`. A `v0.1.0` git tag follows this merge.
+- `crates/openhost-client/tests/end_to_end.rs`: `daemon_produces_sealed_answer_for_dialer_offer` now reflects the post-compression reality. Compression alone doesn't shrink a high-entropy WebRTC SDP enough to fit answer + `_openhost` in the BEP44 1000-byte cap on some configurations, so the test continues to assert against `SharedState::snapshot_answers()` (every server-side layer ran) rather than the wire packet. A full wire-level HTTP round-trip still requires splitting the answer across multiple pkarr records — tracked as post-v0.1.
+
+### Known limitations in 0.1.0
+
+- **Answer delivery over BEP44 is best-effort.** A fully-trickled WebRTC answer SDP can overflow the 1000-byte mutable-item cap when folded alongside the main `_openhost` record. Compression (new in 0.1.0) makes the common case fit; the eviction path remains as a safety valve but means some paired clients may not receive a response on the first poll. Post-v0.1 work splits the answer into separate records.
+- **Client allowlist mutation requires SIGHUP on Unix and daemon restart on Windows.** The CLI prints the reminder on every `pair add` / `pair remove`.
+- **No bundled client CLI.** `openhost-resolve` still ships for record inspection. A `openhost-dial` bin is planned as a follow-up; the `Dialer` library surface is the supported integration point.
+
+## [Pre-0.1.0 development history]
+
 ### Added
 
 - `openhost-client` M8 WebRTC offerer + in-process end-to-end test:

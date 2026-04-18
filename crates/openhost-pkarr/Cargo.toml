@@ -33,6 +33,8 @@ async-trait = { workspace = true }
 sha2 = { workspace = true }
 zbase32 = { workspace = true }
 rand_core = { workspace = true }
+# PR #11: inner-plaintext zlib compression.
+flate2 = { workspace = true }
 
 # Optional — only compiled under the `nostr` feature.
 serde_json = { workspace = true, optional = true }

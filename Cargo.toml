@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
@@ -33,6 +33,10 @@ subtle = "2"
 zbase32 = "0.1"
 base64 = "0.22"
 hex = "0.4"
+# PR #11: zlib compression for the sealed-box inner plaintext so
+# answer SDPs fit the BEP44 1000-byte `v` cap. Pure-Rust backend via
+# miniz_oxide; no C deps.
+flate2 = "1"
 
 # RNG — aligned with ed25519-dalek v2.x (rand_core 0.6)
 rand = { version = "0.8", features = ["std_rng"] }

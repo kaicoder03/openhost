@@ -2,20 +2,29 @@
 //!
 //! Spins up a real `openhost_daemon::App` and a real
 //! `openhost_client::Dialer` in the same tokio runtime, wires both
-//! sides through a shared `MemoryPkarrNetwork`, and drives the full
-//! pkarr → WebRTC → channel-binding → HTTP stack. The daemon's
-//! `[forward]` target is a tiny hyper server on an ephemeral loopback
-//! port; we assert the response survives the round-trip byte-for-byte.
+//! sides through a shared `MemoryPkarrNetwork`, and asserts the full
+//! daemon-side flow fires (resolve → poll offer → handle_offer →
+//! seal → queue answer).
 //!
-//! # Known constraints
+//! # Known constraint — wire-level answer delivery
 //!
-//! - The client's offer SDP is built WITHOUT waiting for ICE gather
-//!   completion (see `Dialer::build_offer` — BEP44 cap). The daemon's
-//!   answer SDP IS fully gathered; for loopback typically 1–2
-//!   candidates, which fits the remaining packet budget. On machines
-//!   where this squeezes, the `daemon_does_not_double_process_same_offer`
-//!   pattern from PR #7a would be the right extension (assert against
-//!   `SharedState` rather than the wire packet).
+//! A real WebRTC answer SDP is ~400 bytes. The high-entropy fields
+//! (DTLS fingerprint, ICE credentials) don't compress meaningfully,
+//! so even after PR #11's zlib-compressed inner plaintext, the
+//! sealed answer + base64url + DNS packaging totals ~700 bytes. The
+//! main `_openhost` record takes ~300 bytes, pushing a combined
+//! packet past BEP44's 1000-byte `v` cap on some measurements. When
+//! the encoder evicts the answer the dialer's `poll_answer` never
+//! sees it on the wire.
+//!
+//! For PR #11 we therefore assert against
+//! `SharedState::snapshot_answers()` (the daemon produced + sealed
+//! the answer — every layer above the wire ran) plus a separate
+//! verification that the sealed answer EXISTS in the memory net (so
+//! the publish path itself works). A true wire-level HTTP round-trip
+//! requires either splitting the answer into a separate pkarr record
+//! (architecturally larger than a v0.1 freeze) or picking a
+//! different substrate — tracked as post-v0.1 work.
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -104,34 +113,13 @@ fn daemon_config(tmp: &TempDir, watched: Vec<String>, upstream_port: Option<u16>
     }
 }
 
-/// The first end-to-end regression guard we can run without a real
-/// relay or the DHT. Drives a real [`App`] and a real [`Dialer`]
-/// against each other through a shared [`MemoryPkarrNetwork`] and
-/// asserts the full daemon-side flow fires:
-///
-/// 1. Dialer publishes its sealed offer into the shared net.
-/// 2. Daemon's poller picks it up on its 1 Hz tick.
-/// 3. Daemon's `PassivePeer::handle_offer` produces an answer SDP.
-/// 4. Daemon seals the answer + queues it in `SharedState`.
-/// 5. Daemon triggers a republish.
-///
-/// # Known architectural gap — wire-level answer delivery
-///
-/// The daemon's answer SDP (even with `set_skip_ice_gather_for_tests`)
-/// is ~500 bytes; sealed it's ~560 bytes; base64url-encoded TXT in
-/// BEP44 packaging it pushes the main pkarr packet past the 1000-byte
-/// `v` cap. The encoder in `openhost-pkarr::offer::encode_with_answers`
-/// evicts the answer and logs a warn. As a result, the client's
-/// poll_answer loop never observes an `_answer` TXT on the wire — by
-/// design, for now.
-///
-/// `TODO(v0.1 freeze)`: splitting ICE trickle into separate pkarr
-/// records (or gzip-compressing the sealed plaintext) is the planned
-/// fix that lets this test be upgraded to assert a full HTTP
-/// round-trip via [`OpenhostSession::request`]. For PR #8 we assert
-/// against `SharedState::snapshot_answers()` — the daemon produced
-/// and sealed the answer — which still exercises every non-wire piece
-/// of the client + daemon stack end-to-end.
+/// Regression guard for every daemon-side layer above the BEP44
+/// wire: resolve the host record → pick up the offer → unseal →
+/// run handle_offer → seal answer → queue answer → trigger publish.
+/// The compressed sealed answer lands in `SharedState`; whether the
+/// encoder can then fold it into the main pkarr packet depends on
+/// the answer SDP size + salt (see the "known constraint" block at
+/// the top of this file).
 #[tokio::test]
 async fn daemon_produces_sealed_answer_for_dialer_offer() {
     let _ = tracing_subscriber::fmt()
@@ -166,8 +154,11 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
         .transport(net.as_transport())
         .resolver(net.as_resolve())
         .config(DialerConfig {
-            // Short timeout: we EXPECT dial() to fail with
-            // PollAnswerTimeout because the encoder evicts the answer.
+            // Short-ish timeout: with the current BEP44 constraint,
+            // dial() fails with PollAnswerTimeout after the encoder
+            // evicts the answer. See the module-level constraint
+            // note; post-v0.1 this becomes a full wire round-trip
+            // assertion.
             dial_timeout: Duration::from_secs(5),
             answer_poll_interval: Duration::from_millis(250),
             webrtc_connect_timeout: Duration::from_secs(10),
@@ -176,36 +167,36 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
         .build()
         .expect("dialer builds");
 
-    // Dial: resolve host + publish offer + poll for answer (times
-    // out because of the BEP44-cap eviction noted above).
     let outcome = dialer.dial().await;
     match outcome {
-        Err(openhost_client::ClientError::PollAnswerTimeout(_)) => {}
+        Err(openhost_client::ClientError::PollAnswerTimeout(_)) => {
+            // Expected: the daemon produced the answer but it didn't
+            // fit the packet. Next assertion verifies the server side
+            // of the flow actually ran.
+        }
         Ok(_) => panic!(
-            "dial must time out on poll_answer until the BEP44 trickle \
-             follow-up lands — if this starts passing, the v0.1 freeze \
-             PR has shipped and the test needs to upgrade to a full HTTP \
-             round-trip assertion",
+            "dial unexpectedly succeeded — the encoder must have fit \
+             the answer on the wire. If this starts passing \
+             consistently, split the ICE trickle follow-up has \
+             landed; upgrade this test to a full HTTP round-trip."
         ),
         Err(other) => panic!("expected PollAnswerTimeout; got {other:?}"),
     }
 
-    // Assert the daemon DID produce + queue the answer for us — this
-    // is the real regression guard: every step of the server side of
-    // the handshake ran, which transitively proves every step of the
-    // client side ran up to the wire-level answer-retrieval.
+    // Real regression guard: the daemon ran every step up to queueing
+    // the sealed answer.
     let expected_hash =
         openhost_core::crypto::allowlist_hash(&app.state().salt(), &client_pk.to_bytes());
     let answers = app.state().snapshot_answers();
-    assert!(
-        answers.iter().any(|e| e.client_hash == expected_hash),
-        "daemon did not queue an answer for the dialer's offer; saw {} entries",
-        answers.len(),
-    );
     let entry = answers
         .iter()
         .find(|e| e.client_hash == expected_hash)
-        .unwrap();
+        .unwrap_or_else(|| {
+            panic!(
+                "daemon did not queue an answer for the dialer's offer; saw {} entries",
+                answers.len()
+            )
+        });
     let opened = entry.open(&client_sk).expect("answer opens");
     assert_eq!(opened.daemon_pk, daemon_pk);
     assert!(
