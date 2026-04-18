@@ -109,7 +109,7 @@ pub type RecordSource = Box<dyn FnMut() -> OpenhostRecord + Send>;
 /// [`crate::offer::encode_with_answers`] for the layout.
 ///
 /// Typical producer: a closure over the daemon's `SharedState` that
-/// calls `drain_answer_snapshot`. Publishers without an answer source
+/// calls `snapshot_answers`. Publishers without an answer source
 /// (the common case before PR #7a) pass `None`.
 pub type AnswerSource = Box<dyn FnMut() -> Vec<AnswerEntry> + Send>;
 
@@ -254,6 +254,15 @@ impl Publisher {
     /// When an answer source is installed via [`with_answer_source`], the
     /// emitted packet carries one `_answer._<client-hash>` TXT per entry
     /// alongside the main `_openhost` TXT.
+    ///
+    /// **Timestamp monotonicity.** BEP44's `seq` is the record's `ts` in
+    /// seconds; two back-to-back publishes within the same wall-clock
+    /// second would share a seq and fail CAS. `publish_once` defends
+    /// against that by bumping `record.ts` to `last_seq + 1` when the
+    /// source returns a non-monotonic value. A backward system-clock
+    /// jump of N seconds manifests as `record.ts` drifting up to N
+    /// seconds ahead of wall time until the clock catches up — visible
+    /// in `warn!` logs, but publishes keep succeeding.
     ///
     /// [`with_answer_source`]: Publisher::with_answer_source
     pub async fn publish_once(&mut self) -> Result<u64> {

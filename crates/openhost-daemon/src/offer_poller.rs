@@ -74,6 +74,12 @@ impl OfferPoller {
     /// noop poller is returned when `cfg.watched_clients` is empty —
     /// the background task still exists but immediately exits, keeping
     /// the `App::shutdown` path uniform.
+    /// # Panics
+    ///
+    /// `cfg.watched_clients` MUST be non-empty — callers check that
+    /// first (see `openhost-daemon::app::build_offer_poller`, which
+    /// returns `None` for an empty watch list rather than calling
+    /// `spawn`). Passing an empty list here is a programmer error.
     pub fn spawn(
         identity: Arc<SigningKey>,
         resolver: Arc<dyn Resolve>,
@@ -82,22 +88,21 @@ impl OfferPoller {
         publisher_trigger: Arc<dyn Fn() + Send + Sync>,
         cfg: OfferPollerConfig,
     ) -> Self {
+        assert!(
+            !cfg.watched_clients.is_empty(),
+            "OfferPoller::spawn requires a non-empty watched_clients list",
+        );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let task = if cfg.watched_clients.is_empty() {
-            tracing::debug!("openhostd: offer poller has no watched clients; running idle");
-            tokio::spawn(idle_until_shutdown(shutdown_rx))
-        } else {
-            tokio::spawn(run_poll_loop(
-                identity,
-                resolver,
-                listener,
-                state,
-                publisher_trigger,
-                cfg,
-                shutdown_rx,
-            ))
-        };
+        let task = tokio::spawn(run_poll_loop(
+            identity,
+            resolver,
+            listener,
+            state,
+            publisher_trigger,
+            cfg,
+            shutdown_rx,
+        ));
 
         Self {
             task: Some(task),
@@ -120,10 +125,6 @@ impl Drop for OfferPoller {
             task.abort();
         }
     }
-}
-
-async fn idle_until_shutdown(mut rx: watch::Receiver<bool>) {
-    let _ = rx.wait_for(|stop| *stop).await;
 }
 
 /// Seen-cache entry: the highest `ts` we've already processed for this
@@ -187,10 +188,6 @@ async fn poll_one_cycle(
     seen: &mut HashMap<PublicKey, Seen>,
 ) {
     let now_instant = Instant::now();
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let daemon_pk = identity.public_key();
 
     // Evict stale entries.
@@ -218,7 +215,6 @@ async fn poll_one_cycle(
             cfg,
             seen,
             now_instant,
-            now_secs,
         )
         .await;
     }
@@ -236,18 +232,26 @@ async fn process_client_packet(
     cfg: &OfferPollerConfig,
     seen: &mut HashMap<PublicKey, Seen>,
     now_instant: Instant,
-    _now_secs: u64,
 ) {
     let offer_record = match decode_offer_from_packet(packet, daemon_pk) {
         Ok(Some(r)) => r,
         Ok(None) => return, // zone has a pkarr record but no _offer TXT
         Err(err) => {
-            tracing::debug!(?err, client = %client_pk, "offer poll: decode failed");
+            // Malformed packet or multi-TXT at the `_offer-<host-hash>`
+            // name — both are worth operator attention.
+            tracing::warn!(?err, client = %client_pk, "offer poll: decode failed");
             return;
         }
     };
 
     // Packet timestamp doubles as the offer's `ts` for dedup.
+    //
+    // NOTE: a legitimate client that publishes two distinct offers
+    // within the same wall-clock second (e.g. quick retry after a
+    // failed first dial) will see the second dropped by the
+    // `packet_ts_secs <= entry.last_ts` gate below. Acceptable given
+    // BEP44's own second-granularity `seq`; a content-hash dedup would
+    // let the second publish through but complicate the cache.
     let packet_ts: u64 = packet.timestamp().into();
     let packet_ts_secs = packet_ts / openhost_pkarr::MICROS_PER_SECOND;
 
@@ -267,15 +271,28 @@ async fn process_client_packet(
                 client = %client_pk,
                 "offer poll: client throttled; skipping",
             );
+            // Advance `last_ts` so a hostile client can't bypass the
+            // throttle by bumping its packet timestamp — the same
+            // (client_pk, ts) gets dropped on every subsequent poll
+            // until the throttle window elapses.
+            entry.last_ts = packet_ts_secs;
             return;
         }
     }
 
-    // Unseal.
+    // Unseal. Any packet we fetched from the zone under the client's
+    // pubkey that happens to carry a TXT at our expected offer name but
+    // isn't actually sealed to us falls through here — cheaper than
+    // ping-spamming at warn-level, so we log at debug.
     let plaintext = match offer_record.open(identity) {
         Ok(p) => p,
         Err(err) => {
-            tracing::warn!(?err, client = %client_pk, "offer poll: unseal failed");
+            tracing::debug!(?err, client = %client_pk, "offer poll: unseal failed");
+            // Advance both cache fields so a hostile / broken client
+            // can't reset the decrypt workload every single tick by
+            // re-publishing under incrementing timestamps.
+            entry.last_ts = packet_ts_secs;
+            entry.last_processed = Some(now_instant);
             return;
         }
     };

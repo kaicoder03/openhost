@@ -57,11 +57,11 @@ pub struct SharedState {
     /// Per-client answer records queued for publication. Keyed by
     /// `client_hash` (HMAC of `client_pk` under the daemon's salt) so a
     /// later answer for the same client overwrites the previous one.
-    /// Drained on every publish via [`drain_answer_snapshot`]; the
+    /// Drained on every publish via [`snapshot_answers`]; the
     /// entries remain in the map across publishes so stale resolvers
     /// still see the most recent answer.
     ///
-    /// [`drain_answer_snapshot`]: SharedState::drain_answer_snapshot
+    /// [`snapshot_answers`]: SharedState::snapshot_answers
     answers: RwLock<HashMap<[u8; CLIENT_HASH_LEN], AnswerEntry>>,
 }
 
@@ -95,9 +95,11 @@ impl SharedState {
             .insert(entry.client_hash, entry);
     }
 
-    /// Snapshot of every queued answer. The publisher's `AnswerSource`
-    /// calls this on each publish.
-    pub fn drain_answer_snapshot(&self) -> Vec<AnswerEntry> {
+    /// Snapshot (clone) of every queued answer. The publisher's
+    /// `AnswerSource` calls this on each publish. Entries remain in
+    /// the map across calls — a later `push_answer` for the same
+    /// `client_hash` overwrites.
+    pub fn snapshot_answers(&self) -> Vec<AnswerEntry> {
         self.answers
             .read()
             .expect("answers lock poisoned")
@@ -223,7 +225,7 @@ pub fn start_with_transport(
     };
     let answer_source: AnswerSource = {
         let state = state.clone();
-        Box::new(move || state.drain_answer_snapshot())
+        Box::new(move || state.snapshot_answers())
     };
 
     let publisher = Publisher::new(transport, identity, record_source, None)

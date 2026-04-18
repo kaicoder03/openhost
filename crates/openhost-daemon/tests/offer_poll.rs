@@ -166,7 +166,7 @@ async fn daemon_polls_scripted_offer_and_publishes_answer() -> DaemonResult<()> 
 
     // Wait until the daemon pushes an answer entry into SharedState.
     //
-    // NOTE: we assert against `SharedState::drain_answer_snapshot` rather
+    // NOTE: we assert against `SharedState::snapshot_answers` rather
     // than against bytes in the captured pkarr packet. The current
     // `PassivePeer::handle_offer` awaits full ICE gathering before
     // returning the answer SDP, and the resulting SDP + sealed overhead
@@ -180,7 +180,7 @@ async fn daemon_polls_scripted_offer_and_publishes_answer() -> DaemonResult<()> 
         openhost_core::crypto::allowlist_hash(&app.state().salt(), &client_pk.to_bytes());
     let got = wait_until(Duration::from_secs(10), || {
         app.state()
-            .drain_answer_snapshot()
+            .snapshot_answers()
             .into_iter()
             .find(|e| e.client_hash == expected_hash)
     })
@@ -288,6 +288,69 @@ async fn daemon_ignores_offer_sealed_to_different_daemon() -> DaemonResult<()> {
             );
         }
     }
+
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_rejects_inner_outer_client_pk_mismatch() -> DaemonResult<()> {
+    // Publish an offer whose OUTER BEP44 signer is `client_pk_a` but
+    // whose sealed plaintext claims `client_pk = client_pk_b`. The
+    // daemon must detect the mismatch and NOT run `handle_offer`.
+    let client_sk_a = SigningKey::generate_os_rng();
+    let client_pk_a = client_sk_a.public_key();
+    let client_sk_b = SigningKey::generate_os_rng();
+    let client_pk_b = client_sk_b.public_key();
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = daemon_config(&tmp, &[client_pk_a]);
+    let transport = Arc::new(CaptureTransport::default());
+    let resolver = ScriptedResolve::new();
+
+    let app = App::build_with_transport_and_resolve(
+        cfg,
+        transport.clone() as Arc<dyn openhost_pkarr::Transport>,
+        resolver.clone() as Arc<dyn openhost_pkarr::Resolve>,
+    )
+    .await
+    .expect("app builds");
+
+    let daemon_pk = app.identity().public_key();
+    let offer_sdp = "v=0\r\na=setup:active\r\n";
+
+    // Build the offer plaintext claiming client_pk_b and seal it to the
+    // daemon. Then publish under client_pk_a's BEP44 zone (so the
+    // outer signer is A).
+    let plaintext = OfferPlaintext {
+        client_pk: client_pk_b,
+        offer_sdp: offer_sdp.to_string(),
+    };
+    let mut rng = OsRng;
+    let offer = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();
+    let txt_value = URL_SAFE_NO_PAD.encode(&offer.sealed);
+    let label = openhost_pkarr::host_hash_label(&daemon_pk);
+    let name = format!("{OFFER_TXT_PREFIX}{label}");
+    let seed = Zeroizing::new(client_sk_a.to_bytes());
+    let keypair = Keypair::from_secret_key(&seed);
+    let packet = SignedPacket::builder()
+        .txt(
+            Name::new_unchecked(&name),
+            TXT::try_from(txt_value.as_str()).unwrap(),
+            OFFER_TXT_TTL,
+        )
+        .timestamp(Timestamp::from(1_700_000_000 * 1_000_000))
+        .sign(&keypair)
+        .unwrap();
+    resolver.set_packet(&client_pk_a, &packet);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        app.listener().active_count().await,
+        0,
+        "offer with inner/outer client_pk mismatch must NOT reach handle_offer"
+    );
 
     app.shutdown().await;
     Ok(())

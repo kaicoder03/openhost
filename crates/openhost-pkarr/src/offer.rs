@@ -391,13 +391,16 @@ fn build_packet(
     Ok(builder.sign(keypair)?)
 }
 
-/// Look for an `_offer._<host-hash>` TXT inside `packet` and return it
+/// Look for an `_offer-<host-hash>` TXT inside `packet` and return it
 /// decoded. Returns `Ok(None)` if the expected TXT is absent.
 ///
-/// Cross-checks that the inner `client_pk` inside the sealed plaintext
-/// matches the outer BEP44 signer — prevents a substrate from serving
-/// an offer signed by key A that claims to come from key B. The caller
-/// gets the validated `OfferPlaintext` via [`OfferRecord::open`].
+/// **Does NOT cross-check** the inner `client_pk` inside the sealed
+/// plaintext against the outer BEP44 signer — the sealed bytes aren't
+/// unsealed here. The caller MUST perform that check after
+/// [`OfferRecord::open`] to defend against a substrate splicing an
+/// offer signed by key A that claims to come from key B. See the
+/// `process_client_packet` path in `openhost-daemon::offer_poller` for
+/// the canonical implementation.
 pub fn decode_offer_from_packet(
     packet: &SignedPacket,
     daemon_pk: &PublicKey,
@@ -411,10 +414,14 @@ pub fn decode_offer_from_packet(
     Ok(Some(OfferRecord { sealed }))
 }
 
-/// Look for an `_answer._<client-hash>` TXT inside `packet` (the daemon's
+/// Look for an `_answer-<client-hash>` TXT inside `packet` (the daemon's
 /// main record) and return it decoded. Called by PR #8's client-side
 /// consumer: it already knows its own `client_pk` and the daemon's
 /// published salt.
+///
+/// **Does NOT cross-check** the inner `daemon_pk` inside the sealed
+/// plaintext against the outer BEP44 signer — the caller MUST do that
+/// after [`AnswerEntry::open`] to defend against a splicing substrate.
 pub fn decode_answer_from_packet(
     packet: &SignedPacket,
     daemon_salt: &[u8; SALT_LEN],
@@ -569,9 +576,12 @@ fn parse_answer_plaintext(bytes: &[u8]) -> Result<AnswerPlaintext> {
 }
 
 fn hex_hash(h: &[u8; CLIENT_HASH_LEN]) -> String {
+    use core::fmt::Write as _;
     let mut s = String::with_capacity(h.len() * 2);
     for b in h {
-        s.push_str(&format!("{b:02x}"));
+        // Writing via fmt::Write avoids allocating a temporary String
+        // per byte (which the per-byte `format!` version did).
+        write!(&mut s, "{b:02x}").expect("String never errors on write");
     }
     s
 }
