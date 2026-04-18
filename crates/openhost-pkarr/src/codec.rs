@@ -80,13 +80,14 @@ pub fn encode(signed: &SignedRecord, signing_key: &SigningKey) -> Result<SignedP
     let txt = pkarr::dns::rdata::TXT::try_from(encoded.as_str())
         .map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?;
 
-    let ts_micros = signed
-        .record
-        .ts
-        .checked_mul(MICROS_PER_SECOND)
-        .ok_or(PkarrError::TimestampOverflow {
-            ts: signed.record.ts,
-        })?;
+    let ts_micros =
+        signed
+            .record
+            .ts
+            .checked_mul(MICROS_PER_SECOND)
+            .ok_or(PkarrError::TimestampOverflow {
+                ts: signed.record.ts,
+            })?;
     let ts = Timestamp::from(ts_micros);
 
     let packet = SignedPacket::builder()

@@ -320,8 +320,7 @@ mod tests {
             sample_record(1_700_000_000 + i * 10)
         });
 
-        let mut publisher =
-            Publisher::new(transport.clone(), sk, record_source, Some(seed_ts));
+        let mut publisher = Publisher::new(transport.clone(), sk, record_source, Some(seed_ts));
 
         // First publish fails — `last_seq` MUST remain at the seeded value
         // so the next attempt still sends the correct CAS.

@@ -231,8 +231,7 @@ mod tests {
         let sk = SigningKey::from_bytes(&RFC_SEED);
         let record_ts = 1_700_000_000u64;
         let signed =
-            openhost_core::pkarr_record::SignedRecord::sign(sample_record(record_ts), &sk)
-                .unwrap();
+            openhost_core::pkarr_record::SignedRecord::sign(sample_record(record_ts), &sk).unwrap();
 
         // Re-implement the encode path but pin the outer pkarr timestamp at
         // a value that disagrees with `record.ts` by more than 1s. We hold
