@@ -1,0 +1,57 @@
+{
+  "description": "openhost-pkarr M2 bridge: SignedRecord <-> pkarr::SignedPacket round-trip. Every implementation MUST produce a packet that decodes back to the referenced SignedRecord from pkarr_record.json, and MUST accept the fixture bytes below as input.",
+  "version": "openhost1",
+  "pkarr_crate_version": "5.0.4",
+  "encoding_notes": [
+    "All bytes are hex-encoded.",
+    "Signing key and OpenhostRecord are inherited from pkarr_record.json::reference_record_v1 — not duplicated here.",
+    "The `_openhost` TXT record value is base64url-encoded (no padding) bytes of (signature || canonical_signing_bytes). The signature is taken verbatim from pkarr_record.json::reference_record_v1.signature_hex. The canonical bytes equal pkarr_record.json::reference_record_v1.canonical_hex.",
+    "`packet_bytes_hex` is the output of `SignedPacket::as_bytes()` in the pkarr 5.x crate — i.e. `<32 public_key><64 signature><8 timestamp_micros_be><encoded_dns_packet>`. Total length 584 bytes for this vector.",
+    "The 8-byte timestamp is big-endian microseconds since the Unix epoch. For this vector: 1_700_000_000 * 1_000_000 = 1_700_000_000_000_000 = 0x060a24181e4000.",
+    "Fixture bytes depend on the exact pkarr wire format (BEP44 signature over the bencoded DNS packet). Implementations MAY regenerate when bumping pkarr, but MUST document the pkarr version used."
+  ],
+  "vectors": [
+    {
+      "name": "reference_packet_v1",
+      "input_vector_ref": "pkarr_record.json::reference_record_v1",
+      "signing_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "record_ts": 1700000000,
+      "pkarr_timestamp_micros": 1700000000000000,
+      "openhost_txt_name": "_openhost",
+      "openhost_txt_ttl": 300,
+      "openhost_blob_len": 294,
+      "openhost_blob_layout": "first 64 bytes = Ed25519 signature (pkarr_record.json::reference_record_v1.signature_hex); remaining 230 bytes = canonical_signing_bytes (pkarr_record.json::reference_record_v1.canonical_hex)",
+      "bep44_outer_signature_hex": "7d8fff2a48157d10d2ed16ca48b7d5f18e132cc9c5b0b0e0cd880f5354bebf7c4ffe786a3c58cd775b658c278ad4c7a3e6367cff23a5a9a637bd6b34843f620f",
+      "packet_bytes_len": 584,
+      "packet_bytes_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a7d8fff2a48157d10d2ed16ca48b7d5f18e132cc9c5b0b0e0cd880f5354bebf7c4ffe786a3c58cd775b658c278ad4c7a3e6367cff23a5a9a637bd6b34843f620f00060a24181e4000000080000000000100000000095f6f70656e686f7374343437706a6f79636e7372666d78696b6d39356a6831337938386538716e687a75356b756e676a707879657067743761386b72707900001000010000012c018afe65364f69637743705f615941796f6245524a324565354d6e36793156356a71643567426c656b68443975464a456d514c6146355141723153495634696c4a6969554333496d34525732787741675a6f663667754643514676634756756147397a64444542414141414147565438514243516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a4351675a7a5a584a325a58495245524552455245524552455245524552455245524552455245524552455245524552455245524552455141427a7a5a4a464d515a636151585558656135423852527741427a7a5a4a464d515a63615158555865613542385252778a414141456a75377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753441476d526f644430784f7942795a57786865543177613246796369356c654746746347786c"
+    }
+  ],
+  "negative": [
+    {
+      "name": "packet_too_large",
+      "tweak": "Encode a record whose `ice` vector is padded (e.g. 30 blobs, 200-byte ciphertexts each) so the encoded DNS packet exceeds 1000 bytes.",
+      "expect": "Encoder returns PacketTooLarge (or the upstream pkarr build error for the same condition)."
+    },
+    {
+      "name": "openhost_sig_invalid",
+      "tweak": "Flip a single bit of the canonical-bytes portion of the `_openhost` TXT blob AFTER encoding the packet. The outer BEP44 signature still verifies, but the inner Ed25519 signature over canonical bytes no longer matches.",
+      "expect": "Decode succeeds; SignedRecord::verify fails with BadSignature."
+    },
+    {
+      "name": "bep44_sig_invalid",
+      "tweak": "Flip a bit of bytes [32..96] of `packet_bytes_hex` (the BEP44 outer signature field).",
+      "expect": "pkarr::SignedPacket deserialization fails before our decoder runs."
+    },
+    {
+      "name": "timestamp_drift",
+      "tweak": "Emit a packet with the BEP44 timestamp set to `(record.ts + 5) * 1_000_000` microseconds while keeping record.ts = 1700000000.",
+      "expect": "Resolver returns TimestampDrift."
+    },
+    {
+      "name": "seq_regression",
+      "tweak": "Resolve the reference packet with cached_seq = record.ts + 1 = 1700000001.",
+      "expect": "Resolver returns SeqRegression."
+    }
+  ]
+}

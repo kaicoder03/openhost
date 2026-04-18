@@ -35,23 +35,33 @@ Clients **MUST** reject any `oh://` URL whose host component fails z-base-32 dec
 
 A host publishes a signed DNS packet as a BEP44 mutable item on the Mainline DHT and simultaneously to one or more public Pkarr relays. The packet's signing key is the host's Ed25519 keypair; the BEP44 `k` field is the host's public key. Record name suffixes are relative to the host's public key.
 
-| Record name | Type | Contents |
-|---|---|---|
-| `@` | TXT | `v=openhost1; ts=<unix>; fp=sha256:<hex>; roles=server` |
-| `_ice._<clienthash>` | TXT | `encrypted:<base64 ciphertext>` — ICE candidates encrypted per-client |
-| `_allow` | TXT | `h1=<base64>; h2=<base64>; ...` — hashed client pubkeys |
-| `_disc` | TXT | `dht=1; relay=<csv>` — informational list of substrates |
+The packet **MUST** contain a single TXT resource record:
+
+| Record name | Type | TTL | Contents |
+|---|---|---|---|
+| `_openhost` | TXT | 300 | `base64url(signature \|\| canonical_bytes)` — the 64-byte Ed25519 signature over `canonical_bytes` concatenated with the canonical byte representation of an `OpenhostRecord` (see below). |
+
+`canonical_bytes` is the output of [`OpenhostRecord::canonical_signing_bytes`](../crates/openhost-core/src/pkarr_record/mod.rs), a deterministic, domain-separated encoding that carries every semantic field of the record — protocol version, Unix-seconds timestamp `ts`, DTLS fingerprint `dtls_fp`, declared `roles`, per-host allowlist `salt`, the `allow` list of 16-byte truncated HMAC entries, a per-paired-client `ice` list (each entry: 16-byte client hash + sealed-box ciphertext), and the informational `disc` hints string. Its exact layout is fixed in the openhost-core crate and reproduced verbatim in [`test-vectors/pkarr_record.json`](test-vectors/pkarr_record.json).
+
+The base64url encoding uses the RFC 4648 §5 URL-safe alphabet without padding. If the encoded string exceeds 255 bytes, it **MUST** be split across multiple DNS character strings within the same TXT RDATA (per RFC 1035 §3.3.14); decoders reconstruct the payload by concatenating the character strings in the order they appear.
+
+Two signatures bind the record:
+
+- The **inner Ed25519 signature** (the 64-byte signature prefix of the `_openhost` TXT value) covers `canonical_bytes` and is produced by the host's Ed25519 identity key. Verifiers **MUST** re-check this signature against the host's public key before trusting the record.
+- The **outer BEP44 signature** on the Pkarr packet itself is also produced by the same Ed25519 identity key — no separate keypair is used — and covers the bencoded DNS packet plus the BEP44 `seq` field. The `seq` field is set to the publication time in seconds since the Unix epoch (equal to `ts` inside the record).
 
 **Constraints:**
 
-- The total signed packet **MUST** fit in 1000 bytes (the BEP44 limit).
-- `ts` is the publication time in seconds since the Unix epoch. Clients **MUST** reject records where `|now - ts| > 7200` (two hours).
-- `fp` is the SHA-256 fingerprint of the daemon's DTLS certificate, encoded as lowercase hex. The daemon **SHOULD** rotate this certificate daily or on restart.
-- Each `<clienthash>` is 16 bytes of HMAC-SHA256 keyed by a per-host salt (published within the `@` record as `salt=<hex>`), applied to the client's 32-byte Ed25519 public key. Unpaired observers see only the existence of ICE records, not which client they belong to. The 16 bytes are encoded as z-base-32 (≈26 characters) in the record name.
+- The encoded DNS packet (the BEP44 `v` value) **MUST** fit in 1000 bytes (the BEP44 mutable-item limit).
+- `ts` is the publication time in seconds since the Unix epoch. Verifiers **MUST** reject records where `|now - ts| > 7200` (two hours).
+- `dtls_fp` is the SHA-256 fingerprint of the daemon's DTLS certificate, 32 raw bytes inside `canonical_bytes`. The daemon **SHOULD** rotate this certificate daily or on restart.
+- Each `client_hash` is 16 bytes of HMAC-SHA256 keyed by the per-host `salt` applied to the client's 32-byte Ed25519 public key. Unpaired observers see only that ICE blobs exist, not which client they address.
 - Per-client ICE candidate ciphertext is a libsodium-compatible **sealed box** (`crypto_box_seal`): anonymous X25519 ephemeral sender to the recipient client's X25519 public key, with the XSalsa20-Poly1305 AEAD. The output is `ephemeral_pk || XSalsa20-Poly1305(shared_key, nonce = Blake2b-24(ephemeral_pk || recipient_pk), plaintext)`.
 - The client's X25519 public key is derived from its Ed25519 identity via the Edwards-to-Montgomery conversion (libsodium's `crypto_sign_ed25519_pk_to_curve25519`), so clients and hosts maintain only one keypair.
-- The `_allow` record contains the same hashed client keys for the daemon's own dedupe and for clients to verify they are on the allowlist before attempting a connection.
-- `_disc` is informational; clients **MUST** try all substrates they know about regardless of the record's contents.
+- The `allow` list is carried inside `canonical_bytes` and lets clients verify they are paired before attempting a connection; the daemon uses it for dedupe.
+- `disc` is informational; clients **MUST** try all substrates they know about regardless of the record's contents.
+
+Republish cadence, relay fan-out, and resolver race semantics are specified in [`03-pkarr-records.md`](03-pkarr-records.md).
 
 ## 3. Connection establishment sequence
 

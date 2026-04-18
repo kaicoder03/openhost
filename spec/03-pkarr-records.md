@@ -86,4 +86,7 @@ Clients **MUST NOT** republish records they observe. Only the holder of the Ed25
 
 ## 5. Test vectors
 
-Packet construction, signing, and verification test vectors live in [`test-vectors/`](test-vectors/). The vectors include a reference BEP44 blob for a fixed keypair and timestamp, the Nostr-wrapped equivalent, and a set of negative tests (bad signature, out-of-window timestamp, oversized packet).
+Packet construction, signing, and verification test vectors live in [`test-vectors/`](test-vectors/):
+
+- [`pkarr_record.json`](test-vectors/pkarr_record.json) — the reference `SignedRecord` (canonical signing bytes, Ed25519 signature, and negative-validation cases). Every implementation **MUST** reproduce its `canonical_hex` and `signature_hex` for the fixed seed.
+- [`pkarr_packet.json`](test-vectors/pkarr_packet.json) — the reference `SignedRecord` after passing through the Pkarr layer: the bytes of a well-formed `pkarr::SignedPacket` (32-byte public key, 64-byte BEP44 signature, 8-byte microsecond timestamp, encoded DNS packet). Implementations **MUST** decode these bytes back into the referenced `SignedRecord` and **MUST** produce byte-identical output when re-encoding the same record with the same signing seed against the same pkarr wire version.

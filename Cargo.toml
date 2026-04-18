@@ -39,10 +39,13 @@ rand = { version = "0.8", features = ["std_rng"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Protocol integrations (used by openhost-pkarr / -daemon at M2/M3)
-pkarr = "3"
-mainline = "4"
+pkarr = "5"
+mainline = "6"
 webrtc = "0.17"
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
 
 # Common utilities
 serde = { version = "1", features = ["derive"] }

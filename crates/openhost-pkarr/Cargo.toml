@@ -11,5 +11,25 @@ readme.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+nostr = ["serde_json"]
+
 [dependencies]
 openhost-core = { path = "../openhost-core" }
+ed25519-dalek = { workspace = true }
+pkarr = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+# Optional — only compiled under the `nostr` feature.
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
