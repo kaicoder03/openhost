@@ -61,6 +61,12 @@ bytes = "1"
 # CryptoProvider to consume.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
+# Localhost forwarder (PR #6).
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+
 # Errors
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -68,3 +74,10 @@ anyhow = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# The forwarder integration test spawns a tiny hyper test server; enable
+# the `server` feature only in test builds so the production binary
+# stays bin-size-disciplined.
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util = { workspace = true }
+bytes = "1"

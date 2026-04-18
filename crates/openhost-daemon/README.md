@@ -77,18 +77,59 @@ callers can drive the listener directly for tests or custom signalling.
 - DTLS handshakes complete against the cert whose SHA-256 fingerprint
   is pinned in the daemon's published record (`openhost-resolve` prints
   it if you want to verify).
-- Every `REQUEST_HEAD` frame on an opened data channel currently gets a
-  stub `HTTP/1.1 502 Bad Gateway` response. The real localhost forwarder
-  ships in PR #6.
+
+## Forwarding to a local HTTP service (PR #6)
+
+Configure a `[forward]` section to route every inbound `REQUEST_*`
+frame to a loopback HTTP server. Omit the section and the daemon keeps
+the PR #5 stub 502 response path.
+
+```toml
+[forward]
+# Only http:// is supported; TLS upstreams land in a future PR.
+target = "http://127.0.0.1:8080"
+
+# Optional. Defaults to the target's authority ("127.0.0.1:8080"
+# above). Override when the upstream service expects a specific
+# `Host` value (e.g. a Host-based router on the upstream side).
+host_override = "my-service.local"
+
+# Cap on the inbound request body. Requests larger than this trigger
+# a framing-violation teardown. Default 16 MiB.
+max_body_bytes = 16777216
+```
+
+### SSRF defences (spec §7.12)
+
+Every forwarded request gets these protections applied before the
+upstream sees it:
+
+- **Hop-by-hop headers stripped** (RFC 7230 §6.1): `Connection`,
+  `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`,
+  `Trailer`, `Transfer-Encoding`, `Upgrade`.
+- **Provenance headers blocked**: `X-Forwarded-For`, `X-Forwarded-Host`,
+  `X-Forwarded-Proto`, `Forwarded`, `X-Real-IP`. Client-supplied values
+  never leak through.
+- **Host header pinned** to the configured target authority
+  (or `host_override` if set).
+- **Websocket upgrades rejected**. `Upgrade: websocket` inbound
+  requests fail with a typed error; per-path gating lands in a future
+  PR.
+- **Upstream response sanitised too**: hop-by-hop headers dropped and
+  `Content-Length` rewritten to match the buffered body size so a
+  misbehaving upstream can't smuggle `Transfer-Encoding: chunked`
+  through the openhost binary frame codec.
+
+## What this crate does NOT (yet) deliver
 
 ## What this crate does NOT (yet) deliver
 
 - Channel binding (spec §7.1 / RFC 8844 mitigation) — PR #5.5.
-- Localhost forwarding — PR #6.
 - Offer-record polling + allowlist + per-IP / per-pubkey rate limit — PR #7.
 - Client-side WebRTC offerer — PR #8 (`openhost-client`).
 - Self-hosted STUN / IPv6-only mode — PR #9.
 - Keychain integration. `FsKeyStore` is the only backend until PR #10.
+- HTTPS upstreams + per-path websocket upgrade gating — post-v0.1.
 
 ## Opt-in smoke test
 

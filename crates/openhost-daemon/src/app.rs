@@ -16,6 +16,7 @@
 use crate::config::{Config, IdentityStore};
 use crate::dtls_cert::{self, DtlsCertificate};
 use crate::error::Result;
+use crate::forward::Forwarder;
 use crate::identity_store::{load_or_create, FsKeyStore, KeyStore};
 use crate::listener::PassivePeer;
 use crate::publish::{self, PublishService, SharedState};
@@ -48,7 +49,9 @@ impl App {
     /// Build the daemon against the real pkarr network.
     pub async fn build(cfg: Config) -> Result<Self> {
         let (identity, cert, state) = init_common(&cfg).await?;
-        let listener = build_listener(&cert, identity.clone(), state.clone()).await?;
+        let forwarder = build_forwarder(&cfg)?;
+        let listener =
+            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
         let publisher = publish::start(&cfg.pkarr, identity.clone(), state.clone()).await?;
         Ok(Self {
             identity,
@@ -63,7 +66,9 @@ impl App {
     /// integration tests to swap in a fake that doesn't open sockets.
     pub async fn build_with_transport(cfg: Config, transport: Arc<dyn Transport>) -> Result<Self> {
         let (identity, cert, state) = init_common(&cfg).await?;
-        let listener = build_listener(&cert, identity.clone(), state.clone()).await?;
+        let forwarder = build_forwarder(&cfg)?;
+        let listener =
+            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
         let publisher =
             publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
         Ok(Self {
@@ -210,9 +215,29 @@ async fn build_listener(
     cert: &DtlsCertificate,
     identity: Arc<SigningKey>,
     state: Arc<SharedState>,
+    forwarder: Option<Arc<Forwarder>>,
 ) -> Result<Arc<PassivePeer>> {
-    let peer = PassivePeer::new(cert.certificate.clone(), identity, state).await?;
+    let peer = PassivePeer::new(cert.certificate.clone(), identity, state, forwarder).await?;
     Ok(Arc::new(peer))
+}
+
+/// Build a [`Forwarder`] from the daemon's `ForwardConfig`, or return
+/// `None` if no `[forward]` section was configured. In the `None` case
+/// the listener keeps the PR #5 stub 502 response path.
+fn build_forwarder(cfg: &Config) -> Result<Option<Arc<Forwarder>>> {
+    match cfg.forward.as_ref() {
+        Some(forward_cfg) => {
+            let forwarder = Forwarder::from_config(forward_cfg)?;
+            if forwarder.is_some() {
+                tracing::info!(
+                    target = cfg.forward.as_ref().and_then(|f| f.target.as_deref()),
+                    "openhostd: forwarder configured",
+                );
+            }
+            Ok(forwarder.map(Arc::new))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Install a global `tracing_subscriber` with the configured level filter.
