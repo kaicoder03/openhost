@@ -60,9 +60,10 @@ pub const EXPORTER_SECRET_LEN: usize = 32;
 
 /// Exporter label openhost requests from the DTLS transport.
 ///
-/// Re-exported from [`openhost_core::crypto::AUTH_CONTEXT_LABEL`] as a
-/// `&str` because webrtc-rs's exporter API is string-typed. The ASCII
-/// bytes are identical.
+/// Held as a `&str` because webrtc-rs's exporter API is string-typed.
+/// The byte contents MUST match
+/// [`openhost_core::crypto::AUTH_CONTEXT_LABEL`]; a unit test pins the
+/// equality so drift is caught in CI.
 pub const EXPORTER_LABEL: &str = "EXPORTER-openhost-auth-v1";
 
 /// How long the daemon waits for the client's `AuthClient` frame after
@@ -119,8 +120,9 @@ pub enum ChannelBindingError {
 }
 
 /// Per-daemon helper that wraps the identity key plus channel-binding
-/// operations. Cheap to clone because it holds only an `Arc<SigningKey>`
-/// and a cached 32-byte pubkey.
+/// operations. Hold behind an `Arc` to share across data channels; the
+/// struct itself is two words (one `Arc` + a 32-byte array) and carries
+/// no runtime state.
 pub struct ChannelBinder {
     identity: Arc<SigningKey>,
     host_pk_bytes: [u8; 32],
@@ -255,6 +257,19 @@ mod tests {
         out.extend_from_slice(&client_pk);
         out.extend_from_slice(&sig.to_bytes());
         out
+    }
+
+    #[test]
+    fn exporter_label_matches_core_auth_context() {
+        // The daemon hands `EXPORTER_LABEL` (a `&str`) to webrtc-rs, while
+        // openhost-core's test vectors reference the same constant as
+        // `AUTH_CONTEXT_LABEL` bytes. If they ever drift, the bytes
+        // signed on the daemon side would no longer match what a
+        // spec-conformant client expects.
+        assert_eq!(
+            EXPORTER_LABEL.as_bytes(),
+            openhost_core::crypto::AUTH_CONTEXT_LABEL
+        );
     }
 
     #[test]

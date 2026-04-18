@@ -184,11 +184,17 @@ async fn client_pk_mismatch_tears_down_channel() -> DaemonResult<()> {
 #[tokio::test]
 async fn binding_timeout_tears_down_channel() -> DaemonResult<()> {
     // Real-time test: the client stays silent after receiving AuthNonce;
-    // the daemon must tear down after BINDING_TIMEOUT_SECS. The window
-    // is 10 s; we give the daemon 15 s of slack.
+    // the daemon must tear down after the configured timeout. We shrink
+    // the binding timeout to 1 s via `with_binding_timeout` so this test
+    // doesn't burn the default 10 s on every CI run; the default is
+    // still exercised implicitly by the production build.
     let tmp = tempfile::TempDir::new().unwrap();
     let cfg = test_config_noforward(&tmp);
     let (_tmp, app) = build_noop_daemon_with_config(cfg).await;
+    app.listener().set_binding_timeout(1);
+    // Sanity check: the default constant is still the expected value so
+    // a future bump shows up in the PR diff, not silently in prod.
+    assert_eq!(BINDING_TIMEOUT_SECS, 10);
 
     let session = establish_connection_opts(
         &app,
@@ -201,7 +207,7 @@ async fn binding_timeout_tears_down_channel() -> DaemonResult<()> {
     .err()
     .expect("timeout path returns Err");
 
-    let frame = wait_for_error_or_close(&session, Duration::from_secs(BINDING_TIMEOUT_SECS + 5))
+    let frame = wait_for_error_or_close(&session, Duration::from_secs(5))
         .await
         .expect("daemon emits ERROR frame on timeout");
     assert_eq!(frame.frame_type, FrameType::Error);

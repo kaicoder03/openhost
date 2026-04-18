@@ -298,13 +298,12 @@ async fn run_binding(session: &ClientSession, mode: BindingMode) -> BindingOutco
         }
         BindingMode::SwapPubkey => {
             // client_pk = A, but sig was produced by B.
+            // payload[..32] = a_pk, payload[32..] = sig-by-B over
+            // auth_bytes(host, a_pk, nonce). Verification fails because
+            // B didn't produce the signature the verifier will check.
             let other_sk = SigningKey::generate_os_rng();
             let a_pk = session.client_pk;
-            let mut payload = sign_auth_client(session, &other_sk, &a_pk, &nonce).await;
-            // Already: payload[..32] = a_pk, payload[32..] = sig-by-B over
-            // auth_bytes(host, a_pk, nonce). Verification fails because B
-            // didn't produce the signature the verifier will check.
-            payload[0] ^= 0; // no-op, just expressing intent
+            let payload = sign_auth_client(session, &other_sk, &a_pk, &nonce).await;
             send_frame(&session.dc, FrameType::AuthClient, payload).await;
             BindingOutcome::Misbehaved
         }
