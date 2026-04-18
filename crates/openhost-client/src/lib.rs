@@ -19,8 +19,20 @@
 //! - [`client`] — [`Client`] + [`ClientBuilder`], the public API.
 //! - [`error`] — crate-wide error enum.
 
+pub mod binding;
 pub mod client;
+pub mod dialer;
 pub mod error;
+pub mod session;
+mod webrtc_helpers;
 
+pub use binding::{ClientBinder, ClientBindingError};
 pub use client::{Client, ClientBuilder};
+pub use dialer::{Dialer, DialerBuilder, DialerConfig};
 pub use error::{ClientError, Result};
+pub use session::{ClientResponse, OpenhostSession};
+
+// Re-export identity types so callers don't have to pull
+// `openhost-core` directly for the common case.
+pub use openhost_core::identity::{OpenhostUrl, PublicKey, SigningKey};
+pub use openhost_pkarr::DEFAULT_RELAYS;

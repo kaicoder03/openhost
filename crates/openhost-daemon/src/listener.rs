@@ -27,7 +27,7 @@ use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -107,6 +107,12 @@ pub struct PassivePeer {
     /// Channel-binding timeout in seconds. Stored atomically so tests
     /// can shrink it after the peer is wrapped in an `Arc`.
     binding_timeout_secs: Arc<AtomicU64>,
+    /// When `true`, `negotiate` skips `gathering_complete_promise()`
+    /// so the answer SDP doesn't accumulate ICE candidates. Intended
+    /// ONLY for in-process end-to-end tests where the full ICE SDP
+    /// overflows the BEP44 1000-byte cap when folded into the
+    /// daemon's pkarr packet. Default: `false`.
+    skip_ice_gather: Arc<AtomicBool>,
     /// Channel-binding helper built from the daemon's identity. The
     /// binder signs `AuthHost` payloads and verifies `AuthClient`
     /// signatures per spec §7.1.
@@ -152,6 +158,7 @@ impl PassivePeer {
             active: Arc::new(Mutex::new(HashMap::new())),
             offer_timeout_secs: DEFAULT_OFFER_TIMEOUT_SECS,
             binding_timeout_secs: Arc::new(AtomicU64::new(BINDING_TIMEOUT_SECS)),
+            skip_ice_gather: Arc::new(AtomicBool::new(false)),
             binder,
             forwarder,
         })
@@ -162,6 +169,16 @@ impl PassivePeer {
     /// the peer has been wrapped in an `Arc`.
     pub fn set_binding_timeout(&self, secs: u64) {
         self.binding_timeout_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Skip waiting for ICE gather completion in `negotiate`. The
+    /// emitted answer SDP will not carry any candidates — webrtc-rs
+    /// will trickle them over the data channel instead. Intended ONLY
+    /// for in-process end-to-end tests where the full ICE SDP would
+    /// overflow the BEP44 1000-byte cap when folded into the main
+    /// pkarr packet; DO NOT set in production.
+    pub fn set_skip_ice_gather_for_tests(&self, skip: bool) {
+        self.skip_ice_gather.store(skip, Ordering::Relaxed);
     }
 
     /// Override the `handle_offer` timeout budget.
@@ -244,8 +261,14 @@ impl PassivePeer {
         // Drain the trickle so the returned SDP carries every candidate.
         // Without this, the answer goes out with no `a=candidate:` lines
         // and the peer can't reach us.
-        let mut gather_complete = pc.gathering_complete_promise().await;
-        let _ = gather_complete.recv().await;
+        //
+        // `skip_ice_gather` short-circuits this for in-process tests
+        // whose answer would otherwise exceed the BEP44 packet cap
+        // (see `set_skip_ice_gather_for_tests`).
+        if !self.skip_ice_gather.load(Ordering::Relaxed) {
+            let mut gather_complete = pc.gathering_complete_promise().await;
+            let _ = gather_complete.recv().await;
+        }
 
         let local_desc = pc
             .local_description()
