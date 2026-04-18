@@ -19,6 +19,9 @@
     "RESPONSE_END": 19,
     "WS_UPGRADE": 32,
     "WS_FRAME": 33,
+    "AUTH_NONCE": 48,
+    "AUTH_CLIENT": 49,
+    "AUTH_HOST": 50,
     "ERROR": 240,
     "PING": 254,
     "PONG": 255
@@ -62,6 +65,26 @@
       "payload_ascii": "upstream-unreachable",
       "payload_hex": "757073747265616d2d756e726561636861626c65",
       "encoded_hex": "f014000000757073747265616d2d756e726561636861626c65"
+    },
+    {
+      "name": "auth_nonce_32_bytes",
+      "frame_type": "AUTH_NONCE",
+      "payload_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+      "encoded_hex": "302000000000112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    },
+    {
+      "name": "auth_client_client_pk_plus_sig",
+      "frame_type": "AUTH_CLIENT",
+      "note": "32-byte client_pk followed by 64-byte Ed25519 sig_client",
+      "payload_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "encoded_hex": "3160000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "auth_host_sig",
+      "frame_type": "AUTH_HOST",
+      "note": "64-byte Ed25519 sig_host",
+      "payload_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "encoded_hex": "3240000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     }
   ],
   "reject": [

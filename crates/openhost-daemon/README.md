@@ -2,8 +2,9 @@
 
 Host-side openhost daemon. Publishes a signed Pkarr record that binds the
 host's Ed25519 public key to a DTLS certificate fingerprint; republishes
-every 30 minutes. WebRTC listener, channel binding, and the localhost
-forwarder land in subsequent PRs (see roadmap in `CHANGELOG.md`).
+every 30 minutes. Accepts inbound WebRTC offers, runs the spec §7.1
+channel-binding handshake, and forwards authenticated HTTP requests to
+a configured loopback service. See roadmap in `CHANGELOG.md`.
 
 ## Quick start
 
@@ -78,6 +79,47 @@ callers can drive the listener directly for tests or custom signalling.
   is pinned in the daemon's published record (`openhost-resolve` prints
   it if you want to verify).
 
+## Channel binding (spec §7.1, PR #5.5)
+
+Every inbound data channel runs a three-frame channel-binding handshake
+before the listener accepts any HTTP traffic:
+
+```
+daemon  → client  AuthNonce   0x30  | 32 random bytes
+client  → daemon  AuthClient  0x31  | 32-byte client_pk || 64-byte sig_client
+daemon  → client  AuthHost    0x32  | 64-byte sig_host
+```
+
+Both signatures cover `auth_bytes = HKDF-SHA256(salt="openhost-auth-v1",
+ikm=DTLS-exporter, info="openhost-auth-v1" || host_pk || client_pk ||
+nonce)`. A client that can't produce the correct `sig_client` over the
+shared DTLS-exporter-derived bytes is dropped before any forwarded
+request reaches the upstream — this closes the RFC 8844 unknown-key-
+share attack surface.
+
+**Authorization is NOT applied yet.** The current binding check proves
+the client holds the private key corresponding to the pubkey it
+presented. It does *not* verify whether that pubkey is allowed to
+connect. Any Ed25519 keypair passes binding today; the `_allow` record
+allowlist gating lands in PR #7. If you deploy an openhost daemon right
+now with a `[forward]` section pointing at a sensitive upstream, any
+client that can find your Pkarr record can reach that upstream.
+
+**Implementation-vs-spec drift.** Two deviations from spec §3 step 9
+are flagged `TODO(v0.1 freeze)` and will reconcile at the v0.1 cut:
+
+- Message order is inverted (daemon sends `AuthNonce`; client signs
+  first with `AuthClient`; daemon replies with `AuthHost`). Necessary
+  because PR #5.5 ships before PR #7's offer-record plumbing — without
+  an offer record the daemon has no source of truth for `client_pk`
+  before the client speaks.
+- Binding bytes fold into HKDF `info`, not the DTLS exporter `context`.
+  `webrtc-dtls` v0.17.x rejects a non-empty exporter `context`
+  (`ContextUnsupported`). Cryptographically equivalent (exporter secret
+  is session-unique; HKDF still commits to `host_pk || client_pk ||
+  nonce`). The spec text is authoritative once the upstream DTLS crate
+  accepts a non-empty context.
+
 ## Forwarding to a local HTTP service (PR #6)
 
 Configure a `[forward]` section to route every inbound `REQUEST_*`
@@ -122,10 +164,9 @@ upstream sees it:
 
 ## What this crate does NOT (yet) deliver
 
-## What this crate does NOT (yet) deliver
-
-- Channel binding (spec §7.1 / RFC 8844 mitigation) — PR #5.5.
-- Offer-record polling + allowlist + per-IP / per-pubkey rate limit — PR #7.
+- Allowlist + per-IP / per-pubkey rate limit — PR #7. Channel binding
+  proves key possession, not authorization.
+- Offer-record polling — PR #7.
 - Client-side WebRTC offerer — PR #8 (`openhost-client`).
 - Self-hosted STUN / IPv6-only mode — PR #9.
 - Keychain integration. `FsKeyStore` is the only backend until PR #10.

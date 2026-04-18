@@ -20,6 +20,7 @@
 //! shutdown), and a full WebRTC stack on top of this foundation.
 
 pub mod app;
+pub mod channel_binding;
 pub mod config;
 pub mod dtls_cert;
 pub mod error;
@@ -30,6 +31,7 @@ pub mod publish;
 pub mod signal;
 
 pub use app::{init_tracing, App};
+pub use channel_binding::{ChannelBinder, ChannelBindingError};
 pub use config::Config;
 pub use error::{DaemonError, Result};
 pub use forward::{ForwardResponse, Forwarder};

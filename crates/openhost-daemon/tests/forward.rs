@@ -5,13 +5,9 @@
 //! `RTCPeerConnection` in the same process, sends `REQUEST_HEAD` +
 //! `REQUEST_BODY` + `REQUEST_END` frames, and asserts the upstream's
 //! response round-trips through the openhost frame codec.
-//!
-//! Shares helpers with `tests/listener.rs`; we duplicate the
-//! `ClientSession` / `establish_connection` scaffolding rather than
-//! pulling `listener.rs` into a shared module because Cargo doesn't
-//! let integration tests depend on each other.
 
-use async_trait::async_trait;
+mod support;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1 as server_http1;
@@ -21,31 +17,14 @@ use openhost_daemon::config::{
     Config, DtlsConfig, ForwardConfig, IdentityConfig, IdentityStore, LogConfig, PkarrConfig,
 };
 use openhost_daemon::{App, Result as DaemonResult};
-use openhost_pkarr::{Result as PkarrResult, Transport};
-use pkarr::{SignedPacket, Timestamp};
+use openhost_pkarr::Transport;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
+use support::{establish_connection, ClientSession, NoopTransport};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
-use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-
-#[derive(Default)]
-struct NoopTransport;
-
-#[async_trait]
-impl Transport for NoopTransport {
-    async fn publish(&self, _packet: &SignedPacket, _cas: Option<Timestamp>) -> PkarrResult<()> {
-        Ok(())
-    }
-}
+use tokio::sync::Mutex;
 
 fn test_config(dir: &TempDir, upstream_port: u16) -> Config {
     Config {
@@ -195,99 +174,6 @@ async fn build_daemon(upstream_port: u16) -> (TempDir, App) {
         .await
         .expect("daemon builds");
     (tmp, app)
-}
-
-struct ClientSession {
-    client_pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
-    dc: Arc<RTCDataChannel>,
-    received: Arc<Mutex<Vec<u8>>>,
-}
-
-impl ClientSession {
-    async fn close(self) {
-        let _ = self.dc.close().await;
-        let _ = self.client_pc.close().await;
-    }
-}
-
-async fn establish_connection(app: &App) -> ClientSession {
-    let client_api = APIBuilder::new().build();
-    let client_pc = Arc::new(
-        client_api
-            .new_peer_connection(RTCConfiguration::default())
-            .await
-            .expect("client pc builds"),
-    );
-
-    let (connected_tx, mut connected_rx) = mpsc::channel::<()>(1);
-    {
-        let connected_tx = connected_tx.clone();
-        client_pc.on_peer_connection_state_change(Box::new(move |state| {
-            let connected_tx = connected_tx.clone();
-            Box::pin(async move {
-                if state == RTCPeerConnectionState::Connected {
-                    let _ = connected_tx.try_send(());
-                }
-            })
-        }));
-    }
-
-    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let (dc_open_tx, mut dc_open_rx) = mpsc::channel::<()>(1);
-
-    let dc = client_pc
-        .create_data_channel("openhost", Some(RTCDataChannelInit::default()))
-        .await
-        .expect("client DC");
-
-    {
-        let dc_open_tx = dc_open_tx.clone();
-        dc.on_open(Box::new(move || {
-            let dc_open_tx = dc_open_tx.clone();
-            Box::pin(async move {
-                let _ = dc_open_tx.try_send(());
-            })
-        }));
-    }
-    let received_for_dc = Arc::clone(&received);
-    dc.on_message(Box::new(move |msg: DataChannelMessage| {
-        let received = Arc::clone(&received_for_dc);
-        Box::pin(async move {
-            let mut buf = received.lock().await;
-            buf.extend_from_slice(&msg.data);
-        })
-    }));
-
-    let offer = client_pc.create_offer(None).await.expect("create_offer");
-    client_pc
-        .set_local_description(offer)
-        .await
-        .expect("set_local_description");
-    let mut gather = client_pc.gathering_complete_promise().await;
-    let _ = gather.recv().await;
-    let offer_sdp = client_pc.local_description().await.unwrap().sdp;
-
-    let answer_sdp = app.handle_offer(&offer_sdp).await.expect("daemon answers");
-    let answer = RTCSessionDescription::answer(answer_sdp).expect("parse answer");
-    client_pc
-        .set_remote_description(answer)
-        .await
-        .expect("set_remote_description");
-
-    tokio::time::timeout(Duration::from_secs(5), connected_rx.recv())
-        .await
-        .expect("DTLS handshake timed out")
-        .expect("connected channel closed");
-    tokio::time::timeout(Duration::from_secs(5), dc_open_rx.recv())
-        .await
-        .expect("data channel didn't open within 5s")
-        .expect("dc_open channel closed");
-
-    ClientSession {
-        client_pc,
-        dc,
-        received,
-    }
 }
 
 /// Send a full request on `session` and collect the full response.

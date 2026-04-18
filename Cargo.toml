@@ -73,3 +73,12 @@ http-body-util = "0.1"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# PR #5.5 — route the `webrtc` dep through our fork, which adds
+# `RTCDtlsTransport::export_keying_material` (RFC 5705 passthrough) so
+# the daemon's channel-binding handshake can reach the live DTLS
+# session's master secret. Pinned to an immutable SHA so CI is
+# reproducible; upstream PR at webrtc-rs/webrtc is tracked separately.
+# Drop this block once the upstream merges and releases a new version.
+[patch.crates-io]
+webrtc = { git = "https://github.com/kaicoder03/webrtc.git", rev = "a1c2dbb36915c43b532d9f067a96d9a6a8bd9c06" }

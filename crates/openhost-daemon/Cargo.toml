@@ -42,6 +42,9 @@ directories = { workspace = true }
 # Identity + DTLS cert
 ed25519-dalek = { workspace = true }
 zeroize = { workspace = true }
+# CSPRNG for channel-binding nonces (PR #5.5).
+rand = { workspace = true }
+rand_core = { workspace = true }
 rcgen = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

@@ -8,32 +8,36 @@
 //! pre-loaded with the daemon's persisted cert, applies the offer,
 //! creates an answer, drains ICE, and returns the answer SDP.
 //!
-//! Data channels opened on the accepted peer run inbound bytes through
-//! [`openhost_core::wire::Frame::try_decode`]; any `REQUEST_HEAD` frame
-//! is answered with an `HTTP/1.1 502 Bad Gateway` `RESPONSE_HEAD` +
-//! empty `RESPONSE_END`. The real localhost forwarder lands in PR #6.
-//!
-//! **Channel binding (spec §7.1 / RFC 8844 mitigation) is NOT
-//! implemented in this PR.** The `webrtc` v0.17.x stable line does not
-//! publicly expose RFC 5705 exporter keying material; PR #5.5 will add
-//! that via a patched fork. See the `TODO(spec §7.1 / PR #5.5)` marker
-//! in [`PassivePeer::wire_dtls_state_observer`].
+//! Data channels opened on the accepted peer first run the spec §7.1
+//! channel-binding handshake ([`crate::channel_binding`]). Only after
+//! the client proves possession of its Ed25519 key and both sides agree
+//! on the DTLS exporter secret does the listener accept REQUEST frames.
+//! A `REQUEST_HEAD` after authentication runs through the configured
+//! [`Forwarder`], or falls back to a stub `HTTP/1.1 502 Bad Gateway`
+//! when no `[forward]` section is configured.
 
+use crate::channel_binding::{
+    ChannelBinder, ChannelBindingError, AUTH_NONCE_LEN, BINDING_TIMEOUT_SECS, EXPORTER_LABEL,
+    EXPORTER_SECRET_LEN,
+};
 use crate::error::ListenerError;
 use crate::forward::{ForwardResponse, Forwarder};
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
-use openhost_core::identity::SigningKey;
+use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::{Mutex, Notify};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::{APIBuilder, API};
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::dtls_transport::dtls_transport_state::RTCDtlsTransportState;
+use webrtc::dtls_transport::RTCDtlsTransport;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -96,12 +100,17 @@ fn pc_key(pc: &Arc<RTCPeerConnection>) -> PcKey {
 pub struct PassivePeer {
     api: Arc<API>,
     certificate: RTCCertificate,
-    #[allow(dead_code)] // wired in PR #5.5 for channel-binding signatures
-    identity: Arc<SigningKey>,
     #[allow(dead_code)] // read by future rotation-consistency checks
     state: Arc<SharedState>,
     active: Arc<Mutex<HashMap<PcKey, Arc<RTCPeerConnection>>>>,
     offer_timeout_secs: u64,
+    /// Channel-binding timeout in seconds. Stored atomically so tests
+    /// can shrink it after the peer is wrapped in an `Arc`.
+    binding_timeout_secs: Arc<AtomicU64>,
+    /// Channel-binding helper built from the daemon's identity. The
+    /// binder signs `AuthHost` payloads and verifies `AuthClient`
+    /// signatures per spec §7.1.
+    binder: Arc<ChannelBinder>,
     /// Localhost forwarder. `None` falls back to the PR #5 stub
     /// (`HTTP/1.1 502 Bad Gateway` on every `REQUEST_HEAD`) — a daemon
     /// without a `[forward]` config section stays serviceable as a
@@ -134,15 +143,25 @@ impl PassivePeer {
 
         let api = APIBuilder::new().with_setting_engine(engine).build();
 
+        let binder = Arc::new(ChannelBinder::new(identity));
+
         Ok(Self {
             api: Arc::new(api),
             certificate,
-            identity,
             state,
             active: Arc::new(Mutex::new(HashMap::new())),
             offer_timeout_secs: DEFAULT_OFFER_TIMEOUT_SECS,
+            binding_timeout_secs: Arc::new(AtomicU64::new(BINDING_TIMEOUT_SECS)),
+            binder,
             forwarder,
         })
+    }
+
+    /// Override the channel-binding timeout. Tests shorten this so the
+    /// timeout regression test doesn't burn 10 s per run. Callable after
+    /// the peer has been wrapped in an `Arc`.
+    pub fn set_binding_timeout(&self, secs: u64) {
+        self.binding_timeout_secs.store(secs, Ordering::Relaxed);
     }
 
     /// Override the `handle_offer` timeout budget.
@@ -205,7 +224,14 @@ impl PassivePeer {
         // peer-connection-state prune hook BEFORE applying the remote
         // description — webrtc-rs fires handlers off internal event loops
         // that can race the DTLS handshake start.
-        wire_data_channel_handler(Arc::clone(&pc), self.forwarder.clone());
+        let dtls_transport = pc.sctp().transport();
+        wire_data_channel_handler(
+            Arc::clone(&pc),
+            Arc::clone(&self.binder),
+            dtls_transport,
+            Arc::clone(&self.binding_timeout_secs),
+            self.forwarder.clone(),
+        );
         wire_dtls_state_observer(Arc::clone(&pc));
         wire_prune_on_terminal_state(Arc::clone(&pc), Arc::clone(&self.active));
 
@@ -276,8 +302,9 @@ fn check_setup_role_is_active(sdp: &str) -> Result<(), ListenerError> {
     }
 }
 
-/// Log when DTLS reaches `Connected` state and mark the channel-binding
-/// TODO. Called once per `RTCPeerConnection` during setup.
+/// Log when DTLS reaches `Connected` state. The channel-binding
+/// handshake itself fires per-data-channel in [`wire_frame_loop`] so it
+/// can observe the first inbound bytes — this observer is debug-only.
 fn wire_dtls_state_observer(pc: Arc<RTCPeerConnection>) {
     pc.sctp()
         .transport()
@@ -286,29 +313,6 @@ fn wire_dtls_state_observer(pc: Arc<RTCPeerConnection>) {
                 tracing::debug!(?state, "openhostd: DTLS transport state change");
                 if state == RTCDtlsTransportState::Connected {
                     tracing::info!("openhostd: DTLS handshake completed — data channel ready");
-                    // TODO(spec §7.1 / PR #5.5): RFC 5705 exporter keying
-                    // material is not exposed by webrtc-rs v0.17.x. Once we
-                    // vendor a patched fork that adds an
-                    // `export_keying_material` accessor on
-                    // `RTCDtlsTransport`, this is where the channel-binding
-                    // handshake fires:
-                    //
-                    //   let exporter = transport.export_keying_material(
-                    //       b"EXPORTER-openhost-auth-v1",
-                    //       &openhost_core::crypto::exporter_context(
-                    //           &host_pk, &client_pk, &nonce),
-                    //       32).await?;
-                    //   let auth = openhost_core::crypto::auth_bytes(&exporter)?;
-                    //   send(nonce || sign(auth));
-                    //
-                    // Until then the daemon is vulnerable to RFC 8844
-                    // unknown-key-share attacks from any offerer that
-                    // possesses our fingerprint. No openhost offerer
-                    // exists yet (client-side WebRTC is PR #8), so the
-                    // attack surface is currently empty.
-                    tracing::warn!(
-                        "openhostd: channel binding unimplemented (see spec §7.1 / PR #5.5)"
-                    );
                 }
             })
         }));
@@ -351,13 +355,22 @@ fn wire_prune_on_terminal_state(
 
 /// Register the `on_data_channel` handler that converts raw
 /// DataChannel messages into framed responses.
-fn wire_data_channel_handler(pc: Arc<RTCPeerConnection>, forwarder: Option<Arc<Forwarder>>) {
+fn wire_data_channel_handler(
+    pc: Arc<RTCPeerConnection>,
+    binder: Arc<ChannelBinder>,
+    dtls_transport: Arc<RTCDtlsTransport>,
+    binding_timeout_secs: Arc<AtomicU64>,
+    forwarder: Option<Arc<Forwarder>>,
+) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let label = dc.label().to_string();
+        let binder = Arc::clone(&binder);
+        let dtls_transport = Arc::clone(&dtls_transport);
+        let binding_timeout_secs = Arc::clone(&binding_timeout_secs);
         let forwarder = forwarder.clone();
         Box::pin(async move {
             tracing::debug!(label, "openhostd: data channel opened");
-            wire_frame_loop(dc, forwarder).await;
+            wire_frame_loop(dc, binder, dtls_transport, binding_timeout_secs, forwarder).await;
         })
     }));
 }
@@ -377,16 +390,118 @@ impl RequestInProgress {
     }
 }
 
-/// Attach a `on_message` handler to `dc` that accumulates bytes, decodes
-/// frames, and either forwards via the configured forwarder or (if no
-/// forwarder is configured) falls back to the PR #5 stub 502 response.
-async fn wire_frame_loop(dc: Arc<RTCDataChannel>, forwarder: Option<Arc<Forwarder>>) {
+/// Channel-binding state machine (spec §7.1). Progresses strictly:
+/// `Pending` → `AwaitingAuthClient` (set from `on_open`) →
+/// `Authenticated` (set after valid AuthClient). `Failed` is terminal
+/// and triggers teardown.
+enum BindingState {
+    /// The data channel has not yet opened. The on_open callback will
+    /// transition to `AwaitingAuthClient` once SCTP is ready and the
+    /// nonce has been sent.
+    Pending,
+    /// AuthNonce has been sent; daemon is waiting for the client's
+    /// AuthClient frame.
+    AwaitingAuthClient { nonce: [u8; AUTH_NONCE_LEN] },
+    /// AuthClient verified and AuthHost emitted. Forwarded traffic
+    /// accepted from this point on.
+    Authenticated {
+        #[allow(dead_code)] // reserved for allowlist check in PR #7
+        client_pk: PublicKey,
+    },
+    /// Terminal — any inbound frame triggers immediate teardown.
+    Failed,
+}
+
+/// Attach `on_open` and `on_message` handlers to `dc`. The `on_open`
+/// handler fires the channel-binding handshake (send AuthNonce, start a
+/// timeout); the `on_message` handler dispatches frames to either the
+/// binding verifier or the request forwarder depending on
+/// [`BindingState`].
+async fn wire_frame_loop(
+    dc: Arc<RTCDataChannel>,
+    binder: Arc<ChannelBinder>,
+    dtls_transport: Arc<RTCDtlsTransport>,
+    binding_timeout_secs: Arc<AtomicU64>,
+    forwarder: Option<Arc<Forwarder>>,
+) {
     let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
+    let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
+    // Notified by `handle_auth_client` on success OR on terminal failure
+    // so the timeout task exits early instead of sleeping its full budget
+    // after binding has already resolved.
+    let binding_done: Arc<Notify> = Arc::new(Notify::new());
+
+    // on_open: generate + send the 32-byte nonce, then arm the timeout.
+    // Running here (rather than from the DTLS-state observer) guarantees
+    // the SCTP stream is ready, so the first outbound frame actually
+    // reaches the peer.
+    {
+        let dc_for_open = Arc::clone(&dc);
+        let binding_for_open = Arc::clone(&binding);
+        let done_for_open = Arc::clone(&binding_done);
+        dc.on_open(Box::new(move || {
+            let dc = Arc::clone(&dc_for_open);
+            let binding = Arc::clone(&binding_for_open);
+            let binding_done = Arc::clone(&done_for_open);
+            Box::pin(async move {
+                let nonce = ChannelBinder::fresh_nonce();
+                // NB(lock ordering): we release the binding lock before
+                // the `send_frame(AuthNonce)` await. If the client races
+                // us with an early `AuthClient`, `on_message` will now
+                // observe `AwaitingAuthClient{nonce}` and run
+                // verification correctly. An early non-`AuthClient`
+                // frame is rejected by `dispatch_frame` in the same
+                // state, which is also correct.
+                {
+                    let mut s = binding.lock().await;
+                    *s = BindingState::AwaitingAuthClient { nonce };
+                }
+                let frame = Frame::new(FrameType::AuthNonce, nonce.to_vec())
+                    .expect("32-byte nonce always fits the frame cap");
+                if let Err(err) = send_frame(&dc, frame).await {
+                    tracing::warn!(?err, "openhostd: failed to send AuthNonce; closing DC");
+                    *binding.lock().await = BindingState::Failed;
+                    binding_done.notify_waiters();
+                    let _ = dc.close().await;
+                    return;
+                }
+
+                // Timeout enforcer. Exits early if `handle_auth_client`
+                // reports a terminal binding outcome via `binding_done`.
+                let dc_for_timeout = Arc::clone(&dc);
+                let binding_for_timeout = Arc::clone(&binding);
+                let done_for_timeout = Arc::clone(&binding_done);
+                let budget_secs = binding_timeout_secs.load(Ordering::Relaxed);
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(budget_secs)) => {},
+                        _ = done_for_timeout.notified() => return,
+                    }
+                    let mut s = binding_for_timeout.lock().await;
+                    if matches!(*s, BindingState::AwaitingAuthClient { .. }) {
+                        *s = BindingState::Failed;
+                        drop(s);
+                        tracing::warn!(
+                            timeout_secs = budget_secs,
+                            "openhostd: channel binding timed out; tearing down DC"
+                        );
+                        let _ = send_error_frame(&dc_for_timeout, "channel binding timeout").await;
+                        let _ = dc_for_timeout.close().await;
+                    }
+                });
+            })
+        }));
+    }
+
     let dc_handler = Arc::clone(&dc);
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let buffer = Arc::clone(&buffer);
         let request = Arc::clone(&request);
+        let binding = Arc::clone(&binding);
+        let binding_done = Arc::clone(&binding_done);
+        let binder = Arc::clone(&binder);
+        let dtls_transport = Arc::clone(&dtls_transport);
         let dc = Arc::clone(&dc_handler);
         let forwarder = forwarder.clone();
         Box::pin(async move {
@@ -396,8 +511,17 @@ async fn wire_frame_loop(dc: Arc<RTCDataChannel>, forwarder: Option<Arc<Forwarde
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
                         buf.drain(..consumed);
-                        let outcome =
-                            handle_frame(&frame, &dc, &request, forwarder.as_deref()).await;
+                        let outcome = dispatch_frame(
+                            &frame,
+                            &dc,
+                            &binding,
+                            &binding_done,
+                            &binder,
+                            &dtls_transport,
+                            &request,
+                            forwarder.as_deref(),
+                        )
+                        .await;
                         if let FrameOutcome::Teardown = outcome {
                             let _ = dc.close().await;
                             buf.clear();
@@ -425,16 +549,85 @@ enum FrameOutcome {
     Teardown,
 }
 
-/// Dispatch one decoded inbound frame. Accumulates request state across
-/// `RequestHead` → `RequestBody*` → `RequestEnd`. When `RequestEnd`
-/// arrives the forwarder (if configured) runs; otherwise the PR #5 stub
-/// 502 response fires.
-async fn handle_frame(
+/// Top-level dispatch. Gates on [`BindingState`]: until the channel
+/// binding is `Authenticated`, the ONLY frame accepted from the peer is
+/// `AuthClient`. Anything else produces an `ERROR` frame + teardown.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_frame(
     frame: &Frame,
     dc: &RTCDataChannel,
+    binding: &Arc<Mutex<BindingState>>,
+    binding_done: &Arc<Notify>,
+    binder: &ChannelBinder,
+    dtls_transport: &RTCDtlsTransport,
     request: &Arc<Mutex<RequestInProgress>>,
     forwarder: Option<&Forwarder>,
 ) -> FrameOutcome {
+    // Look up binding state, then release the lock before awaiting
+    // webrtc I/O (the send + close paths below both await).
+    let binding_snapshot = {
+        let guard = binding.lock().await;
+        match &*guard {
+            BindingState::Pending => BindingSnapshot::Pending,
+            BindingState::AwaitingAuthClient { nonce } => {
+                BindingSnapshot::AwaitingAuthClient { nonce: *nonce }
+            }
+            BindingState::Authenticated { .. } => BindingSnapshot::Authenticated,
+            BindingState::Failed => BindingSnapshot::Failed,
+        }
+    };
+
+    match binding_snapshot {
+        BindingSnapshot::Failed => {
+            // Timeout or earlier failure already closed the DC (and
+            // notified the timeout task). Swallow the frame without
+            // re-emitting an ERROR or re-closing.
+            return FrameOutcome::Continue;
+        }
+        BindingSnapshot::Pending => {
+            tracing::warn!(
+                ?frame.frame_type,
+                "openhostd: frame arrived before data channel opened; tearing down"
+            );
+            let _ = send_error_frame(dc, "frame before channel opened").await;
+            *binding.lock().await = BindingState::Failed;
+            binding_done.notify_waiters();
+            return FrameOutcome::Teardown;
+        }
+        BindingSnapshot::AwaitingAuthClient { nonce } => {
+            if frame.frame_type != FrameType::AuthClient {
+                tracing::warn!(
+                    ?frame.frame_type,
+                    "openhostd: non-AuthClient frame before binding completed; tearing down"
+                );
+                let _ = send_error_frame(
+                    dc,
+                    &format!(
+                        "expected AuthClient before any other frame (got 0x{:02x})",
+                        frame.frame_type.as_u8()
+                    ),
+                )
+                .await;
+                *binding.lock().await = BindingState::Failed;
+                binding_done.notify_waiters();
+                return FrameOutcome::Teardown;
+            }
+            return handle_auth_client(
+                frame,
+                dc,
+                binding,
+                binding_done,
+                binder,
+                dtls_transport,
+                &nonce,
+            )
+            .await;
+        }
+        BindingSnapshot::Authenticated => {
+            // Fall through into the request-handling arm below.
+        }
+    }
+
     match frame.frame_type {
         FrameType::RequestHead => {
             let mut req = request.lock().await;
@@ -529,7 +722,123 @@ async fn handle_frame(
             let _ = send_error_frame(dc, "unexpected frame type from client").await;
             FrameOutcome::Teardown
         }
+        // Auth frames after binding is complete are a protocol violation.
+        // Spec §7.1 says binding runs once per DC; a client wishing to
+        // re-bind must open a new data channel.
+        FrameType::AuthNonce | FrameType::AuthClient | FrameType::AuthHost => {
+            tracing::warn!(
+                ?frame.frame_type,
+                "openhostd: auth frame after binding completed; tearing down"
+            );
+            let _ = send_error_frame(
+                dc,
+                "auth frame after binding completed; re-binding requires a new data channel",
+            )
+            .await;
+            FrameOutcome::Teardown
+        }
     }
+}
+
+/// Snapshot of [`BindingState`] used by [`dispatch_frame`] to hold no
+/// lock across `await` points while still branching on state.
+enum BindingSnapshot {
+    Pending,
+    AwaitingAuthClient { nonce: [u8; AUTH_NONCE_LEN] },
+    Authenticated,
+    Failed,
+}
+
+/// Verify an inbound `AuthClient` frame, and if it passes:
+///   1. Reply with `AuthHost`.
+///   2. Transition the binding state to `Authenticated`.
+///
+/// Any failure (bad payload, bad signature, exporter error) emits an
+/// `ERROR` frame, marks state `Failed`, and requests teardown.
+async fn handle_auth_client(
+    frame: &Frame,
+    dc: &RTCDataChannel,
+    binding: &Arc<Mutex<BindingState>>,
+    binding_done: &Arc<Notify>,
+    binder: &ChannelBinder,
+    dtls_transport: &RTCDtlsTransport,
+    nonce: &[u8; AUTH_NONCE_LEN],
+) -> FrameOutcome {
+    let exporter = match dtls_transport
+        .export_keying_material(EXPORTER_LABEL, EXPORTER_SECRET_LEN)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(?err, "openhostd: DTLS exporter failed; tearing down");
+            let _ = send_error_frame(dc, "DTLS exporter failed").await;
+            *binding.lock().await = BindingState::Failed;
+            binding_done.notify_waiters();
+            return FrameOutcome::Teardown;
+        }
+    };
+    if exporter.len() != EXPORTER_SECRET_LEN {
+        tracing::warn!(
+            got = exporter.len(),
+            "openhostd: DTLS exporter returned wrong length; tearing down"
+        );
+        let _ = send_error_frame(dc, "DTLS exporter returned wrong length").await;
+        *binding.lock().await = BindingState::Failed;
+        binding_done.notify_waiters();
+        return FrameOutcome::Teardown;
+    }
+
+    let client_pk = match binder.verify_client_sig(&exporter, nonce, &frame.payload) {
+        Ok(pk) => pk,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "openhostd: AuthClient verification failed; tearing down"
+            );
+            let reason = match err {
+                ChannelBindingError::MalformedAuthClient(_) => "malformed AuthClient",
+                ChannelBindingError::MalformedClientPk => "malformed client_pk",
+                ChannelBindingError::VerifyFailed => "client signature failed to verify",
+                _ => "channel binding failed",
+            };
+            let _ = send_error_frame(dc, reason).await;
+            *binding.lock().await = BindingState::Failed;
+            binding_done.notify_waiters();
+            return FrameOutcome::Teardown;
+        }
+    };
+
+    let host_sig = match binder.sign_host(&exporter, nonce, &client_pk) {
+        Ok(sig) => sig,
+        Err(err) => {
+            tracing::warn!(?err, "openhostd: sign_host failed; tearing down");
+            let _ = send_error_frame(dc, "host signing failed").await;
+            *binding.lock().await = BindingState::Failed;
+            binding_done.notify_waiters();
+            return FrameOutcome::Teardown;
+        }
+    };
+
+    if let Err(err) = send_frame(
+        dc,
+        Frame::new(FrameType::AuthHost, host_sig.to_vec())
+            .expect("64-byte host signature fits the frame cap"),
+    )
+    .await
+    {
+        tracing::warn!(?err, "openhostd: failed to send AuthHost; tearing down");
+        *binding.lock().await = BindingState::Failed;
+        binding_done.notify_waiters();
+        return FrameOutcome::Teardown;
+    }
+
+    tracing::info!(
+        client_pk = %client_pk,
+        "openhostd: channel binding authenticated"
+    );
+    *binding.lock().await = BindingState::Authenticated { client_pk };
+    binding_done.notify_waiters();
+    FrameOutcome::Continue
 }
 
 /// Emit a forwarder response as `RESPONSE_HEAD` + `RESPONSE_BODY*` +
