@@ -24,6 +24,10 @@ cli = ["clap", "tracing-subscriber", "serde_json", "hex"]
 # Opt-in suite that resolves a real host pubkey over public Pkarr
 # relays. NOT on CI — run manually before publishing.
 real-network = []
+# In-process end-to-end tests. Pulls in openhost-pkarr's
+# MemoryPkarrNetwork + the hyper test-server machinery via
+# dev-dependencies. Not enabled in release builds.
+test-fakes = ["openhost-pkarr/test-fakes"]
 
 [dependencies]
 openhost-core = { path = "../openhost-core" }
@@ -41,6 +45,19 @@ anyhow = { workspace = true }
 # Underlying pkarr client for the real Resolve impl
 pkarr = { workspace = true }
 
+# Channel binding + offer sealing (PR #8)
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+base64 = { workspace = true }
+
+# WebRTC (PR #8). Pinned via workspace's [patch.crates-io].
+webrtc = { workspace = true }
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Optional — cli feature only
 clap = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
@@ -51,3 +68,12 @@ hex = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["test-util"] }
 hex = { workspace = true }
 serde_json = { workspace = true }
+# End-to-end test scaffolding (PR #8).
+openhost-daemon = { path = "../openhost-daemon" }
+openhost-pkarr = { path = "../openhost-pkarr", features = ["test-fakes"] }
+tempfile = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util = { workspace = true }
+async-trait = { workspace = true }
+tracing-subscriber = { workspace = true }

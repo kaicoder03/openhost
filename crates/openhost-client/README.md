@@ -1,24 +1,61 @@
 # openhost-client
 
-Client-side library for reading openhost host records. Consumed by the
-browser extension (compiled to WASM), the native apps (via
-`openhost-ffi`), and the `openhost-resolve` debug CLI bundled here.
+Client-side library for resolving openhost host records AND dialing
+authenticated WebRTC sessions to them. Consumed by the browser
+extension (compiled to WASM), the native apps (via `openhost-ffi`),
+and the `openhost-resolve` debug CLI bundled here.
 
-**PR #4 / M4.1 is read-only.** The library resolves an `oh://…` URL to a
-validated [`SignedRecord`](../openhost-core/src/pkarr_record/mod.rs) by
-racing the configured Pkarr relays + the Mainline DHT. WebRTC offerer,
-ICE candidate decryption, and channel binding are PR #8 work.
+## Dialer (PR #8)
 
-## Library
+```rust,no_run
+use openhost_client::{Dialer, OpenhostUrl, SigningKey};
+use bytes::Bytes;
+use std::sync::Arc;
 
-```rust
+# async fn _ex() -> Result<(), Box<dyn std::error::Error>> {
+let identity = Arc::new(SigningKey::generate_os_rng());
+let url = OpenhostUrl::parse("oh://<52-char-zbase32>/")?;
+
+let mut dialer = Dialer::builder()
+    .identity(identity)
+    .host_url(url)
+    // Defaults to DEFAULT_RELAYS + the Mainline DHT.
+    .relays(["https://pkarr.pubky.app"])
+    .build()?;
+
+let session = dialer.dial().await?;
+let response = session
+    .request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", Bytes::new())
+    .await?;
+println!("{}", std::str::from_utf8(&response.head_bytes)?);
+session.close().await;
+# Ok(()) }
+```
+
+`dial()` resolves the host's Pkarr record, generates + publishes a
+sealed offer under the client's own Pkarr zone, polls the host zone
+for the answer, completes the RFC 5705 DTLS exporter + RFC 8844
+channel binding (spec §7.1), and returns an authenticated
+`OpenhostSession` backed by one WebRTC data channel.
+
+**Known constraint.** Today the daemon's answer SDP with full ICE
+candidates doesn't fit the BEP44 1000-byte `v` cap when folded into
+the daemon's main pkarr packet. The integration test in
+`tests/end_to_end.rs` asserts against the daemon's `SharedState`
+answer queue rather than the on-wire packet. Splitting ICE trickle
+into separate pkarr records is the planned v0.1-freeze fix.
+
+## Read-only resolver
+
+Still exported as-is for callers that only need the host record:
+
+```rust,no_run
 use openhost_client::Client;
 use std::time::Duration;
 
+# async fn _ex() -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::builder()
-    // Empty falls back to the bundled default relay list + the Mainline DHT.
     .relays(["https://pkarr.pubky.app"])
-    // Duration::ZERO skips the spec §3 rule 5 grace window for snappy dials.
     .grace_window(Duration::from_millis(1500))
     .build()?;
 
@@ -27,6 +64,7 @@ let record = client
     .await?;
 
 println!("DTLS fp: {}", hex::encode(record.record.dtls_fp));
+# Ok(()) }
 ```
 
 On the test side, `Client::builder().build_with_resolve(Arc<dyn Resolve>)`

@@ -32,6 +32,15 @@ pub mod resolver;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// In-memory pkarr substrate for end-to-end tests (PR #8). Gated
+/// behind the `test-fakes` feature so it never ships in release
+/// builds.
+#[cfg(any(test, feature = "test-fakes"))]
+pub mod test_fakes;
+
+#[cfg(any(test, feature = "test-fakes"))]
+pub use test_fakes::MemoryPkarrNetwork;
+
 pub use codec::{
     decode, encode, packet_public_key, BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME,
     OPENHOST_TXT_TTL,

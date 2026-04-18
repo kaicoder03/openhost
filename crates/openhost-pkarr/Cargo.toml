@@ -14,6 +14,10 @@ path = "src/lib.rs"
 [features]
 default = []
 nostr = ["serde_json", "hex"]
+# PR #8: in-memory pkarr substrate for end-to-end tests that drive a
+# real `App` + `Dialer` against each other without touching the
+# network. Gated so the fake never leaks into release builds.
+test-fakes = []
 
 [dependencies]
 openhost-core = { path = "../openhost-core" }

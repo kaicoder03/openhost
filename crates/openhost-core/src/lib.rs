@@ -19,6 +19,7 @@
 //! Every module has matching test vectors under `spec/test-vectors/`. Implementations in
 //! other languages are expected to pass the same vectors verbatim.
 
+pub mod channel_binding_wire;
 pub mod crypto;
 pub mod error;
 pub mod identity;

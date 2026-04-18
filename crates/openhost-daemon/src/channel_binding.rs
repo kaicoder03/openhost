@@ -45,31 +45,14 @@ use rand_core::RngCore;
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Length of the daemon-chosen channel-binding nonce (spec §7.1).
-pub const AUTH_NONCE_LEN: usize = 32;
-
-/// Wire length of the `AuthClient` frame payload: 32-byte `client_pk` ||
-/// 64-byte `sig_client`.
-pub const AUTH_CLIENT_PAYLOAD_LEN: usize = 32 + 64;
-
-/// Wire length of the `AuthHost` frame payload: 64-byte `sig_host`.
-pub const AUTH_HOST_PAYLOAD_LEN: usize = 64;
-
-/// Length of the RFC 5705 exporter secret openhost derives.
-pub const EXPORTER_SECRET_LEN: usize = 32;
-
-/// Exporter label openhost requests from the DTLS transport.
-///
-/// Held as a `&str` because webrtc-rs's exporter API is string-typed.
-/// The byte contents MUST match
-/// [`openhost_core::crypto::AUTH_CONTEXT_LABEL`]; a unit test pins the
-/// equality so drift is caught in CI.
-pub const EXPORTER_LABEL: &str = "EXPORTER-openhost-auth-v1";
-
-/// How long the daemon waits for the client's `AuthClient` frame after
-/// sending `AuthNonce`. Past this deadline the data channel is torn down
-/// (spec §7.1, "binding MUST complete promptly").
-pub const BINDING_TIMEOUT_SECS: u64 = 10;
+// Wire-level constants shared with `openhost-client`'s client-side
+// binder. The canonical source is `openhost-core::channel_binding_wire`;
+// re-exported here to keep existing daemon imports
+// (`channel_binding::AUTH_NONCE_LEN`, etc.) working unchanged.
+pub use openhost_core::channel_binding_wire::{
+    AUTH_CLIENT_PAYLOAD_LEN, AUTH_HOST_PAYLOAD_LEN, AUTH_NONCE_LEN, BINDING_TIMEOUT_SECS,
+    EXPORTER_LABEL, EXPORTER_SECRET_LEN,
+};
 
 /// Why the channel-binding handshake failed.
 #[derive(Debug, Error)]

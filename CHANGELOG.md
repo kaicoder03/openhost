@@ -8,6 +8,22 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added
+
+- `openhost-client` M8 WebRTC offerer + in-process end-to-end test:
+  - New `openhost-client::Dialer` — resolves the host's Pkarr record, generates a WebRTC offer, seals + publishes an `_offer-<host-hash>` record under the client's own zone, polls the host zone for `_answer-<client-hash>`, unseals + applies the answer, and runs the client side of the PR #5.5 channel-binding handshake. Returns an authenticated `OpenhostSession` backed by one WebRTC data channel.
+  - New `openhost-client::OpenhostSession::request(head, body) -> ClientResponse { head_bytes, body }` — wire-bytes HTTP/1.1 round-trip over the authenticated data channel. `close().await` for orderly teardown; `Drop` is a safety net.
+  - New `openhost-client::ClientBinder` — client-side mirror of the daemon's `ChannelBinder`. Domain-separated against `openhost-daemon::ChannelBinder`; both share wire-level constants through a new `openhost-core::channel_binding_wire` module.
+  - Staged public methods on `Dialer` (`resolve_host`, `build_offer`, `publish_offer`, `poll_answer`, `apply_answer`) for fault-injection tests. Production callers go through `dial()`.
+  - New `openhost-pkarr::MemoryPkarrNetwork` (feature `test-fakes`) — shared in-memory substrate that lets a daemon + dialer publish/resolve against each other in the same process without touching a real relay. Serialized `SignedPacket` storage keyed on pubkey; `Transport` + `Resolve` adapters.
+  - `PassivePeer::set_skip_ice_gather_for_tests(bool)` — test-only knob that skips the daemon's `gathering_complete_promise` wait so the answer SDP stays small enough to probe; DO NOT use in production.
+  - Two integration tests in `crates/openhost-client/tests/end_to_end.rs`:
+    1. `daemon_produces_sealed_answer_for_dialer_offer` — drives a real `App` + real `Dialer` through a shared `MemoryPkarrNetwork`; asserts the full daemon-side flow (poll offer → handle_offer → seal answer → queue in SharedState) fires. See hazard note below.
+    2. `dial_times_out_when_daemon_not_running` — no poller seeing the offer, so `Dialer::dial` hits `ClientError::PollAnswerTimeout`.
+  - New `ClientError` variants: `ResolveHost`, `PublishOffer`, `PollAnswerTimeout`, `AnswerDecode`, `AnswerBindingMismatch`, `WebRtcSetup`, `ChannelBinding(ClientBindingError)`, `HttpRoundTrip`.
+  - Re-exports from `openhost-client`: `PublicKey`, `SigningKey`, `OpenhostUrl`, `DEFAULT_RELAYS`.
+  - **Architectural gap flagged `TODO(v0.1 freeze)`:** a full webrtc-rs answer SDP (even with `set_skip_ice_gather_for_tests`) is ~500 bytes; sealed + base64url + DNS packaging pushes the daemon's pkarr packet past the 1000-byte BEP44 `v` cap, so the encoder evicts the answer and the client's `poll_answer` loop never observes it on the wire. The end-to-end test documents this and asserts against `SharedState::snapshot_answers()`. Splitting ICE trickle into separate pkarr records is the planned v0.1-freeze fix that upgrades the test to a full HTTP round-trip assertion.
+
 ### Breaking changes
 
 - **Allowlist enforcement is on by default** (`pkarr.offer_poll.enforce_allowlist = true`). Upgraders running PR #7a configurations will see every inbound offer rejected until they either (a) pair their clients via `openhostd pair add <pubkey>`, or (b) explicitly set `enforce_allowlist = false` in the config. The daemon logs a startup `warn!` when enforcement is on, the pair DB is empty, and `watched_clients` is non-empty — operators see the misconfiguration in the first line of the boot log. The escape-hatch (`false`) preserves PR #7a's permissive behavior unchanged.
