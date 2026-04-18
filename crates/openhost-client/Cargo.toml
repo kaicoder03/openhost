@@ -11,11 +11,16 @@ readme.workspace = true
 [lib]
 path = "src/lib.rs"
 
-# Debug CLI. Gated behind the `cli` feature so WASM / FFI consumers
+# Debug CLIs. Gated behind the `cli` feature so WASM / FFI consumers
 # don't pull clap / tracing-subscriber / serde_json transitively.
 [[bin]]
 name = "openhost-resolve"
 path = "src/bin/openhost-resolve.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "openhost-dial"
+path = "src/bin/openhost-dial.rs"
 required-features = ["cli"]
 
 [features]

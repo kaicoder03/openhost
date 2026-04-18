@@ -20,6 +20,8 @@
 //! - [`error`] — crate-wide error enum.
 
 pub mod binding;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod client;
 pub mod dialer;
 pub mod error;
