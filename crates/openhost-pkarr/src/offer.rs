@@ -1,53 +1,58 @@
-//! Offer + answer record codec for the daemon's signalling loop (PR #7a).
+//! Offer + answer record codec for the daemon's signalling loop.
 //!
 //! # Overview
 //!
 //! Clients publish an ephemeral offer SDP by posting a `SignedPacket`
 //! under their own Ed25519 pubkey containing a TXT record at
-//! `_offer._<host-hash>`. The TXT value is a sealed-box ciphertext
-//! addressed to the daemon's Ed25519 identity (converted to X25519). The
-//! daemon polls known clients, reads the TXT, unseals it, and hands the
-//! inner SDP to [`crate::listener::PassivePeer::handle_offer`].
+//! `_offer-<host-hash>`. The TXT value is a sealed-box ciphertext
+//! addressed to the daemon's Ed25519 identity (converted to X25519).
+//! The daemon polls known clients, reads the TXT, unseals it, and
+//! hands the inner SDP to
+//! [`crate::listener::PassivePeer::handle_offer`].
 //!
-//! The daemon in turn publishes the answer back as an extra TXT record
-//! inside its own regular `_openhost` packet, at `_answer._<client-hash>`.
-//! The `_openhost` TXT bytes are completely unchanged; clients that only
-//! decode the main record don't notice. Client-side consumers that DO
-//! know their `client_hash` can look for the `_answer.*` TXT, unseal it
-//! against their own identity, and apply the answer SDP to their peer
-//! connection.
+//! The daemon publishes the answer back as an extra TXT record
+//! inside its own regular `_openhost` packet, at
+//! `_answer-<client-hash>`. The `_openhost` TXT bytes are completely
+//! unchanged; clients that only decode the main record don't notice.
+//! Client-side consumers that DO know their `client_hash` look for
+//! the `_answer-*` TXT, unseal it against their own identity, and
+//! apply the answer SDP to their peer connection.
 //!
-//! # Spec status
+//! Canonical reference: `spec/01-wire-format.md §3.3`.
 //!
-//! `spec/01-wire-format.md §3` describes the offer side only; the
-//! answer record is a PR #7a extension flagged `TODO(v0.1 freeze)` in
-//! the same file.
+//! # Wire format (v0.1)
 //!
-//! # Wire format
-//!
-//! Both TXT values are `base64url_no_pad(sealed_box_ciphertext)` where
-//! the sealed-box plaintext follows a domain-separated canonical form:
+//! Both TXT values are `base64url_no_pad(sealed_box_ciphertext)`.
+//! The sealed-box plaintext begins with a 1-byte `compression_tag`
+//! that determines the layout of the remaining bytes:
 //!
 //! ```text
-//! offer_plaintext  = 0x01
-//!                    || "openhost-offer-inner1"
-//!                    || client_pk               (32 bytes)
-//!                    || sdp_len                 (u32, big-endian)
-//!                    || offer_sdp               (sdp_len bytes, UTF-8)
+//! inner_plaintext = compression_tag || body
 //!
-//! answer_plaintext = 0x01
-//!                    || "openhost-answer-inner1"
-//!                    || daemon_pk               (32 bytes)
-//!                    || offer_sdp_hash          (32 bytes, SHA-256 of the
-//!                                                UTF-8 offer SDP this
-//!                                                answer is bound to)
-//!                    || sdp_len                 (u32, big-endian)
-//!                    || answer_sdp              (sdp_len bytes, UTF-8)
+//!   compression_tag : u8
+//!       0x01 = Uncompressed — `body` bytes follow verbatim (legacy).
+//!       0x02 = Zlib (RFC 1950) — `body` bytes are the zlib-encoded
+//!              form of the uncompressed body below. Decompressed
+//!              output MUST NOT exceed 65_536 bytes.
+//!       Other values MUST be rejected as malformed.
+//!
+//!   body (offer)  =  "openhost-offer-inner1"   (21 bytes)
+//!                 || client_pk                  (32 bytes)
+//!                 || sdp_len                    (u32 big-endian)
+//!                 || offer_sdp_utf8             (sdp_len bytes)
+//!
+//!   body (answer) =  "openhost-answer-inner1"  (22 bytes)
+//!                 || daemon_pk                  (32 bytes)
+//!                 || offer_sdp_hash             (32 bytes, SHA-256)
+//!                 || sdp_len                    (u32 big-endian)
+//!                 || answer_sdp_utf8            (sdp_len bytes)
 //! ```
 //!
-//! The inner `client_pk` / `daemon_pk` MUST match the outer BEP44 signer
-//! pubkey — cross-checked on decode so a hostile substrate cannot splice
-//! an offer signed under key A with inner plaintext claiming key B.
+//! v0.1+ encoders emit `compression_tag = 0x02`. Decoders accept
+//! both `0x01` and `0x02`. The inner `client_pk` / `daemon_pk` MUST
+//! match the outer BEP44 signer pubkey — cross-checked on decode so
+//! a hostile substrate cannot splice an offer signed under key A
+//! with inner plaintext claiming key B.
 
 use crate::codec::{BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME, OPENHOST_TXT_TTL};
 use crate::error::{PkarrError, Result};
@@ -65,8 +70,35 @@ use rand_core::CryptoRngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-/// Version tag prefixing every offer/answer inner plaintext.
-const INNER_TAG: u8 = 0x01;
+/// Compression discriminator prefixing every sealed inner plaintext.
+/// Encoders post-v0.1 MUST emit `Zlib`; decoders MUST accept both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CompressionTag {
+    /// v1 legacy layout — body bytes follow the tag verbatim.
+    Uncompressed = 0x01,
+    /// v2 — body bytes are zlib-compressed (RFC 1950) after the tag.
+    Zlib = 0x02,
+}
+
+impl CompressionTag {
+    fn try_from_u8(b: u8) -> Result<Self> {
+        match b {
+            0x01 => Ok(Self::Uncompressed),
+            0x02 => Ok(Self::Zlib),
+            _ => Err(PkarrError::MalformedCanonical(
+                "unknown offer/answer inner compression tag",
+            )),
+        }
+    }
+}
+
+/// Maximum decompressed inner-plaintext size. A legitimate SDP is
+/// ~500 bytes; 4 KiB covers fully-trickled ICE; 64 KiB is two orders
+/// of magnitude past anything plausible, tight enough to defeat zlib
+/// bombs. Decoders MUST reject inputs whose decompressed size would
+/// exceed this cap.
+const MAX_DECOMPRESSED_PLAINTEXT: usize = 64 * 1024;
 
 /// Domain separator embedded in the offer inner plaintext.
 pub const OFFER_INNER_DOMAIN: &[u8] = b"openhost-offer-inner1";
@@ -477,10 +509,13 @@ fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String
 // Inner plaintext encode / decode
 // ============================================================================
 
-fn encode_offer_plaintext(p: &OfferPlaintext) -> Vec<u8> {
+/// Shape of the v1 body: `domain || client_pk || sdp_len(u32be) || sdp`.
+/// No leading compression tag — that's added by
+/// [`encode_offer_plaintext`] / [`parse_offer_plaintext`] around the
+/// compression layer.
+fn encode_offer_body(p: &OfferPlaintext) -> Vec<u8> {
     let sdp = p.offer_sdp.as_bytes();
-    let mut out = Vec::with_capacity(1 + OFFER_INNER_DOMAIN.len() + PUBLIC_KEY_LEN + 4 + sdp.len());
-    out.push(INNER_TAG);
+    let mut out = Vec::with_capacity(OFFER_INNER_DOMAIN.len() + PUBLIC_KEY_LEN + 4 + sdp.len());
     out.extend_from_slice(OFFER_INNER_DOMAIN);
     out.extend_from_slice(&p.client_pk.to_bytes());
     let len = u32::try_from(sdp.len())
@@ -490,14 +525,8 @@ fn encode_offer_plaintext(p: &OfferPlaintext) -> Vec<u8> {
     out
 }
 
-fn parse_offer_plaintext(bytes: &[u8]) -> Result<OfferPlaintext> {
-    let mut r = InnerCursor::new(bytes);
-    let tag = r.u8()?;
-    if tag != INNER_TAG {
-        return Err(PkarrError::MalformedCanonical(
-            "unknown offer-inner encoding tag",
-        ));
-    }
+fn parse_offer_body(body: &[u8]) -> Result<OfferPlaintext> {
+    let mut r = InnerCursor::new(body);
     let domain = r.take(OFFER_INNER_DOMAIN.len())?;
     if domain != OFFER_INNER_DOMAIN {
         return Err(PkarrError::MalformedCanonical(
@@ -523,12 +552,38 @@ fn parse_offer_plaintext(bytes: &[u8]) -> Result<OfferPlaintext> {
     })
 }
 
-fn encode_answer_plaintext(p: &AnswerPlaintext) -> Vec<u8> {
+/// Encode a v2 (zlib-compressed) offer inner plaintext. v0.1+ default.
+fn encode_offer_plaintext(p: &OfferPlaintext) -> Vec<u8> {
+    let body = encode_offer_body(p);
+    let compressed = zlib_compress(&body);
+    let mut out = Vec::with_capacity(1 + compressed.len());
+    out.push(CompressionTag::Zlib as u8);
+    out.extend_from_slice(&compressed);
+    out
+}
+
+/// Parse an offer inner plaintext. Accepts both `Uncompressed` (v1
+/// legacy) and `Zlib` (v2) tags.
+fn parse_offer_plaintext(bytes: &[u8]) -> Result<OfferPlaintext> {
+    let mut r = InnerCursor::new(bytes);
+    let tag = CompressionTag::try_from_u8(r.u8()?)?;
+    let body_bytes;
+    let body: &[u8] = match tag {
+        CompressionTag::Uncompressed => r.remaining(),
+        CompressionTag::Zlib => {
+            body_bytes = zlib_decompress_capped(r.remaining(), MAX_DECOMPRESSED_PLAINTEXT)?;
+            &body_bytes
+        }
+    };
+    parse_offer_body(body)
+}
+
+/// Shape of the v1 answer body.
+fn encode_answer_body(p: &AnswerPlaintext) -> Vec<u8> {
     let sdp = p.answer_sdp.as_bytes();
     let mut out = Vec::with_capacity(
-        1 + ANSWER_INNER_DOMAIN.len() + PUBLIC_KEY_LEN + OFFER_SDP_HASH_LEN + 4 + sdp.len(),
+        ANSWER_INNER_DOMAIN.len() + PUBLIC_KEY_LEN + OFFER_SDP_HASH_LEN + 4 + sdp.len(),
     );
-    out.push(INNER_TAG);
     out.extend_from_slice(ANSWER_INNER_DOMAIN);
     out.extend_from_slice(&p.daemon_pk.to_bytes());
     out.extend_from_slice(&p.offer_sdp_hash);
@@ -539,14 +594,32 @@ fn encode_answer_plaintext(p: &AnswerPlaintext) -> Vec<u8> {
     out
 }
 
+/// Encode a v2 (zlib-compressed) answer inner plaintext.
+fn encode_answer_plaintext(p: &AnswerPlaintext) -> Vec<u8> {
+    let body = encode_answer_body(p);
+    let compressed = zlib_compress(&body);
+    let mut out = Vec::with_capacity(1 + compressed.len());
+    out.push(CompressionTag::Zlib as u8);
+    out.extend_from_slice(&compressed);
+    out
+}
+
 fn parse_answer_plaintext(bytes: &[u8]) -> Result<AnswerPlaintext> {
     let mut r = InnerCursor::new(bytes);
-    let tag = r.u8()?;
-    if tag != INNER_TAG {
-        return Err(PkarrError::MalformedCanonical(
-            "unknown answer-inner encoding tag",
-        ));
-    }
+    let tag = CompressionTag::try_from_u8(r.u8()?)?;
+    let body_bytes;
+    let body: &[u8] = match tag {
+        CompressionTag::Uncompressed => r.remaining(),
+        CompressionTag::Zlib => {
+            body_bytes = zlib_decompress_capped(r.remaining(), MAX_DECOMPRESSED_PLAINTEXT)?;
+            &body_bytes
+        }
+    };
+    parse_answer_body(body)
+}
+
+fn parse_answer_body(body: &[u8]) -> Result<AnswerPlaintext> {
+    let mut r = InnerCursor::new(body);
     let domain = r.take(ANSWER_INNER_DOMAIN.len())?;
     if domain != ANSWER_INNER_DOMAIN {
         return Err(PkarrError::MalformedCanonical(
@@ -617,6 +690,52 @@ impl<'a> InnerCursor<'a> {
     fn is_empty(&self) -> bool {
         self.pos >= self.buf.len()
     }
+    /// Remainder of the buffer after the current position.
+    fn remaining(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+}
+
+/// Zlib-compress `body` at the highest level. Used by v2
+/// inner-plaintext encoders. `Compression::best()` trades a few
+/// milliseconds of CPU for 5-10% better ratio on short messages —
+/// important because the sealed answer + base64url + DNS packaging
+/// needs to fit inside the remaining BEP44 budget alongside the main
+/// `_openhost` record.
+fn zlib_compress(body: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = ZlibEncoder::new(Vec::with_capacity(body.len()), Compression::best());
+    enc.write_all(body)
+        .expect("writing into a Vec<u8> never errors");
+    enc.finish()
+        .expect("zlib finalize must not fail on Vec<u8>")
+}
+
+/// Zlib-decompress up to `cap` bytes. Returns
+/// `PkarrError::MalformedCanonical` if the output would exceed `cap`.
+fn zlib_decompress_capped(input: &[u8], cap: usize) -> Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut decoder = ZlibDecoder::new(input);
+    let mut out = Vec::with_capacity(input.len() * 2);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = decoder
+            .read(&mut chunk)
+            .map_err(|_| PkarrError::MalformedCanonical("zlib decompression failed"))?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n > cap {
+            return Err(PkarrError::MalformedCanonical(
+                "decompressed plaintext exceeds 64 KiB cap",
+            ));
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -700,13 +819,13 @@ mod tests {
     }
 
     #[test]
-    fn offer_plaintext_rejects_tampered_tag() {
+    fn offer_plaintext_rejects_unknown_compression_tag() {
         let p = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: "v=0".to_string(),
         };
         let mut enc = encode_offer_plaintext(&p);
-        enc[0] = 0x02;
+        enc[0] = 0xFF;
         assert!(matches!(
             parse_offer_plaintext(&enc),
             Err(PkarrError::MalformedCanonical(_))
@@ -714,7 +833,10 @@ mod tests {
     }
 
     #[test]
-    fn offer_plaintext_rejects_truncated_input() {
+    fn offer_plaintext_rejects_truncated_zlib_body() {
+        // Truncating a v2 blob inside the zlib stream fails
+        // decompression. (v1-truncation is still covered by the v1
+        // back-compat test below.)
         let p = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: "v=0".to_string(),
@@ -724,6 +846,97 @@ mod tests {
             parse_offer_plaintext(&enc[..5]),
             Err(PkarrError::MalformedCanonical(_))
         ));
+    }
+
+    /// Hand-craft a v1 (uncompressed) offer plaintext and confirm the
+    /// new v2 decoder accepts it. Locks the legacy wire layout against
+    /// accidental encoder breakage.
+    #[test]
+    fn offer_plaintext_accepts_v1_uncompressed_for_backcompat() {
+        let p = OfferPlaintext {
+            client_pk: client_sk().public_key(),
+            offer_sdp: SAMPLE_OFFER_SDP.to_string(),
+        };
+        let body = encode_offer_body(&p);
+        let mut v1 = Vec::with_capacity(1 + body.len());
+        v1.push(0x01);
+        v1.extend_from_slice(&body);
+        let dec = parse_offer_plaintext(&v1).unwrap();
+        assert_eq!(dec, p);
+    }
+
+    /// Zlib compression MUST strictly shrink a realistic-sized SDP
+    /// (the main v0.1 motivation). Don't pin an exact ratio — flate2
+    /// output isn't byte-deterministic across backend versions.
+    #[test]
+    fn v2_encoding_is_smaller_than_v1_for_realistic_sdp() {
+        // ~500-byte SDP with multiple ICE candidates — representative
+        // of what the daemon's handle_offer produces after gather.
+        let mut sdp = String::from(SAMPLE_OFFER_SDP);
+        for i in 0..12 {
+            sdp.push_str(&format!(
+                "a=candidate:{i} 1 udp 2122260223 192.168.1.{i} 50000 typ host\r\n"
+            ));
+        }
+        let p = OfferPlaintext {
+            client_pk: client_sk().public_key(),
+            offer_sdp: sdp.clone(),
+        };
+        let v1_body = encode_offer_body(&p);
+        let v1_total = 1 + v1_body.len();
+        let v2 = encode_offer_plaintext(&p);
+        assert!(
+            v2.len() < v1_total,
+            "v2 compressed plaintext ({} bytes) must be strictly smaller than v1 ({})",
+            v2.len(),
+            v1_total,
+        );
+    }
+
+    /// Defense-in-depth: feed a zip bomb (128 KiB of zeros compressed
+    /// to ~130 bytes) under a v2 tag; the decoder must reject it at
+    /// the 64 KiB cap rather than allocate unbounded memory.
+    #[test]
+    fn decompression_dos_cap_rejects_oversized_blob() {
+        let zero_bomb = vec![0u8; 128 * 1024];
+        let compressed = zlib_compress(&zero_bomb);
+        let mut input = Vec::with_capacity(1 + compressed.len());
+        input.push(CompressionTag::Zlib as u8);
+        input.extend_from_slice(&compressed);
+        assert!(matches!(
+            parse_offer_plaintext(&input),
+            Err(PkarrError::MalformedCanonical(
+                "decompressed plaintext exceeds 64 KiB cap"
+            ))
+        ));
+    }
+
+    /// Empty SDP should still round-trip cleanly.
+    #[test]
+    fn empty_offer_sdp_roundtrips_v2() {
+        let p = OfferPlaintext {
+            client_pk: client_sk().public_key(),
+            offer_sdp: String::new(),
+        };
+        let enc = encode_offer_plaintext(&p);
+        let dec = parse_offer_plaintext(&enc).unwrap();
+        assert_eq!(dec, p);
+    }
+
+    #[test]
+    fn answer_plaintext_accepts_v1_uncompressed_for_backcompat() {
+        let daemon_pk = host_sk().public_key();
+        let p = AnswerPlaintext {
+            daemon_pk,
+            offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
+            answer_sdp: SAMPLE_ANSWER_SDP.to_string(),
+        };
+        let body = encode_answer_body(&p);
+        let mut v1 = Vec::with_capacity(1 + body.len());
+        v1.push(0x01);
+        v1.extend_from_slice(&body);
+        let dec = parse_answer_plaintext(&v1).unwrap();
+        assert_eq!(dec, p);
     }
 
     #[test]

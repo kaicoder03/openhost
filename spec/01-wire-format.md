@@ -97,27 +97,32 @@ Client                                                    Daemon
   │ 9. Authentication channel binding (see 04-security §7.1): │
   │                                                          │
   │    Daemon → Client:                                      │
-  │      nonce    : 32 random bytes                          │
-  │      sig_host : Ed25519_sign(host_sk,                    │
-  │                              auth_bytes(host_pk,         │
-  │                                         client_pk,       │
-  │                                         nonce))          │
+  │      AUTH_NONCE  : 32 random bytes                       │
   │                                                          │
   │    Client → Daemon:                                      │
-  │      sig_client : Ed25519_sign(client_sk,                │
-  │                                auth_bytes(host_pk,       │
-  │                                           client_pk,     │
-  │                                           nonce))        │
+  │      AUTH_CLIENT : client_pk (32 bytes)                  │
+  │                  || Ed25519_sign(                        │
+  │                         client_sk,                       │
+  │                         auth_bytes(host_pk,              │
+  │                                    client_pk,            │
+  │                                    nonce))               │
+  │                                                          │
+  │    Daemon → Client:                                      │
+  │      AUTH_HOST   : Ed25519_sign(                         │
+  │                         host_sk,                         │
+  │                         auth_bytes(host_pk,              │
+  │                                    client_pk,            │
+  │                                    nonce))               │
   │                                                          │
   │    where                                                 │
   │      auth_bytes(h, c, n) =                               │
   │        HKDF-SHA256(                                      │
   │          salt = "openhost-auth-v1",                      │
   │          ikm  = tls_exporter(                            │
-  │                   label = "EXPORTER-openhost-auth-v1",   │
-  │                   context = h || c || n,                 │
-  │                   length = 32),                          │
-  │          info = "openhost-auth-v1",                      │
+  │                   label   = "EXPORTER-openhost-auth-v1", │
+  │                   context = "",                          │
+  │                   length  = 32),                         │
+  │          info = "openhost-auth-v1" || h || c || n,       │
   │          length = 32)                                    │
   │                                                          │
   │    Both parties verify the counterparty's signature.     │
@@ -126,28 +131,25 @@ Client                                                    Daemon
   │ 10. HTTP-over-DataChannel framing begins (§4).           │
 ```
 
-> **TODO(v0.1 freeze).** Two implementation deviations from step 9 need
-> to be reconciled against this text before v0.1 ships:
->
-> 1. **Message order is inverted.** The reference implementation in
->    `openhost-daemon` sends `AuthNonce` first, then the *client* signs
->    (`AuthClient` = 32-byte `client_pk` || 64-byte `sig_client`), then
->    the daemon replies (`AuthHost` = 64-byte `sig_host`). This is
->    required because PR #5.5 ships before PR #7's offer-record
->    plumbing — without an offer record, the daemon has no source of
->    truth for `client_pk` before the client speaks, and cannot compute
->    `auth_bytes` on its own. Once PR #7 lands, the spec text and the
->    flow should reunify.
-> 2. **Binding bytes live in HKDF `info`, not exporter `context`.**
->    `webrtc-dtls` v0.17.x rejects a non-empty exporter `context`
->    (`ContextUnsupported`). The reference implementation calls
->    `tls_exporter(label = "EXPORTER-openhost-auth-v1", context = "",
->    length = 32)` and then passes `info = "openhost-auth-v1" || h || c
->    || n` into HKDF. This is cryptographically equivalent (the
->    exporter secret is still session-unique; HKDF still commits to
->    `host_pk || client_pk || nonce`) but the spec layers it the other
->    way. The fix lands when the upstream DTLS crate accepts a
->    non-empty context.
+**Rationale.** Two deliberate design choices worth naming explicitly:
+
+1. **Client-first message order.** The daemon is the one that
+   generates the nonce, but the client is the one whose Ed25519
+   pubkey the daemon needs in order to compute `auth_bytes`. Letting
+   the client send `AUTH_CLIENT` (carrying its pubkey as a 32-byte
+   prefix alongside the signature) keeps the DTLS and handshake
+   layers cleanly decoupled — the daemon doesn't need to read the
+   offer record before DTLS-`Connected` fires. An earlier draft had
+   the daemon sign first but required the daemon to pre-resolve
+   `client_pk` by cracking open the sealed offer record at
+   DTLS-setup time, a cross-layer coupling we chose to avoid.
+2. **Empty DTLS exporter `context`.** webrtc-dtls v0.17.x rejects
+   non-empty exporter `context` with `ContextUnsupported` (a TLS-1.3
+   exporter spec-compliance gap). Rather than fork webrtc-dtls a
+   second time, openhost folds the binding bytes into HKDF `info`
+   instead. Cryptographically equivalent: the exporter secret is
+   still session-unique, and HKDF still commits to
+   `host_pk || client_pk || nonce`.
 
 ### 3.1 DTLS role
 
@@ -158,11 +160,6 @@ The daemon **MUST** assert `a=setup:passive` in its SDP. The client **MUST** ass
 The `fp` value in the host's Pkarr record pins the expected DTLS certificate fingerprint. A client **MUST** abort the connection if the fingerprint negotiated during the DTLS handshake does not exactly equal `fp`. This prevents unknown-key-share attacks even in the presence of a malicious Pkarr relay (see [`04-security.md`](04-security.md)).
 
 ### 3.3 Offer and answer records
-
-> **TODO(v0.1 freeze).** This section describes the PR #7a implementation of
-> offer-record polling + per-client answer publishing. The
-> names/sizes below are wire-visible; treat as authoritative for the
-> reference implementation. Fold into the main spec text at v0.1 cut.
 
 **Offer (client → daemon).** Per §3 step 5, the client publishes a
 `SignedPacket` under its own Ed25519 pubkey containing **one** TXT
@@ -175,19 +172,36 @@ _offer-<host-hash-label>
 where `host-hash-label = z_base_32(SHA-256(b"openhost-offer-host-v1" || daemon_pk)[0..16])`
 — a 26-character lower-case alphanumeric string. The TXT value is
 `base64url_nopad(sealed_ct)` where `sealed_ct` is a libsodium sealed-box
-(`crypto_box_seal`) of the following canonical plaintext, addressed to
-`public_key_to_x25519(daemon_pk)`:
+(`crypto_box_seal`) of the canonical plaintext below, addressed to
+`public_key_to_x25519(daemon_pk)`.
+
+The inner plaintext begins with a 1-byte `compression_tag` that
+determines the layout of the remaining bytes:
 
 ```
-offer_plaintext = 0x01
-               || "openhost-offer-inner1"       (21 bytes)
-               || client_pk                     (32 bytes)
-               || sdp_len                       (u32 big-endian)
-               || offer_sdp_utf8                (sdp_len bytes)
+offer_plaintext = compression_tag || body
+
+  compression_tag : u8
+      0x01 = Uncompressed (v1 legacy). `body` bytes are literal.
+      0x02 = Zlib (v2, RFC 1950). `body` bytes are the RFC 1950 encoding
+             of the uncompressed body below. Decompressed `body` size
+             MUST NOT exceed 65536 bytes; decoders MUST reject
+             oversized inputs.
+      Other values MUST be rejected as malformed.
+
+  body =  "openhost-offer-inner1"  (21 bytes)
+       || client_pk                 (32 bytes)
+       || sdp_len                   (u32 big-endian)
+       || offer_sdp_utf8            (sdp_len bytes)
 ```
 
-The inner `client_pk` MUST match the outer BEP44 signer pubkey. The
-daemon verifies this on decode and rejects a mismatch.
+v0.1+ encoders **MUST** emit `compression_tag = 0x02`. v0.1+ decoders
+**MUST** accept both `0x01` and `0x02` for backward compatibility
+with pre-v0.1 blobs. Future codecs can claim new tag values without
+invalidating existing implementations.
+
+The inner `client_pk` **MUST** match the outer BEP44 signer pubkey.
+The daemon verifies this on decode and rejects a mismatch.
 
 **Answer (daemon → client).** The daemon publishes answer records as
 **extra** TXT entries inside its existing `_openhost` `SignedPacket`, at
@@ -202,32 +216,32 @@ where `client-hash-label = z_base_32(allowlist_hash(daemon_salt, client_pk))`
 the answer TXT inside the same packet as `_openhost` is required because
 BEP44 permits only one mutable item per pubkey.
 
-The TXT value is `base64url_nopad(sealed_ct)` with plaintext:
+The TXT value is `base64url_nopad(sealed_ct)` with the same
+`compression_tag || body` framing as the offer. The answer body is:
 
 ```
-answer_plaintext = 0x01
-                || "openhost-answer-inner1"     (22 bytes)
-                || daemon_pk                    (32 bytes)
-                || offer_sdp_hash               (32 bytes, SHA-256 of the
-                                                 UTF-8 offer SDP being
-                                                 answered)
-                || sdp_len                      (u32 big-endian)
-                || answer_sdp_utf8              (sdp_len bytes)
+  body =  "openhost-answer-inner1"   (22 bytes)
+       || daemon_pk                   (32 bytes)
+       || offer_sdp_hash              (32 bytes, SHA-256 of the UTF-8
+                                       offer SDP being answered)
+       || sdp_len                     (u32 big-endian)
+       || answer_sdp_utf8             (sdp_len bytes)
 ```
 
 `offer_sdp_hash` binds the answer to a specific offer; a racing
 adversary cannot splice a valid answer onto a different offer. The
-inner `daemon_pk` MUST match the outer BEP44 signer.
+inner `daemon_pk` **MUST** match the outer BEP44 signer.
 
 TXT TTL for both records is 30 seconds (ephemeral per-handshake).
 
 **Encoder constraint (eviction).** The main `_openhost` record + all
-`_answer.*` entries MUST fit in the BEP44 1000-byte limit. When an
-answer would overflow, the daemon evicts oldest entries (lowest
-creation timestamp first). This implies the answer publish path is
-best-effort — under congestion the oldest paired client loses its
-pending answer. The v0.1 freeze PR tightens this via separate ICE
-trickle records so full SDPs fit.
+`_answer-*` entries MUST fit in the BEP44 1000-byte limit. When an
+answer would overflow, the daemon evicts the oldest entries (lowest
+creation timestamp first). Compression (v2 tag) reduces the common
+case to something that fits; high-entropy SDPs (those dominated by
+DTLS fingerprints + ICE credentials) still approach the cap.
+Splitting an answer across multiple records — allowing arbitrarily
+large SDPs plus ICE trickle — is tracked as post-v0.1 work.
 
 ## 4. HTTP-over-DataChannel framing (ABNF)
 
