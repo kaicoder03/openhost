@@ -334,6 +334,13 @@ async fn process_client_packet(
     // Runs BEFORE the rate-limit consume so an unpaired flood can't
     // drain a legitimate client's bucket (each pk has its own entry
     // anyway, but the ordering is also cheap and readable).
+    //
+    // Note on log severity: the FIRST rejection for an unpaired pk
+    // logs at `warn!` so operators see the actionable message. Any
+    // subsequent tick from the same unpaired pk falls into the
+    // per-client throttle branch above and logs at `debug!` instead
+    // — preventing a single misconfigured client from flooding the
+    // daemon's `warn!` stream.
     if cfg.enforce_allowlist && !state.is_client_allowed(client_pk) {
         tracing::warn!(
             client = %client_pk,

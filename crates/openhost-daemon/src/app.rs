@@ -207,6 +207,10 @@ impl App {
 
         // Drive the event loop: shutdown wins over concurrent SIGHUP
         // (`biased;` makes the select poll the shutdown arm first).
+        // Rapid SIGHUP bursts coalesce at the tokio-signal layer and
+        // at the loop boundary — we reload at most once per iteration.
+        // Reload is idempotent: a later SIGHUP just runs the load +
+        // replace_allow again, so coalescing is acceptable.
         loop {
             tokio::select! {
                 biased;

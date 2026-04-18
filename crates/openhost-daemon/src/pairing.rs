@@ -56,15 +56,17 @@ pub struct PairingDb {
 impl PairingDb {
     /// Parsed entries as `(PublicKey, Option<nickname>)`. Invalid
     /// z-base-32 entries are rejected up-front by [`load`]; this method
-    /// cannot fail.
+    /// cannot fail when the DB was produced by [`load`].
     ///
     /// # Panics
     ///
     /// Panics if any `pubkey` fails `PublicKey::from_zbase32`. `load`
-    /// enforces the invariant; direct mutators outside this module
-    /// must uphold it.
+    /// enforces the invariant; because `PairingDb` is `Deserialize`,
+    /// callers who bypass `load` (e.g. `toml::from_str` directly)
+    /// must re-validate before using `parsed` / `compute_hashes`.
+    /// `pub(crate)` to keep the panic-boundary narrow.
     #[must_use]
-    pub fn parsed(&self) -> Vec<(PublicKey, Option<String>)> {
+    pub(crate) fn parsed(&self) -> Vec<(PublicKey, Option<String>)> {
         self.pairs
             .iter()
             .map(|p| {
