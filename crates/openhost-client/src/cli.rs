@@ -10,21 +10,75 @@ use base64::Engine;
 use bytes::Bytes;
 use std::io::Read;
 use std::path::Path;
+use thiserror::Error;
+
+/// Usage-style errors — argv / URL / identity-file / relay-scheme
+/// mistakes made by the operator, distinguishable from runtime /
+/// network errors so CLI binaries can map them to exit code 2 without
+/// resorting to error-message string matching.
+#[derive(Debug, Error)]
+pub enum UsageError {
+    /// Identity seed file missing, wrong size, or otherwise unreadable.
+    #[error("{0}")]
+    Identity(String),
+}
 
 /// Load a 32-byte raw Ed25519 seed from disk, matching the layout the
-/// daemon's `FsKeyStore` writes. Returns a typed error when the file
-/// is missing or not exactly 32 bytes.
+/// daemon's `FsKeyStore` writes. Returns a [`UsageError::Identity`]
+/// variant when the file is missing or not exactly 32 bytes; on
+/// Unix, also emits a `warn!` when the file's mode is wider than
+/// `0600` (defense-in-depth — a world-readable seed is the sort of
+/// smell an operator should see before it becomes an incident).
 pub fn load_identity_from_file(path: &Path) -> Result<SigningKey> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read identity seed from {}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        anyhow!(UsageError::Identity(format!(
+            "failed to read identity seed from {}: {e}",
+            path.display()
+        )))
+    })?;
     let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-        anyhow!(
+        anyhow!(UsageError::Identity(format!(
             "identity seed at {} must be exactly 32 bytes, got {}",
             path.display(),
             bytes.len()
-        )
+        )))
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Ok(meta) = std::fs::metadata(path) {
+            // Lower 9 bits are the rwx/rwx/rwx permission triple. 0o177
+            // masks out the owner's rwx; anything left on after owner
+            // permissions is group/other — wider than 0600.
+            let wider_than_owner = meta.mode() & 0o077 != 0;
+            if wider_than_owner {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", meta.mode() & 0o777),
+                    "openhost-client: identity seed file is readable outside its owner — narrow permissions to 0600 to avoid leaking the signing key",
+                );
+            }
+        }
+    }
     Ok(SigningKey::from_bytes(&seed))
+}
+
+/// Returns `true` when `err`'s chain carries a [`UsageError`] or a
+/// [`crate::ClientError::UrlParse`]. CLI binaries use this to pick
+/// exit code 2 (usage) vs 1 (runtime).
+pub fn is_usage_error(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<UsageError>().is_some() {
+        return true;
+    }
+    if err
+        .chain()
+        .any(|e| e.downcast_ref::<UsageError>().is_some())
+    {
+        return true;
+    }
+    err.downcast_ref::<crate::ClientError>()
+        .map(|ce| matches!(ce, crate::ClientError::UrlParse(_)))
+        .unwrap_or(false)
 }
 
 /// Interpret a `--data` argument: `@path` reads a file, `-` reads
@@ -329,5 +383,19 @@ mod tests {
         std::fs::write(tmp.path(), seed).unwrap();
         let sk = load_identity_from_file(tmp.path()).unwrap();
         assert_eq!(sk.to_bytes(), seed);
+    }
+
+    #[test]
+    fn is_usage_error_detects_identity_usage_variant() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"too-short").unwrap();
+        let err = load_identity_from_file(tmp.path()).unwrap_err();
+        assert!(is_usage_error(&err));
+    }
+
+    #[test]
+    fn is_usage_error_is_false_for_plain_runtime_errors() {
+        let err = anyhow!("network went away");
+        assert!(!is_usage_error(&err));
     }
 }

@@ -13,10 +13,10 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use openhost_client::cli::{
-    build_request_head, load_identity_from_file, parse_header_arg, parse_response, read_body_arg,
-    response_to_json,
+    build_request_head, is_usage_error, load_identity_from_file, parse_header_arg, parse_response,
+    read_body_arg, response_to_json,
 };
-use openhost_client::{ClientError, Dialer, DialerConfig, OpenhostUrl, SigningKey};
+use openhost_client::{Dialer, DialerConfig, OpenhostUrl, SigningKey};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -103,15 +103,9 @@ fn main() -> ExitCode {
     match rt.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let is_usage = err
-                .downcast_ref::<ClientError>()
-                .map(|ce| matches!(ce, ClientError::UrlParse(_)))
-                .unwrap_or(false)
-                || err
-                    .chain()
-                    .any(|e| e.to_string().contains("identity seed at"));
+            let usage = is_usage_error(&err);
             eprintln!("openhost-dial: {err:#}");
-            if is_usage {
+            if usage {
                 ExitCode::from(2)
             } else {
                 ExitCode::FAILURE
@@ -136,7 +130,7 @@ async fn run(cli: Cli) -> Result<()> {
     let parsed_url: OpenhostUrl = cli
         .oh_url
         .parse()
-        .map_err(ClientError::from)
+        .map_err(openhost_client::ClientError::from)
         .with_context(|| format!("failed to parse oh-url {:?}", cli.oh_url))?;
     let identity = match cli.identity.as_deref() {
         Some(path) => load_identity_from_file(path)?,
@@ -159,10 +153,19 @@ async fn run(cli: Cli) -> Result<()> {
     } else {
         parsed_url.path.clone()
     };
-    let default_host = format!("{}.openhost", parsed_url.pubkey);
-    let head_bytes = build_request_head(&method, &path, &default_host, &headers, body.len());
+    // Host is overridden by the daemon's forwarder to the configured
+    // upstream authority, so the default here only needs to be a
+    // valid RFC 7230 token. We deliberately use the plain string
+    // `openhost` rather than a pseudo-TLD like `<pubkey>.openhost` —
+    // the authority relationship is already carried in the `oh://`
+    // URL, and inventing a fake TLD in the Host header would only
+    // confuse observability tools.
+    let head_bytes = build_request_head(&method, &path, "openhost", &headers, body.len());
 
-    // 3. Build the dialer and dial.
+    // 3. Build the dialer and dial. `webrtc_connect_timeout` is a
+    // separate sub-budget inside the overall `dial_timeout`; capping
+    // it at 30 s keeps DTLS handshake waits bounded even when the
+    // user opts into a long overall timeout for flaky networks.
     let mut dialer = Dialer::builder()
         .identity(Arc::new(identity))
         .host_url(parsed_url)
