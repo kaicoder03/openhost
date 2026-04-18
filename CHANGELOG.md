@@ -20,6 +20,15 @@ once it reaches a tagged release.
   - `pkarr_record` module: `OpenhostRecord` schema, canonical deterministic signing bytes, and `SignedRecord::sign`/`verify` with 2-hour freshness window.
   - Reference JSON test vectors under `spec/test-vectors/` for every primitive, consumed by the crate's integration tests so the spec and implementation cannot drift.
   - End-to-end protocol exercise that walks spec §8 across all four modules.
+- `openhost-daemon` M3.1 bootstrap:
+  - Library + `openhostd` binary: `run`, `identity show`, `identity rotate` subcommands.
+  - `config` module: TOML schema for identity, Pkarr, DTLS, logging; `deny_unknown_fields`; HTTPS-only relay URL validation. `directories` backs the platform default path.
+  - `identity_store` module: `KeyStore` trait with filesystem-backed `FsKeyStore`. 32-byte Ed25519 seed on disk, mode 0600 on Unix via atomic write-then-rename. Keychain impls plug behind the trait in a later PR.
+  - `dtls_cert` module: self-signed ECDSA P-256 certificate via `rcgen` 0.13, persisted as a combined PEM bundle (private key + cert). SHA-256 fingerprint pinned into the published record. Rotation policy keyed on file mtime; `force_rotate` invoked by the `identity rotate` subcommand.
+  - `publish` module: `SharedState` holds the live fingerprint / allowlist / ICE blobs; `PublishService` wraps `openhost_pkarr::PublisherHandle` and feeds a `RecordSource` closure that snapshots `SharedState` on every tick. `start_with_transport` lets tests inject a fake `Transport` without opening sockets.
+  - `app` / `signal` / `main`: `App::build` wires identity → DTLS cert → state → publisher; `App::run` blocks on SIGINT / SIGTERM (Ctrl-C on Windows) and shuts the publisher down cleanly.
+  - Integration test (`tests/bootstrap.rs`) drives `App::build_with_transport` against a tempdir and a fake transport; asserts file permissions, fingerprint propagation, and trigger behaviour.
+  - Opt-in real-network smoke test (`tests/real_pkarr.rs`, feature `real-network`, `#[ignore]`d by default) round-trips a record through `pkarr.pubky.app` to catch publisher regressions before merge.
 - `openhost-pkarr` M2 implementation:
   - `codec` module: bidirectional translation between `SignedRecord` and `pkarr::SignedPacket`; a single `_openhost` TXT record carries `base64url(sig || canonical_signing_bytes)` and the outer BEP44 signature is produced by the same Ed25519 identity key.
   - `publisher` module: 30-minute republish loop with an on-demand trigger channel, CAS-threaded seq handoff, and a `Transport` trait abstracting over `pkarr::Client` for testability.

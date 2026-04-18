@@ -53,6 +53,14 @@ serde_bytes = "0.11"
 anyhow = "1"
 thiserror = "2"
 
+# Daemon / CLI (openhost-daemon, M3.1)
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+toml = "0.8"
+rcgen = { version = "0.13", features = ["pem"] }
+directories = "5"
+tempfile = "3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
