@@ -134,6 +134,17 @@ impl PublishService {
         self.handle.trigger();
     }
 
+    /// Wait for the underlying publisher's initial-publish retry loop
+    /// to terminate (success or exhaustion). Delegates to
+    /// [`openhost_pkarr::PublisherHandle::await_initial_publish`].
+    ///
+    /// `App::run` uses this to gate its "openhostd: up" log line on
+    /// discoverability — so the daemon never claims to be up when the
+    /// first publish is still in flight or already failed out.
+    pub async fn await_initial_publish(&self) -> openhost_pkarr::InitialPublishOutcome {
+        self.handle.await_initial_publish().await
+    }
+
     /// Gracefully shut down the publisher.
     pub async fn shutdown(self) {
         self.handle.shutdown().await;
@@ -183,14 +194,14 @@ fn build_default_transport(cfg: &PkarrConfig) -> DaemonResult<Arc<dyn Transport>
         .relays(&relays)
         .map_err(|e| PublishError::ClientBuild(format!("invalid relay URL: {e}")))?;
 
-    // TODO(M3.2): `App::build` returns success once the publisher task is
-    // spawned, NOT once the first publish lands. A slow relay can leave
-    // the daemon "up" while still undiscoverable for up to pkarr's default
-    // request timeout. Decide between (a) gating `App::build` on the
-    // initial publish succeeding — blocks startup on relay availability —
-    // or (b) emitting a "first publish landed" event a supervisor can
-    // observe. Pair this with the exp-backoff retry marked `TODO(M3)` in
-    // `openhost-pkarr/src/publisher.rs:175`.
+    // Startup-gating resolution (was TODO(M3.2) pre-PR #5): `App::run`
+    // now awaits `PublishService::await_initial_publish` with a 10-s
+    // budget before logging "openhostd: up". Build still returns
+    // asynchronously — `App::build` spawns the publisher task, which
+    // runs its own retry loop (`INITIAL_PUBLISH_BACKOFF * 2^(n-1)`
+    // across `INITIAL_PUBLISH_ATTEMPTS`) — but the daemon's visible
+    // readiness signal is now tied to the first publish's terminal
+    // outcome instead of just task liveness.
     let client = builder
         .build()
         .map_err(|e| PublishError::ClientBuild(e.to_string()))?;

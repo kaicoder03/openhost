@@ -64,15 +64,31 @@ PUBKEY=$(cargo run -q -p openhost-daemon -- identity show --config examples/daem
 curl -s "https://pkarr.pubky.app/$PUBKEY" | xxd | head -20
 ```
 
-## What this PR does NOT deliver
+## Acting as a listener (PR #5)
 
-- No WebRTC listener. Published `ice` list ships empty — nothing yet to
-  handshake against.
-- No localhost forwarding; no allowlist; no channel binding.
-- No keychain integration. `FsKeyStore` is the only backend.
-- No self-hosted STUN.
+The daemon now accepts inbound WebRTC offers via
+`openhost_daemon::PassivePeer::handle_offer(offer_sdp)`. The signalling
+plumbing (offer-record polling over Pkarr) is PR #7's job; library
+callers can drive the listener directly for tests or custom signalling.
 
-All of these are tracked for future PRs on the road to v0.1.
+- Inbound offers **MUST** assert `a=setup:active` or `a=setup:actpass`
+  (standard WebRTC). Anything else is rejected before any
+  `RTCPeerConnection` is built.
+- DTLS handshakes complete against the cert whose SHA-256 fingerprint
+  is pinned in the daemon's published record (`openhost-resolve` prints
+  it if you want to verify).
+- Every `REQUEST_HEAD` frame on an opened data channel currently gets a
+  stub `HTTP/1.1 502 Bad Gateway` response. The real localhost forwarder
+  ships in PR #6.
+
+## What this crate does NOT (yet) deliver
+
+- Channel binding (spec §7.1 / RFC 8844 mitigation) — PR #5.5.
+- Localhost forwarding — PR #6.
+- Offer-record polling + allowlist + per-IP / per-pubkey rate limit — PR #7.
+- Client-side WebRTC offerer — PR #8 (`openhost-client`).
+- Self-hosted STUN / IPv6-only mode — PR #9.
+- Keychain integration. `FsKeyStore` is the only backend until PR #10.
 
 ## Opt-in smoke test
 

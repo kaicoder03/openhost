@@ -51,6 +51,16 @@ hkdf = { workspace = true }
 # Underlying pkarr client for the real Transport
 pkarr = { workspace = true }
 
+# WebRTC listener (PR #5). `pem` feature enables RTCCertificate::from_pem so
+# we can hand DtlsCertificate.pem_bundle directly to webrtc-rs.
+webrtc = { workspace = true }
+bytes = "1"
+# rustls 0.23 decoupled crypto providers from the default feature set; the
+# daemon installs `ring` as the process-wide provider before the listener
+# starts so webrtc-dtls + reqwest (transitive via pkarr) both have a
+# CryptoProvider to consume.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Errors
 thiserror = { workspace = true }
 anyhow = { workspace = true }
