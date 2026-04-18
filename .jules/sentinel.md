@@ -1,0 +1,4 @@
+## 2025-05-15 - Insecure memory handling of sensitive key material
+**Vulnerability:** Several instances of missing or ineffective zeroization of Ed25519 signing seeds and intermediate cryptographic material (like SHA-512 hashes of seeds) were found across `openhost-core` and `openhost-daemon`.
+**Learning:** Even when using types like `SigningKey` that implement `ZeroizeOnDrop`, intermediate copies made via `.to_bytes()` or hashing must be manually zeroized. In one case, `Zeroize` was implemented for a wrapper type by zeroizing a *copy* of the key rather than the key itself, which is a common but dangerous pattern.
+**Prevention:** Always ensure that any buffer holding sensitive material (seeds, private keys, hashes of keys) is explicitly zeroized as soon as it is no longer needed, especially when those buffers are stack-allocated or result from `.to_bytes()` calls.

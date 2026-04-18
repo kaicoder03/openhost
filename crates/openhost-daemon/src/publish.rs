@@ -17,6 +17,7 @@ use crate::config::PkarrConfig;
 use crate::error::{PublishError, Result as DaemonResult};
 use hkdf::Hkdf;
 use openhost_core::identity::SigningKey;
+use zeroize::Zeroize;
 use openhost_core::pkarr_record::{
     IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
 };
@@ -59,8 +60,9 @@ impl SharedState {
     /// is derived deterministically from `identity` via HKDF-SHA256 (see
     /// the struct-level doc for the scheme).
     pub fn new(identity: &SigningKey, dtls_fp: [u8; DTLS_FINGERPRINT_LEN]) -> Self {
-        let seed = identity.to_bytes();
+        let mut seed = identity.to_bytes();
         let hk = Hkdf::<Sha256>::new(Some(ALLOW_SALT_HKDF_SALT), &seed);
+        seed.zeroize();
         let mut salt = [0u8; SALT_LEN];
         hk.expand(&[], &mut salt)
             .expect("HKDF expansion to 32 bytes cannot fail");
