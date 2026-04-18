@@ -33,6 +33,7 @@ fn real_config(dir: &TempDir) -> Config {
         pkarr: PkarrConfig {
             relays: vec!["https://pkarr.pubky.app".to_string()],
             republish_secs: 3600,
+            offer_poll: Default::default(),
         },
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),

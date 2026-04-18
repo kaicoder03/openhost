@@ -42,6 +42,7 @@ fn test_config(dir: &TempDir) -> Config {
         pkarr: PkarrConfig {
             relays: vec![],
             republish_secs: 3600, // keep the ticker inert
+            offer_poll: Default::default(),
         },
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),

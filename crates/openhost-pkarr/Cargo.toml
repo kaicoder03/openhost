@@ -25,6 +25,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+# Offer/answer codec (PR #7a)
+sha2 = { workspace = true }
+zbase32 = { workspace = true }
+rand_core = { workspace = true }
 
 # Optional — only compiled under the `nostr` feature.
 serde_json = { workspace = true, optional = true }
@@ -33,6 +37,8 @@ hex = { workspace = true, optional = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 hex = { workspace = true }
+# For deterministic seed-driven RNG in codec/offer tests.
+rand = { workspace = true }
 # `test-util` for `tokio::time::pause`/`start_paused=true` — keeps grace-window
 # tests from actually sleeping 1.5s each.
 tokio = { workspace = true, features = ["test-util"] }

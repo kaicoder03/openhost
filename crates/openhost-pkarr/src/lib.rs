@@ -24,6 +24,7 @@ pub mod codec;
 pub mod error;
 #[cfg(feature = "nostr")]
 pub mod nostr;
+pub mod offer;
 pub mod publisher;
 pub mod relays;
 pub mod resolver;
@@ -36,9 +37,15 @@ pub use codec::{
     OPENHOST_TXT_TTL,
 };
 pub use error::{PkarrError, Result};
+pub use offer::{
+    answer_txt_name, client_hash_label, decode_answer_from_packet, decode_offer_from_packet,
+    encode_with_answers, hash_offer_sdp, host_hash, host_hash_label, offer_txt_name, AnswerEntry,
+    AnswerPlaintext, OfferPlaintext, OfferRecord, ANSWER_TXT_PREFIX, CLIENT_HASH_LEN,
+    HOST_HASH_LEN, OFFER_SDP_HASH_LEN, OFFER_TXT_PREFIX, OFFER_TXT_TTL,
+};
 pub use publisher::{
-    InitialPublishOutcome, PkarrTransport, Publisher, PublisherHandle, RecordSource, Transport,
-    INITIAL_PUBLISH_ATTEMPTS, INITIAL_PUBLISH_BACKOFF, REPUBLISH_INTERVAL,
+    AnswerSource, InitialPublishOutcome, PkarrTransport, Publisher, PublisherHandle, RecordSource,
+    Transport, INITIAL_PUBLISH_ATTEMPTS, INITIAL_PUBLISH_BACKOFF, REPUBLISH_INTERVAL,
 };
 pub use relays::DEFAULT_RELAYS;
 pub use resolver::{PkarrResolve, Resolve, Resolver, GRACE_WINDOW};

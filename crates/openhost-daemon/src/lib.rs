@@ -27,12 +27,14 @@ pub mod error;
 pub mod forward;
 pub mod identity_store;
 pub mod listener;
+pub mod offer_poller;
 pub mod publish;
 pub mod signal;
 
 pub use app::{init_tracing, App};
 pub use channel_binding::{ChannelBinder, ChannelBindingError};
 pub use config::Config;
-pub use error::{DaemonError, Result};
+pub use error::{DaemonError, OfferPollError, Result};
 pub use forward::{ForwardResponse, Forwarder};
 pub use listener::PassivePeer;
+pub use offer_poller::{OfferPoller, OfferPollerConfig};

@@ -36,6 +36,10 @@ pub enum DaemonError {
     #[error(transparent)]
     Forward(#[from] ForwardError),
 
+    /// The offer-record poller failed.
+    #[error(transparent)]
+    OfferPoll(#[from] OfferPollError),
+
     /// Low-level I/O failure not caught by a more specific variant.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -198,4 +202,25 @@ pub enum ListenerError {
         /// Budget, in seconds.
         secs: u64,
     },
+}
+
+/// Offer-record poller failures (PR #7a).
+#[derive(Debug, Error)]
+pub enum OfferPollError {
+    /// Decrypting a sealed offer failed — the record was not addressed
+    /// to this daemon or was corrupted by a substrate.
+    #[error("failed to open sealed offer: {0}")]
+    Decrypt(String),
+
+    /// Building or sealing an answer entry failed.
+    #[error("failed to build answer record: {0}")]
+    AnswerBuild(String),
+
+    /// The underlying `openhost-pkarr` layer reported an error.
+    #[error(transparent)]
+    Pkarr(#[from] openhost_pkarr::PkarrError),
+
+    /// `PassivePeer::handle_offer` rejected the SDP.
+    #[error(transparent)]
+    Handshake(#[from] ListenerError),
 }

@@ -79,6 +79,41 @@ callers can drive the listener directly for tests or custom signalling.
   is pinned in the daemon's published record (`openhost-resolve` prints
   it if you want to verify).
 
+## Offer-record polling (spec §3.3, PR #7a)
+
+The daemon picks up inbound WebRTC offers by polling pkarr for
+sealed offer records published by known clients. Enable it by listing
+the z-base-32 pubkeys of clients you've paired with:
+
+```toml
+[pkarr.offer_poll]
+# Seconds between consecutive polls (default 1).
+poll_secs = 1
+
+# Clients whose `_offer-<host-hash>` records to fetch.
+# Pre-pairing stopgap: PR #7 (pairing) will populate this from the
+# allowlist automatically. Until then, operators configure explicitly.
+watched_clients = [
+    "tyshm7a...",  # z-base-32 client pubkey (52 chars)
+]
+
+# Per-client throttle — at most one processed offer every N seconds
+# per client, dropping floods (default 5).
+per_client_throttle_secs = 5
+```
+
+Each polled offer runs through `PassivePeer::handle_offer`; the
+resulting answer SDP is sealed back to the client and added as an
+extra `_answer-<client-hash>` TXT inside the daemon's next
+`_openhost` publish. See `spec/01-wire-format.md §3.3` for the wire
+layout.
+
+**Known constraint.** A full webrtc-rs answer SDP with trickled ICE
+candidates exceeds the BEP44 1000-byte `v` cap when bundled with the
+main `_openhost` record. When that happens the encoder evicts the
+oldest queued answer and `warn!`s. Splitting ICE trickle over pkarr
+lands post-v0.1.
+
 ## Channel binding (spec §7.1, PR #5.5)
 
 Every inbound data channel runs a three-frame channel-binding handshake

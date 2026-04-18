@@ -69,6 +69,41 @@ pub struct PkarrConfig {
     /// [`DEFAULT_REPUBLISH_SECS`].
     #[serde(default = "default_republish_secs")]
     pub republish_secs: u64,
+
+    /// Offer-polling configuration (PR #7a). Defaults disable polling
+    /// until the operator opts in by listing `watched_clients`.
+    #[serde(default)]
+    pub offer_poll: OfferPollConfig,
+}
+
+/// Offer-record polling configuration.
+///
+/// The daemon polls the listed client pubkeys once per `poll_secs` for
+/// `_offer-<host-hash>` records sealed to its own pubkey. This is a
+/// pre-pairing stopgap; once PR #7 (pairing + allowlist) lands,
+/// `watched_clients` is replaced by the `_allow` list.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OfferPollConfig {
+    /// Seconds between consecutive polls. Defaults to 1.
+    pub poll_secs: u64,
+    /// z-base-32 encoded Ed25519 pubkeys whose `_offer` records to poll.
+    /// Empty disables the poller.
+    pub watched_clients: Vec<String>,
+    /// Per-client throttle: the daemon processes at most one offer per
+    /// this many seconds per watched client, dropping floods without
+    /// killing the loop. Defaults to 5.
+    pub per_client_throttle_secs: u64,
+}
+
+impl Default for OfferPollConfig {
+    fn default() -> Self {
+        Self {
+            poll_secs: 1,
+            watched_clients: Vec::new(),
+            per_client_throttle_secs: 5,
+        }
+    }
 }
 
 /// DTLS certificate configuration.
@@ -172,6 +207,20 @@ impl Config {
                 return Err(ConfigError::InvalidRelayUrl { url: url.clone() }.into());
             }
         }
+        if self.pkarr.offer_poll.poll_secs == 0 {
+            return Err(ConfigError::Invalid("pkarr.offer_poll.poll_secs must be > 0").into());
+        }
+        // Validate each watched-client pubkey parses as z-base-32 at
+        // load time so a typo fails loudly rather than silently
+        // producing a poller that never finds anything.
+        for entry in &self.pkarr.offer_poll.watched_clients {
+            if openhost_core::identity::PublicKey::from_zbase32(entry).is_err() {
+                return Err(ConfigError::Invalid(
+                    "pkarr.offer_poll.watched_clients contains a value that is not a valid z-base-32 Ed25519 pubkey",
+                )
+                .into());
+            }
+        }
         if let Some(forward) = &self.forward {
             if let Some(target) = &forward.target {
                 if !target.starts_with("http://") {
@@ -229,6 +278,7 @@ pub fn seed_config(data_dir: &Path) -> Config {
         pkarr: PkarrConfig {
             relays: Vec::new(),
             republish_secs: DEFAULT_REPUBLISH_SECS,
+            offer_poll: OfferPollConfig::default(),
         },
         dtls: DtlsConfig {
             cert_path: data_dir.join("dtls.pem"),
