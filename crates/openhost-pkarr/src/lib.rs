@@ -13,6 +13,8 @@
 //!   [`openhost_core::pkarr_record::SignedRecord`] and [`pkarr::SignedPacket`].
 //! - [`publisher`] — sign + encode + fan out to relays and the Mainline DHT on
 //!   a 30-minute republish schedule.
+//! - [`resolver`] — race relays + DHT, decode, verify freshness and
+//!   `seq` monotonicity.
 //! - [`relays`] — bundled default list of public Pkarr HTTP relays.
 //! - [`error`] — crate-wide error type.
 
@@ -20,6 +22,7 @@ pub mod codec;
 pub mod error;
 pub mod publisher;
 pub mod relays;
+pub mod resolver;
 
 pub use codec::{
     decode, encode, packet_public_key, BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME,
@@ -30,3 +33,4 @@ pub use publisher::{
     PkarrTransport, Publisher, PublisherHandle, RecordSource, Transport, REPUBLISH_INTERVAL,
 };
 pub use relays::DEFAULT_RELAYS;
+pub use resolver::{PkarrResolve, Resolve, Resolver};
