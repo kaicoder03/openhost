@@ -8,6 +8,19 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #16, `openhost-dial` CLI)
+
+- **New binary: `openhost-dial`**. Sends one HTTP request over openhost and prints the response. Behind the existing `cli` feature, so WASM / FFI consumers of `openhost-client` don't pull clap / tracing-subscriber / serde_json / hex transitively. Usage: `openhost-dial oh://<zbase32-pubkey>[/path] [-X METHOD] [-H 'Key: Value']... [-d BODY] [--relay URL]... [--timeout SECS] [--identity PATH] [--json]`. `-d` accepts `@path` (file), `-` (stdin), or a literal string — curl-style. `--identity <PATH>` loads a 32-byte raw Ed25519 seed (matches the daemon's `FsKeyStore` format); when omitted the binary generates an ephemeral key (useful against unauthenticated daemons, not useful against hosts with `enforce_allowlist = true` since the pubkey changes per invocation).
+- New public module `openhost_client::cli`. Shared CLI helpers the binary uses: `load_identity_from_file`, `read_body_arg`, `parse_header_arg`, `build_request_head`, `parse_response`, `response_to_json`, and the `ParsedResponse` struct. Also gated behind the `cli` feature.
+- 11 new unit tests covering the cli helpers: header-parsing variants (`Key: Value`, `Key:Value`, multiple-space values, empty-name error, colon-missing error), request-head defaults and user-override precedence (Host / Content-Length / Content-Type skipped when user supplied), response parsing (happy path + malformed status), JSON body encoding (UTF-8 vs base64 fallback), file and literal body loading, and identity-seed size validation. Plus 2 binary-level tests for relay-URL validation.
+- Exit-code contract documented: `0` for any successful round-trip (regardless of HTTP status, matching curl), `1` for openhost / network / protocol errors, `2` for usage errors (clap parse failures, URL parse errors, identity file missing / wrong size, non-HTTPS relays).
+- Non-`--json` output routes the status line + response headers to stderr and the body to stdout, so `openhost-dial … | jq` works out of the box; `--json` emits a single pretty-printed object to stdout instead.
+
+### Changed (PR #16)
+
+- `crates/openhost-client/src/lib.rs` adds `#[cfg(feature = "cli")] pub mod cli;` and documents the new binary alongside `openhost-resolve` in the crate header.
+- `crates/openhost-client/Cargo.toml` adds a second `[[bin]]` entry for `openhost-dial` with `required-features = ["cli"]`.
+
 ### Added (PR #15, answer-record splitting)
 
 - `openhost-pkarr` fragmented answer records. Each `AnswerEntry`'s sealed ciphertext is now split into one or more `_answer-<client-hash>-<idx>` TXT records before being folded into the daemon's `_openhost` pkarr packet. Each fragment carries a 5-byte envelope (`version=0x01`, `chunk_idx: u8`, `chunk_total: u8`, `payload_len: u16 BE`) followed by up to `MAX_FRAGMENT_PAYLOAD_BYTES = 180` bytes of sealed ciphertext. Public API adds `decode_answer_fragments_from_packet`, `answer_txt_chunk_name`, `MAX_FRAGMENT_PAYLOAD_BYTES`, and `MAX_FRAGMENT_TOTAL = 255`.
