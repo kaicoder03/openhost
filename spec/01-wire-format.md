@@ -204,20 +204,40 @@ The inner `client_pk` **MUST** match the outer BEP44 signer pubkey.
 The daemon verifies this on decode and rejects a mismatch.
 
 **Answer (daemon → client).** The daemon publishes answer records as
-**extra** TXT entries inside its existing `_openhost` `SignedPacket`, at
-the single-label name
+**extra** TXT entries inside its existing `_openhost` `SignedPacket`.
+Each answer is split into one or more **fragments**, each emitted as
+its own TXT record at the single-label name
 
 ```
-_answer-<client-hash-label>
+_answer-<client-hash-label>-<idx>
 ```
 
 where `client-hash-label = z_base_32(allowlist_hash(daemon_salt, client_pk))`
-— reusing the same HMAC construction `_allow` uses (see §2). Putting
-the answer TXT inside the same packet as `_openhost` is required because
-BEP44 permits only one mutable item per pubkey.
+— reusing the same HMAC construction `_allow` uses (see §2) — and
+`idx` is the 0-based fragment index written as decimal digits (no
+leading zeros). Putting answer fragments inside the same packet as
+`_openhost` is required because BEP44 permits only one mutable item
+per pubkey.
 
-The TXT value is `base64url_nopad(sealed_ct)` with the same
-`compression_tag || body` framing as the offer. The answer body is:
+Each TXT value is `base64url_nopad(fragment_envelope)` where
+`fragment_envelope` is:
+
+```
+  fragment_envelope =
+      version        : u8   (0x01)
+      chunk_idx      : u8   (0-based; MUST equal the numeric suffix on the DNS label)
+      chunk_total    : u8   (1..=255; identical across every fragment of one answer)
+      payload_len    : u16  big-endian; ≤ 180
+      payload        : payload_len bytes; a slice of the sealed ciphertext
+```
+
+Concatenating the `payload` fields of every fragment addressed to one
+client (in `chunk_idx` order) yields `sealed_ct`, the libsodium
+sealed-box (`crypto_box_seal`) of the answer plaintext below,
+addressed to `public_key_to_x25519(client_pk)`.
+
+The answer plaintext carries the same `compression_tag || body`
+framing as the offer. The answer body is:
 
 ```
   body =  "openhost-answer-inner1"   (22 bytes)
@@ -234,14 +254,27 @@ inner `daemon_pk` **MUST** match the outer BEP44 signer.
 
 TXT TTL for both records is 30 seconds (ephemeral per-handshake).
 
-**Encoder constraint (eviction).** The main `_openhost` record + all
-`_answer-*` entries MUST fit in the BEP44 1000-byte limit. When an
-answer would overflow, the daemon evicts the oldest entries (lowest
-creation timestamp first). Compression (v2 tag) reduces the common
-case to something that fits; high-entropy SDPs (those dominated by
-DTLS fingerprints + ICE credentials) still approach the cap.
-Splitting an answer across multiple records — allowing arbitrarily
-large SDPs plus ICE trickle — is tracked as post-v0.1 work.
+**Reassembly.** A client looks up `_answer-<client-hash-label>-0`
+first. Missing fragment zero ⇒ the daemon has not yet queued an
+answer. Otherwise the client reads `chunk_total` from fragment zero
+and fetches fragments `1..chunk_total - 1`. It MUST reject the
+reassembly as malformed on any of: inconsistent `chunk_total` across
+fragments, a fragment whose numeric label suffix disagrees with its
+envelope `chunk_idx`, a missing or duplicated index, `chunk_total == 0`,
+`chunk_idx >= chunk_total`, or `payload_len > 180`. Only after
+successful reassembly does the client run sealed-box open on the
+concatenated payload.
+
+**Encoder constraint (whole-answer eviction).** The main `_openhost`
+record + every fragment of every answer MUST fit in the BEP44
+1000-byte limit. When adding an answer would overflow, the daemon
+evicts the whole answer (all of its fragments) — never a single
+fragment, which would yield an un-reassemblable partial at the
+client. Eviction order is oldest-first by `created_at`. A `warn!` is
+logged per eviction so operators notice shedding. The daemon may
+further reduce the main record size (e.g., by moving fields it
+publishes outside the packet) to leave more room for answers, but
+that is an implementation concern rather than a wire-format one.
 
 ## 4. HTTP-over-DataChannel framing (ABNF)
 

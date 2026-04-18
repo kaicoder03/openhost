@@ -20,7 +20,8 @@ use openhost_daemon::config::{
 };
 use openhost_daemon::{App, Result as DaemonResult};
 use openhost_pkarr::{
-    decode_answer_from_packet, OfferPlaintext, OfferRecord, OFFER_TXT_PREFIX, OFFER_TXT_TTL,
+    decode_answer_fragments_from_packet, OfferPlaintext, OfferRecord, OFFER_TXT_PREFIX,
+    OFFER_TXT_TTL,
 };
 use pkarr::dns::rdata::TXT;
 use pkarr::dns::Name;
@@ -289,7 +290,8 @@ async fn daemon_ignores_offer_sealed_to_different_daemon() -> DaemonResult<()> {
     // addressed to this client.
     for raw in transport.snapshot() {
         if let Ok(pk) = SignedPacket::deserialize(&raw) {
-            let decoded = decode_answer_from_packet(&pk, &app.state().salt(), &client_pk).unwrap();
+            let decoded =
+                decode_answer_fragments_from_packet(&pk, &app.state().salt(), &client_pk).unwrap();
             assert!(
                 decoded.is_none(),
                 "daemon must not publish an answer for an offer it couldn't unseal"

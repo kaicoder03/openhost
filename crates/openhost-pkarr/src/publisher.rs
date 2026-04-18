@@ -760,9 +760,9 @@ mod tests {
 
         let raw = &transport.packets.lock().unwrap()[0];
         let packet = SignedPacket::deserialize(raw).unwrap();
-        let decoded = crate::offer::decode_answer_from_packet(&packet, &salt, &client_pk)
+        let decoded = crate::offer::decode_answer_fragments_from_packet(&packet, &salt, &client_pk)
             .unwrap()
-            .expect("answer TXT present");
+            .expect("answer fragments present");
         let opened = decoded.open(&client_sk).unwrap();
         assert_eq!(opened.answer_sdp, answer_sdp);
     }

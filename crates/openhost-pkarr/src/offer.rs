@@ -127,13 +127,137 @@ pub const OFFER_SDP_HASH_LEN: usize = 32;
 /// to a single label separated by `-`.
 pub const OFFER_TXT_PREFIX: &str = "_offer-";
 
-/// DNS label prefix for answer records. Full single-label name is
-/// `_answer-<client-hash-label>`.
+/// DNS label prefix for answer records. v0.2+ encoders emit one
+/// `_answer-<client-hash-label>-<idx>` TXT per fragment; see
+/// [`encode_with_answers`] and [`decode_answer_fragments_from_packet`].
 pub const ANSWER_TXT_PREFIX: &str = "_answer-";
 
 /// TTL (in seconds) used for both offer and answer TXT records. Short
 /// because they're per-handshake and shouldn't be cached.
 pub const OFFER_TXT_TTL: u32 = 30;
+
+// ============================================================================
+// Answer fragmentation (spec §3.3, v0.2+)
+// ============================================================================
+//
+// v0.1 shipped one `_answer-<client-hash>` TXT per queued answer, which
+// routinely overflowed BEP44's 1000-byte `v` cap when combined with the
+// main `_openhost` record, forcing the encoder into an eviction path
+// that silently dropped answers. v0.2+ fragments the sealed ciphertext
+// across multiple `_answer-<client-hash>-<idx>` TXTs. The dialer
+// reassembles before unsealing.
+//
+// Wire format of each fragment (BEFORE base64url):
+//
+//   [u8]   version       = FRAGMENT_VERSION
+//   [u8]   chunk_idx     (0-based)
+//   [u8]   chunk_total   (1..=MAX_FRAGMENT_TOTAL, repeated in every fragment)
+//   [u16]  payload_len   big-endian, ≤ MAX_FRAGMENT_PAYLOAD_BYTES
+//   [..]   payload       slice of the sealed-box ciphertext
+//
+// This is a breaking wire change relative to v0.1: v0.1 daemons emit
+// one unnumbered `_answer-<client-hash>` TXT, v0.2 daemons emit one or
+// more `_answer-<client-hash>-<idx>` TXTs. v0.1 clients will not find
+// the unnumbered name on a v0.2 host packet, and vice versa. Since v0.1
+// answer delivery was explicitly documented as best-effort (eviction),
+// and both sides upgrade in lockstep with this PR, that break is
+// acceptable.
+
+const FRAGMENT_VERSION: u8 = 0x01;
+const FRAGMENT_HEADER_LEN: usize = 5;
+
+/// Maximum payload bytes per fragment. Sized so that each fragment's
+/// `base64url(header || payload)` fits comfortably inside a single DNS
+/// TXT character-string (the 255-byte limit in RFC 1035 §3.3.14) while
+/// leaving room to pack multiple fragments alongside the main record
+/// inside BEP44's 1000-byte packet cap.
+pub const MAX_FRAGMENT_PAYLOAD_BYTES: usize = 180;
+
+/// Maximum `chunk_total` we emit or accept. Bounded by `u8` on the wire.
+pub const MAX_FRAGMENT_TOTAL: u8 = 255;
+
+fn encode_fragment(idx: u8, total: u8, payload: &[u8]) -> Vec<u8> {
+    debug_assert!(payload.len() <= MAX_FRAGMENT_PAYLOAD_BYTES);
+    let mut out = Vec::with_capacity(FRAGMENT_HEADER_LEN + payload.len());
+    out.push(FRAGMENT_VERSION);
+    out.push(idx);
+    out.push(total);
+    let len =
+        u16::try_from(payload.len()).expect("payload ≤ MAX_FRAGMENT_PAYLOAD_BYTES < u16::MAX");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+#[derive(Debug)]
+struct DecodedFragment {
+    idx: u8,
+    total: u8,
+    payload: Vec<u8>,
+}
+
+fn decode_fragment(bytes: &[u8]) -> Result<DecodedFragment> {
+    if bytes.len() < FRAGMENT_HEADER_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "truncated answer fragment header",
+        ));
+    }
+    let version = bytes[0];
+    if version != FRAGMENT_VERSION {
+        return Err(PkarrError::MalformedCanonical(
+            "unknown answer fragment version",
+        ));
+    }
+    let idx = bytes[1];
+    let total = bytes[2];
+    if total == 0 {
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment total must be >= 1",
+        ));
+    }
+    if idx >= total {
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment idx >= total",
+        ));
+    }
+    let payload_len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+    if payload_len > MAX_FRAGMENT_PAYLOAD_BYTES {
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment payload exceeds per-fragment cap",
+        ));
+    }
+    let expected_end = FRAGMENT_HEADER_LEN + payload_len;
+    if bytes.len() != expected_end {
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment payload length mismatch",
+        ));
+    }
+    Ok(DecodedFragment {
+        idx,
+        total,
+        payload: bytes[FRAGMENT_HEADER_LEN..expected_end].to_vec(),
+    })
+}
+
+fn split_into_fragments(sealed: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if sealed.is_empty() {
+        // Sealed-box output is always ≥48 bytes; an empty payload is a
+        // construction bug, not a wire condition.
+        return Err(PkarrError::MalformedCanonical(
+            "cannot fragment empty sealed ciphertext",
+        ));
+    }
+    let chunk_count = sealed.len().div_ceil(MAX_FRAGMENT_PAYLOAD_BYTES);
+    if chunk_count > MAX_FRAGMENT_TOTAL as usize {
+        return Err(PkarrError::PacketTooLarge { size: sealed.len() });
+    }
+    let total = u8::try_from(chunk_count).expect("chunk_count bounded by MAX_FRAGMENT_TOTAL");
+    Ok(sealed
+        .chunks(MAX_FRAGMENT_PAYLOAD_BYTES)
+        .enumerate()
+        .map(|(i, chunk)| encode_fragment(i as u8, total, chunk))
+        .collect())
+}
 
 /// One offer record. Wraps the sealed-box ciphertext; the outer BEP44
 /// signature on the containing [`SignedPacket`] provides integrity.
@@ -223,14 +347,27 @@ pub fn offer_txt_name(daemon_pk: &PublicKey) -> String {
     format!("{OFFER_TXT_PREFIX}{}", host_hash_label(daemon_pk))
 }
 
-/// Full DNS name the daemon publishes an answer at inside its own zone:
-/// `_answer._<client-hash-label>`.
+/// Base DNS name (without the `-<idx>` fragment suffix) the daemon
+/// publishes answers under inside its own zone: `_answer-<client-hash-label>`.
+/// v0.2+ callers should use [`answer_txt_chunk_name`]; this helper
+/// exists for diagnostic tooling and tests.
 #[must_use]
 pub fn answer_txt_name(daemon_salt: &[u8; SALT_LEN], client_pk: &PublicKey) -> String {
     format!(
         "{ANSWER_TXT_PREFIX}{}",
         client_hash_label(daemon_salt, client_pk)
     )
+}
+
+/// Full DNS name for one fragment of an answer, carrying the 0-based
+/// `idx` suffix. Format: `_answer-<client-hash-label>-<idx>`.
+#[must_use]
+pub fn answer_txt_chunk_name(
+    daemon_salt: &[u8; SALT_LEN],
+    client_pk: &PublicKey,
+    idx: u8,
+) -> String {
+    format!("{}-{}", answer_txt_name(daemon_salt, client_pk), idx)
 }
 
 // ============================================================================
@@ -311,14 +448,17 @@ pub fn hash_offer_sdp(offer_sdp: &str) -> [u8; OFFER_SDP_HASH_LEN] {
 // ============================================================================
 
 /// Encode a [`SignedRecord`] into a [`SignedPacket`], optionally
-/// carrying answer TXT records. When `answers` is empty the returned
-/// packet is byte-identical to what [`crate::codec::encode`] would
-/// produce — an existing test pins this invariant.
+/// carrying fragmented answer TXT records. When `answers` is empty the
+/// returned packet is byte-identical to what [`crate::codec::encode`]
+/// would produce — an existing test pins this invariant.
 ///
-/// When the packet would overflow [`BEP44_MAX_V_BYTES`] after including
-/// all answers, the encoder evicts the oldest entries (smallest
-/// `created_at` first) until the packet fits. A `warn!` is logged for
-/// each eviction so operators notice shedding.
+/// Each [`AnswerEntry`]'s sealed ciphertext is split into one or more
+/// fragments of up to [`MAX_FRAGMENT_PAYLOAD_BYTES`] bytes and emitted
+/// as `_answer-<client-hash>-<idx>` TXT records. Fragments of one
+/// answer are packed atomically: if adding them would overflow
+/// [`BEP44_MAX_V_BYTES`], the whole answer is evicted (oldest entries
+/// first, by `created_at`) and a `warn!` is logged so operators notice
+/// shedding.
 pub fn encode_with_answers(
     signed: &SignedRecord,
     signing_key: &SigningKey,
@@ -344,9 +484,25 @@ pub fn encode_with_answers(
     let ts = Timestamp::from(ts_micros);
 
     // Sort by created_at ascending so oldest entries are at the front —
-    // eviction walks the back, keeping the freshest answers.
+    // eviction walks the front, keeping the freshest answers.
     let mut sorted: Vec<&AnswerEntry> = answers.iter().collect();
     sorted.sort_by_key(|e| e.created_at);
+
+    // Pre-compute the fragment record set for every answer. Each inner
+    // Vec is the atomic publication unit: either every fragment of an
+    // answer makes it into the packet, or none does.
+    let mut per_answer_records: Vec<Vec<(String, String)>> = Vec::with_capacity(sorted.len());
+    for entry in &sorted {
+        let fragments = split_into_fragments(&entry.sealed)?;
+        let label = zbase32::encode_full_bytes(&entry.client_hash);
+        let base = format!("{ANSWER_TXT_PREFIX}{label}");
+        let named: Vec<(String, String)> = fragments
+            .into_iter()
+            .enumerate()
+            .map(|(i, frag)| (format!("{base}-{i}"), URL_SAFE_NO_PAD.encode(&frag)))
+            .collect();
+        per_answer_records.push(named);
+    }
 
     // Try with ALL answers first. pkarr's own signer enforces the
     // 1000-byte BEP44 cap and returns `SignedPacketBuildError::PacketTooLarge`
@@ -354,7 +510,11 @@ pub fn encode_with_answers(
     // retry rather than post-hoc inspecting `encoded_packet().len()`.
     let mut keep_from = 0usize;
     loop {
-        match build_packet(&main_txt, ts, &sorted[keep_from..], &keypair) {
+        let records: Vec<&(String, String)> = per_answer_records[keep_from..]
+            .iter()
+            .flat_map(|answer| answer.iter())
+            .collect();
+        match build_packet(&main_txt, ts, &records, &keypair) {
             Ok(packet) => {
                 // Defensive: also re-check our own ceiling in case the
                 // pkarr crate's check moves in a future release.
@@ -366,6 +526,7 @@ pub fn encode_with_answers(
                     }
                     tracing::warn!(
                         evicted_client_hash = %hex_hash(&sorted[keep_from].client_hash),
+                        fragments = per_answer_records[keep_from].len(),
                         "openhost-pkarr: answer entry evicted — packet would exceed BEP44 1000-byte limit",
                     );
                     keep_from += 1;
@@ -379,6 +540,7 @@ pub fn encode_with_answers(
                 }
                 tracing::warn!(
                     evicted_client_hash = %hex_hash(&sorted[keep_from].client_hash),
+                    fragments = per_answer_records[keep_from].len(),
                     "openhost-pkarr: answer entry evicted — packet would exceed BEP44 1000-byte limit",
                 );
                 keep_from += 1;
@@ -401,7 +563,7 @@ fn is_packet_too_large(err: &pkarr::errors::SignedPacketBuildError) -> bool {
 fn build_packet(
     main_txt: &str,
     ts: Timestamp,
-    answers: &[&AnswerEntry],
+    records: &[&(String, String)],
     keypair: &Keypair,
 ) -> Result<SignedPacket> {
     let mut builder = SignedPacket::builder().timestamp(ts).txt(
@@ -409,14 +571,10 @@ fn build_packet(
         TXT::try_from(main_txt).map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?,
         OPENHOST_TXT_TTL,
     );
-    for entry in answers {
-        let label = zbase32::encode_full_bytes(&entry.client_hash);
-        let name_owned = format!("{ANSWER_TXT_PREFIX}{label}");
-        let answer_txt = URL_SAFE_NO_PAD.encode(&entry.sealed);
+    for (name, value) in records {
         builder = builder.txt(
-            Name::new_unchecked(&name_owned),
-            TXT::try_from(answer_txt.as_str())
-                .map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?,
+            Name::new_unchecked(name),
+            TXT::try_from(value.as_str()).map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?,
             OFFER_TXT_TTL,
         );
     }
@@ -446,29 +604,72 @@ pub fn decode_offer_from_packet(
     Ok(Some(OfferRecord { sealed }))
 }
 
-/// Look for an `_answer-<client-hash>` TXT inside `packet` (the daemon's
-/// main record) and return it decoded. Called by PR #8's client-side
-/// consumer: it already knows its own `client_pk` and the daemon's
-/// published salt.
+/// Scan `packet` for fragmented `_answer-<client-hash>-<idx>` TXT
+/// records addressed to `client_pk`, reassemble them, and return the
+/// resulting [`AnswerEntry`] with the concatenated sealed ciphertext.
+/// Returns `Ok(None)` when no fragments addressed to this client are
+/// present (i.e. the daemon has not yet queued an answer for us).
 ///
-/// **Does NOT cross-check** the inner `daemon_pk` inside the sealed
-/// plaintext against the outer BEP44 signer — the caller MUST do that
-/// after [`AnswerEntry::open`] to defend against a splicing substrate.
-pub fn decode_answer_from_packet(
+/// Rejects malformed fragmentation: inconsistent `chunk_total` across
+/// fragments, missing or duplicate indices, oversized payloads, and
+/// unknown envelope versions all produce `PkarrError::MalformedCanonical`.
+///
+/// **Does NOT cross-check** the inner `daemon_pk` inside the reassembled
+/// sealed plaintext against the outer BEP44 signer — the caller MUST do
+/// that after [`AnswerEntry::open`] to defend against a splicing
+/// substrate.
+pub fn decode_answer_fragments_from_packet(
     packet: &SignedPacket,
     daemon_salt: &[u8; SALT_LEN],
     client_pk: &PublicKey,
 ) -> Result<Option<AnswerEntry>> {
     let client_hash = allowlist_hash(daemon_salt, &client_pk.to_bytes());
-    let want_name = format!(
+    let base = format!(
         "{ANSWER_TXT_PREFIX}{}",
         zbase32::encode_full_bytes(&client_hash)
     );
-    let text = match collect_single_txt(packet, &want_name)? {
-        Some(t) => t,
-        None => return Ok(None),
+
+    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
+    let first_name = format!("{base}-0");
+    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+        return Ok(None);
     };
-    let sealed = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
+    let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
+    let first = decode_fragment(&first_bytes)?;
+    if first.idx != 0 {
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment 0 carries non-zero idx",
+        ));
+    }
+    let total = first.total;
+
+    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
+    fragments.push(first);
+    for i in 1..total {
+        let name = format!("{base}-{i}");
+        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
+            "answer fragment set is missing an idx",
+        ))?;
+        let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
+        let frag = decode_fragment(&bytes)?;
+        if frag.total != total {
+            return Err(PkarrError::MalformedCanonical(
+                "answer fragments disagree on chunk_total",
+            ));
+        }
+        if frag.idx != i {
+            return Err(PkarrError::MalformedCanonical(
+                "answer fragment idx disagrees with its DNS label suffix",
+            ));
+        }
+        fragments.push(frag);
+    }
+
+    let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
+    for frag in fragments {
+        sealed.extend_from_slice(&frag.payload);
+    }
+
     // Use the packet timestamp as a sensible default for `created_at` —
     // the caller can override if they track their own receipt time.
     let packet_ts_micros: u64 = packet.timestamp().into();
@@ -1044,10 +1245,12 @@ mod tests {
         let decoded_main = codec::decode(&packet).unwrap();
         assert_eq!(decoded_main.record, signed.record);
 
-        // The `_answer._<client-hash>` TXT decodes to the expected entry.
-        let decoded = decode_answer_from_packet(&packet, &salt, &client_pk)
+        // The fragmented `_answer-<client-hash>-<idx>` TXTs reassemble
+        // into the original sealed AnswerEntry.
+        let decoded = decode_answer_fragments_from_packet(&packet, &salt, &client_pk)
             .unwrap()
-            .expect("answer TXT is present");
+            .expect("answer fragments are present");
+        assert_eq!(decoded.sealed, entry.sealed);
         let opened = decoded.open(&client_sk()).unwrap();
         assert_eq!(opened, plaintext);
     }
@@ -1085,18 +1288,251 @@ mod tests {
         // Freshest (created_at = 1) survives.
         let freshest_pk = SigningKey::from_bytes(&[0x11u8; 32]).public_key();
         assert!(
-            decode_answer_from_packet(&packet, &salt, &freshest_pk)
+            decode_answer_fragments_from_packet(&packet, &salt, &freshest_pk)
                 .unwrap()
                 .is_some(),
             "the freshest answer must survive eviction"
         );
-        // Oldest (created_at = 0) was dropped.
+        // Oldest (created_at = 0) was dropped — fragment 0 not in packet.
         let oldest_pk = SigningKey::from_bytes(&[0x10u8; 32]).public_key();
         assert!(
-            decode_answer_from_packet(&packet, &salt, &oldest_pk)
+            decode_answer_fragments_from_packet(&packet, &salt, &oldest_pk)
                 .unwrap()
                 .is_none(),
             "the oldest answer must be evicted"
+        );
+    }
+
+    // ---------- answer fragmentation (v0.2+) ----------
+
+    /// Small answer: seals a minimal SDP, verifies the packet carries
+    /// exactly `chunk_total` consecutive `_answer-<hash>-<idx>` records
+    /// and nothing at the past-the-end index, and that reassembly
+    /// returns the original sealed bytes. The exact `chunk_total`
+    /// depends on zlib output for the sample SDP (not byte-pinnable
+    /// across flate2 versions) so we assert the shape, not a number.
+    #[test]
+    fn small_answer_fragments_and_reassembles() {
+        let sk = host_sk();
+        let signed = reference_signed();
+        let client_pk = client_sk().public_key();
+        let salt = [0x33u8; SALT_LEN];
+
+        let plaintext = AnswerPlaintext {
+            daemon_pk: sk.public_key(),
+            offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
+            answer_sdp: SAMPLE_ANSWER_SDP.to_string(),
+        };
+        let mut rng = deterministic_rng();
+        let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, 1).unwrap();
+
+        let expected_total = entry.sealed.len().div_ceil(MAX_FRAGMENT_PAYLOAD_BYTES);
+        let packet = encode_with_answers(&signed, &sk, std::slice::from_ref(&entry)).unwrap();
+
+        for idx in 0..expected_total {
+            let name = answer_txt_chunk_name(&salt, &client_pk, idx as u8);
+            assert!(
+                collect_single_txt(&packet, &name).unwrap().is_some(),
+                "expected fragment at {name}",
+            );
+        }
+        let past_end = answer_txt_chunk_name(&salt, &client_pk, expected_total as u8);
+        assert!(
+            collect_single_txt(&packet, &past_end).unwrap().is_none(),
+            "no fragment expected past chunk_total",
+        );
+
+        let reassembled = decode_answer_fragments_from_packet(&packet, &salt, &client_pk)
+            .unwrap()
+            .expect("fragments present");
+        assert_eq!(reassembled.sealed, entry.sealed);
+        let opened = reassembled.open(&client_sk()).unwrap();
+        assert_eq!(opened, plaintext);
+    }
+
+    /// Force a multi-fragment answer by sealing an SDP large enough
+    /// that the ciphertext exceeds MAX_FRAGMENT_PAYLOAD_BYTES, then
+    /// verify reassembly returns the original sealed bytes. We can't
+    /// stuff it into a full-signer packet because of the BEP44 cap —
+    /// drive the fragment codec directly via split_into_fragments +
+    /// decode_fragment.
+    #[test]
+    fn multi_fragment_answer_reassembles() {
+        // 420 raw bytes → 3 fragments (180 + 180 + 60).
+        let sealed = (0u8..=u8::MAX).cycle().take(420).collect::<Vec<u8>>();
+        let fragments = split_into_fragments(&sealed).unwrap();
+        assert_eq!(fragments.len(), 3);
+        let mut decoded: Vec<DecodedFragment> = fragments
+            .iter()
+            .map(|b| decode_fragment(b).unwrap())
+            .collect();
+        // Shuffle idx order; decoder is order-agnostic at reassembly-time
+        // via the lookup-by-idx probe, but double-check the fragment
+        // carries idx + total in its own header.
+        decoded.reverse();
+        for f in &decoded {
+            assert_eq!(f.total, 3);
+        }
+        let mut sorted = decoded;
+        sorted.sort_by_key(|f| f.idx);
+        let mut reassembled = Vec::with_capacity(sealed.len());
+        for f in sorted {
+            reassembled.extend_from_slice(&f.payload);
+        }
+        assert_eq!(reassembled, sealed);
+    }
+
+    #[test]
+    fn fragment_decode_rejects_unknown_version() {
+        let bytes = vec![0xFF, 0, 1, 0, 0];
+        assert!(matches!(
+            decode_fragment(&bytes),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn fragment_decode_rejects_idx_ge_total() {
+        let bytes = vec![FRAGMENT_VERSION, 3, 2, 0, 0];
+        assert!(matches!(
+            decode_fragment(&bytes),
+            Err(PkarrError::MalformedCanonical(
+                "answer fragment idx >= total"
+            ))
+        ));
+    }
+
+    #[test]
+    fn fragment_decode_rejects_zero_total() {
+        let bytes = vec![FRAGMENT_VERSION, 0, 0, 0, 0];
+        assert!(matches!(
+            decode_fragment(&bytes),
+            Err(PkarrError::MalformedCanonical(
+                "answer fragment total must be >= 1"
+            ))
+        ));
+    }
+
+    #[test]
+    fn fragment_decode_rejects_length_mismatch() {
+        // Header claims payload_len = 10 but only 5 payload bytes follow.
+        let mut bytes = vec![FRAGMENT_VERSION, 0, 1];
+        bytes.extend_from_slice(&10u16.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 5]);
+        assert!(matches!(
+            decode_fragment(&bytes),
+            Err(PkarrError::MalformedCanonical(
+                "answer fragment payload length mismatch"
+            ))
+        ));
+    }
+
+    #[test]
+    fn fragment_reassembly_detects_chunk_total_disagreement() {
+        // Build a packet with two fragments whose headers disagree on
+        // `chunk_total`. We synthesize them directly into a SignedPacket
+        // rather than going through encode_with_answers (which only
+        // emits self-consistent fragment sets).
+        let sk = host_sk();
+        let client_pk = client_sk().public_key();
+        let salt = [0x33u8; SALT_LEN];
+        let signed = reference_signed();
+
+        // Valid fragment 0 claiming total = 2, plus a fake fragment 1
+        // claiming total = 3.
+        let frag0 = encode_fragment(0, 2, b"first-half");
+        let frag1 = encode_fragment(1, 3, b"second-half");
+        let client_hash = allowlist_hash(&salt, &client_pk.to_bytes());
+        let label = zbase32::encode_full_bytes(&client_hash);
+        let base = format!("{ANSWER_TXT_PREFIX}{label}");
+
+        let main_blob = {
+            let canonical = signed.record.canonical_signing_bytes().unwrap();
+            let mut b = Vec::with_capacity(64 + canonical.len());
+            b.extend_from_slice(&signed.signature.to_bytes());
+            b.extend_from_slice(&canonical);
+            URL_SAFE_NO_PAD.encode(&b)
+        };
+        let seed = Zeroizing::new(sk.to_bytes());
+        let keypair = Keypair::from_secret_key(&seed);
+        let ts = Timestamp::from(signed.record.ts * MICROS_PER_SECOND);
+        let packet = SignedPacket::builder()
+            .timestamp(ts)
+            .txt(
+                Name::new_unchecked(OPENHOST_TXT_NAME),
+                TXT::try_from(main_blob.as_str()).unwrap(),
+                OPENHOST_TXT_TTL,
+            )
+            .txt(
+                Name::new_unchecked(&format!("{base}-0")),
+                TXT::try_from(URL_SAFE_NO_PAD.encode(&frag0).as_str()).unwrap(),
+                OFFER_TXT_TTL,
+            )
+            .txt(
+                Name::new_unchecked(&format!("{base}-1")),
+                TXT::try_from(URL_SAFE_NO_PAD.encode(&frag1).as_str()).unwrap(),
+                OFFER_TXT_TTL,
+            )
+            .sign(&keypair)
+            .unwrap();
+
+        let err = decode_answer_fragments_from_packet(&packet, &salt, &client_pk)
+            .expect_err("chunk_total disagreement must be rejected");
+        assert!(
+            matches!(err, PkarrError::MalformedCanonical(m) if m.contains("chunk_total")),
+            "expected chunk_total mismatch error",
+        );
+    }
+
+    #[test]
+    fn fragment_reassembly_detects_missing_middle() {
+        // Emit frag 0 (total = 3) and frag 2, but skip frag 1.
+        let sk = host_sk();
+        let client_pk = client_sk().public_key();
+        let salt = [0x33u8; SALT_LEN];
+        let signed = reference_signed();
+
+        let frag0 = encode_fragment(0, 3, b"first");
+        let frag2 = encode_fragment(2, 3, b"third");
+        let client_hash = allowlist_hash(&salt, &client_pk.to_bytes());
+        let label = zbase32::encode_full_bytes(&client_hash);
+        let base = format!("{ANSWER_TXT_PREFIX}{label}");
+
+        let main_blob = {
+            let canonical = signed.record.canonical_signing_bytes().unwrap();
+            let mut b = Vec::with_capacity(64 + canonical.len());
+            b.extend_from_slice(&signed.signature.to_bytes());
+            b.extend_from_slice(&canonical);
+            URL_SAFE_NO_PAD.encode(&b)
+        };
+        let seed = Zeroizing::new(sk.to_bytes());
+        let keypair = Keypair::from_secret_key(&seed);
+        let ts = Timestamp::from(signed.record.ts * MICROS_PER_SECOND);
+        let packet = SignedPacket::builder()
+            .timestamp(ts)
+            .txt(
+                Name::new_unchecked(OPENHOST_TXT_NAME),
+                TXT::try_from(main_blob.as_str()).unwrap(),
+                OPENHOST_TXT_TTL,
+            )
+            .txt(
+                Name::new_unchecked(&format!("{base}-0")),
+                TXT::try_from(URL_SAFE_NO_PAD.encode(&frag0).as_str()).unwrap(),
+                OFFER_TXT_TTL,
+            )
+            .txt(
+                Name::new_unchecked(&format!("{base}-2")),
+                TXT::try_from(URL_SAFE_NO_PAD.encode(&frag2).as_str()).unwrap(),
+                OFFER_TXT_TTL,
+            )
+            .sign(&keypair)
+            .unwrap();
+
+        let err = decode_answer_fragments_from_packet(&packet, &salt, &client_pk)
+            .expect_err("missing middle fragment must be rejected");
+        assert!(
+            matches!(err, PkarrError::MalformedCanonical(m) if m.contains("missing")),
+            "expected missing-fragment error, got {err:?}",
         );
     }
 

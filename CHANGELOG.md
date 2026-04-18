@@ -8,6 +8,24 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #15, answer-record splitting)
+
+- `openhost-pkarr` fragmented answer records. Each `AnswerEntry`'s sealed ciphertext is now split into one or more `_answer-<client-hash>-<idx>` TXT records before being folded into the daemon's `_openhost` pkarr packet. Each fragment carries a 5-byte envelope (`version=0x01`, `chunk_idx: u8`, `chunk_total: u8`, `payload_len: u16 BE`) followed by up to `MAX_FRAGMENT_PAYLOAD_BYTES = 180` bytes of sealed ciphertext. Public API adds `decode_answer_fragments_from_packet`, `answer_txt_chunk_name`, `MAX_FRAGMENT_PAYLOAD_BYTES`, and `MAX_FRAGMENT_TOTAL = 255`.
+- Dialer reassembly: `openhost-client::Dialer::poll_answer` now calls `decode_answer_fragments_from_packet`, which probes fragment zero first (so a missing zero cheaply means "no answer yet"), reads `chunk_total`, fetches the remaining `1..chunk_total - 1` fragments, validates that every fragment's label suffix agrees with its envelope `chunk_idx` and that `chunk_total` is consistent across the set, and concatenates the payloads before running sealed-box open. Malformed sets (gaps, oversize payloads, inconsistent totals, unknown envelope versions) are rejected before any cryptographic operation runs.
+- New tests in `crates/openhost-pkarr/src/offer.rs` covering the fragment codec: `small_answer_fragments_and_reassembles`, `multi_fragment_answer_reassembles`, `fragment_decode_rejects_unknown_version`, `fragment_decode_rejects_idx_ge_total`, `fragment_decode_rejects_zero_total`, `fragment_decode_rejects_length_mismatch`, `fragment_reassembly_detects_chunk_total_disagreement`, `fragment_reassembly_detects_missing_middle`. The existing `encode_evicts_oldest_when_overflow` and `encode_with_one_answer_preserves_openhost_txt` tests continue to pass against the new fragment path.
+- New `crates/openhost-client/tests/end_to_end.rs::dialer_reassembles_fragmented_answer_from_wire` exercises the full wire round-trip: a synthetic small sealed answer is pushed into `SharedState`, the publisher re-emits, and the test resolves the packet and asserts `decode_answer_fragments_from_packet` returns byte-identical sealed bytes.
+
+### Changed (PR #15, answer-record splitting)
+
+- **Wire-format break**: v0.2+ daemons emit fragmented `_answer-<client-hash>-<idx>` TXTs; v0.1 clients expecting the legacy unfragmented `_answer-<client-hash>` name will not find an answer on a v0.2 packet, and vice versa. v0.1 answer delivery was already labelled best-effort (the encoder evicted answers that didn't fit the BEP44 cap), and both sides upgrade in lockstep with this PR, so the break is contained.
+- `spec/01-wire-format.md §3.3` rewritten: the old "encoder constraint (eviction)" paragraph is replaced with the fragment envelope, DNS naming convention (`-<idx>` suffix), reassembly procedure, and the whole-answer eviction rule (the encoder MUST evict all fragments of an answer together — never a single fragment, which would yield an un-reassemblable partial at the client).
+- The encoder's existing oldest-first eviction ordering is preserved but now operates on whole fragment sets; `encode_with_answers` pre-computes per-answer fragment sets and packs them atomically.
+- `openhost-client::Dialer::poll_answer` no longer imports or references `decode_answer_from_packet`; callers who depended on the legacy unfragmented decoder should migrate to `decode_answer_fragments_from_packet`.
+
+### Known limitations (carries into 0.2.0 from 0.1.0)
+
+- Real webrtc-rs answer SDPs seal to ≈450 bytes, which — even with fragmentation — still exceeds the residual BEP44 budget after the main `_openhost` record. The daemon's `handle_offer → push_answer` path continues to have its answer evicted in `crates/openhost-client/tests/end_to_end.rs::daemon_produces_sealed_answer_for_dialer_offer`, which still asserts `PollAnswerTimeout` as the expected outcome. Closing that gap (shrinking the answer SDP itself, or moving answers out of the main packet) is the next line item in `ROADMAP.md`.
+
 ## [0.1.0] - 2026-04-18
 
 The first tagged release. Daemon + client + pkarr integration + WebRTC + channel binding + HTTP forwarding + allowlist + rate limit all shipped. One known gap remains (see below).

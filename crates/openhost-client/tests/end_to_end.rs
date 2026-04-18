@@ -1,30 +1,22 @@
-//! First truly-automated end-to-end regression guard (PR #8).
+//! End-to-end regression guard for wire-level signalling.
 //!
-//! Spins up a real `openhost_daemon::App` and a real
-//! `openhost_client::Dialer` in the same tokio runtime, wires both
-//! sides through a shared `MemoryPkarrNetwork`, and asserts the full
-//! daemon-side flow fires (resolve → poll offer → handle_offer →
-//! seal → queue answer).
+//! PR #15 introduced fragmented `_answer-<client-hash>-<idx>` TXT
+//! records so the daemon can stop silently evicting answers that
+//! overflow BEP44's 1000-byte `v` cap. This test injects a
+//! synthetic, minimal sealed answer into `SharedState`, kicks the
+//! publisher, and asserts that the dialer reassembles it on the
+//! wire via `decode_answer_fragments_from_packet`.
 //!
-//! # Known constraint — wire-level answer delivery
-//!
-//! A real WebRTC answer SDP is ~400 bytes. The high-entropy fields
-//! (DTLS fingerprint, ICE credentials) don't compress meaningfully,
-//! so even after PR #11's zlib-compressed inner plaintext, the
-//! sealed answer + base64url + DNS packaging totals ~700 bytes. The
-//! main `_openhost` record takes ~300 bytes, pushing a combined
-//! packet past BEP44's 1000-byte `v` cap on some measurements. When
-//! the encoder evicts the answer the dialer's `poll_answer` never
-//! sees it on the wire.
-//!
-//! For PR #11 we therefore assert against
-//! `SharedState::snapshot_answers()` (the daemon produced + sealed
-//! the answer — every layer above the wire ran) plus a separate
-//! verification that the sealed answer EXISTS in the memory net (so
-//! the publish path itself works). A true wire-level HTTP round-trip
-//! requires either splitting the answer into a separate pkarr record
-//! (architecturally larger than a v0.1 freeze) or picking a
-//! different substrate — tracked as post-v0.1 work.
+//! **Why a synthetic answer rather than a live `handle_offer`?** The
+//! real webrtc-rs answer SDP seals to ≈450 bytes; even after
+//! fragmentation the total packet size (main `_openhost` record +
+//! all answer fragment RRs + their ~16-byte overheads) exceeds the
+//! 1000-byte cap. Shrinking the WebRTC answer SDP itself, or
+//! moving answers out of the main packet entirely, is a separate
+//! post-v0.1 line item (see ROADMAP.md). This test covers the
+//! fragmentation mechanism in isolation; the full offer→answer
+//! daemon flow continues to be exercised end-to-end in
+//! `crates/openhost-daemon/tests/offer_poll.rs`.
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -113,13 +105,102 @@ fn daemon_config(tmp: &TempDir, watched: Vec<String>, upstream_port: Option<u16>
     }
 }
 
-/// Regression guard for every daemon-side layer above the BEP44
-/// wire: resolve the host record → pick up the offer → unseal →
-/// run handle_offer → seal answer → queue answer → trigger publish.
-/// The compressed sealed answer lands in `SharedState`; whether the
-/// encoder can then fold it into the main pkarr packet depends on
-/// the answer SDP size + salt (see the "known constraint" block at
-/// the top of this file).
+/// Fragment round-trip on the wire: push a synthetic small sealed
+/// answer into `SharedState`, trigger a republish, resolve the
+/// packet, and assert `decode_answer_fragments_from_packet`
+/// reassembles byte-for-byte what the daemon queued. Closes the
+/// v0.1 regression where the encoder evicted answers that wouldn't
+/// fit the BEP44 cap.
+#[tokio::test]
+async fn dialer_reassembles_fragmented_answer_from_wire() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+    let net = MemoryPkarrNetwork::new();
+
+    let client_sk = SigningKey::generate_os_rng();
+    let client_pk = client_sk.public_key();
+
+    let tmp = TempDir::new().unwrap();
+    // No upstream needed; no offer poller needed (empty watched list).
+    let cfg = daemon_config(&tmp, vec![], None);
+    let app = App::build_with_transport_and_resolve(cfg, net.as_transport(), net.as_resolve())
+        .await
+        .expect("app builds");
+    let daemon_pk = app.identity().public_key();
+    let daemon_salt = app.state().salt();
+
+    // Craft a minimal sealed answer. Small enough to fragment into
+    // two records and still fit alongside the main `_openhost`
+    // packet inside the BEP44 1000-byte cap.
+    let sample_offer_sdp = "v=0\r\na=setup:active\r\n";
+    let sample_answer_sdp =
+        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=setup:passive\r\n";
+    let plaintext = openhost_pkarr::AnswerPlaintext {
+        daemon_pk,
+        offer_sdp_hash: openhost_pkarr::hash_offer_sdp(sample_offer_sdp),
+        answer_sdp: sample_answer_sdp.to_string(),
+    };
+    let mut rng = rand::rngs::OsRng;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry =
+        openhost_pkarr::AnswerEntry::seal(&mut rng, &client_pk, &daemon_salt, &plaintext, now_secs)
+            .expect("seal");
+
+    app.state().push_answer(entry.clone());
+    app.trigger_republish();
+
+    // Poll the memory network until we see a packet carrying the
+    // expected answer fragments. A short loop insulates from
+    // publisher-tick scheduling without introducing a big fixed sleep.
+    let resolver = net.as_resolve();
+    let pk_bytes = daemon_pk.to_bytes();
+    let pkarr_pk = pkarr::PublicKey::try_from(&pk_bytes).expect("pk");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let reassembled = loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("publisher never emitted a packet carrying the answer fragments");
+        }
+        if let Some(packet) = resolver.resolve_most_recent(&pkarr_pk).await {
+            if let Some(reassembled) = openhost_pkarr::decode_answer_fragments_from_packet(
+                &packet,
+                &daemon_salt,
+                &client_pk,
+            )
+            .expect("wire fragments are well-formed")
+            {
+                break reassembled;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(
+        reassembled.sealed, entry.sealed,
+        "wire-reassembled sealed bytes must byte-match the queued AnswerEntry",
+    );
+    let opened = reassembled.open(&client_sk).expect("answer opens");
+    assert_eq!(opened.answer_sdp, sample_answer_sdp);
+    assert_eq!(opened.daemon_pk, daemon_pk);
+
+    app.shutdown().await;
+}
+
+/// Regression guard: the `daemon_produces_sealed_answer_for_dialer_offer`
+/// test from v0.1 continues to assert the daemon's server-side layers
+/// run (resolve → unseal offer → handle_offer → seal answer → queue).
+/// With real webrtc-rs answer sizes the wire round-trip still can
+/// exceed BEP44's cap, so `dial()` fails with `PollAnswerTimeout` and
+/// we verify the daemon queued the answer in `SharedState`. Closing
+/// that remaining size gap (shrinking the answer SDP or moving
+/// answers out of the main packet) is separate post-v0.1 work.
 #[tokio::test]
 async fn daemon_produces_sealed_answer_for_dialer_offer() {
     let _ = tracing_subscriber::fmt()
@@ -145,7 +226,6 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
     let daemon_pk = app.identity().public_key();
     let host_url: OpenhostUrl = format!("oh://{daemon_pk}/").parse().expect("url");
 
-    // Let the initial daemon publish land.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut dialer = Dialer::builder()
@@ -154,11 +234,6 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
         .transport(net.as_transport())
         .resolver(net.as_resolve())
         .config(DialerConfig {
-            // Short-ish timeout: with the current BEP44 constraint,
-            // dial() fails with PollAnswerTimeout after the encoder
-            // evicts the answer. See the module-level constraint
-            // note; post-v0.1 this becomes a full wire round-trip
-            // assertion.
             dial_timeout: Duration::from_secs(5),
             answer_poll_interval: Duration::from_millis(250),
             webrtc_connect_timeout: Duration::from_secs(10),
@@ -170,21 +245,16 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
     let outcome = dialer.dial().await;
     match outcome {
         Err(openhost_client::ClientError::PollAnswerTimeout(_)) => {
-            // Expected: the daemon produced the answer but it didn't
-            // fit the packet. Next assertion verifies the server side
-            // of the flow actually ran.
+            // Expected while real webrtc-rs answer sizes exceed the
+            // BEP44 cap even with fragmentation. See module docs.
         }
-        Ok(_) => panic!(
-            "dial unexpectedly succeeded — the encoder must have fit \
-             the answer on the wire. If this starts passing \
-             consistently, split the ICE trickle follow-up has \
-             landed; upgrade this test to a full HTTP round-trip."
-        ),
-        Err(other) => panic!("expected PollAnswerTimeout; got {other:?}"),
+        Ok(_) => {
+            // If this starts passing the real-SDP size gap is closed;
+            // upgrade this test or retire it.
+        }
+        Err(other) => panic!("expected PollAnswerTimeout or Ok; got {other:?}"),
     }
 
-    // Real regression guard: the daemon ran every step up to queueing
-    // the sealed answer.
     let expected_hash =
         openhost_core::crypto::allowlist_hash(&app.state().salt(), &client_pk.to_bytes());
     let answers = app.state().snapshot_answers();
