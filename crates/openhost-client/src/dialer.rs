@@ -234,6 +234,13 @@ impl Dialer {
         // under the BEP44 1000-byte cap).
         let (pc, dc, offer_sdp) = self.build_offer().await?;
 
+        // RAII guard: if any stage 3-6 fails, close pc+dc before we
+        // bubble the error. webrtc-rs's `RTCPeerConnection` holds UDP
+        // sockets, ICE task handles, and DTLS state that Drop does
+        // NOT release — without this guard every failed dial leaks a
+        // full peer connection until process exit.
+        let mut teardown = Some(PeerConnectionGuard::new(Arc::clone(&pc), Arc::clone(&dc)));
+
         // Stage 3: seal + publish the offer.
         self.publish_offer(&daemon_pk, &offer_sdp).await?;
 
@@ -250,6 +257,12 @@ impl Dialer {
         // Stage 6: run the client-side channel-binding handshake.
         let binder = ClientBinder::new(Arc::clone(&self.identity), daemon_pk);
         complete_binding(&pc, &dc, &inbound, &binder, self.config.binding_timeout).await?;
+
+        // Authenticated — transfer pc+dc ownership to the session;
+        // the guard's Drop is now a no-op.
+        if let Some(g) = teardown.take() {
+            g.disarm();
+        }
 
         Ok(OpenhostSession::new(pc, dc, inbound))
     }
@@ -523,6 +536,47 @@ async fn complete_binding(
     binder.verify_auth_host(&exporter, &nonce, &host_frame.payload)?;
 
     Ok(())
+}
+
+/// RAII guard that closes a `(pc, dc)` pair on drop unless `disarm`
+/// was called. Used to plug the resource leak on `dial_inner` error
+/// paths — webrtc-rs does NOT close peer connections in Drop, so a
+/// naked drop leaks UDP sockets + ICE tasks + DTLS state per failed
+/// dial.
+struct PeerConnectionGuard {
+    pc: Option<Arc<RTCPeerConnection>>,
+    dc: Option<Arc<RTCDataChannel>>,
+}
+
+impl PeerConnectionGuard {
+    fn new(pc: Arc<RTCPeerConnection>, dc: Arc<RTCDataChannel>) -> Self {
+        Self {
+            pc: Some(pc),
+            dc: Some(dc),
+        }
+    }
+
+    /// Transfer ownership to the caller; subsequent `Drop` is a no-op.
+    fn disarm(mut self) {
+        self.pc.take();
+        self.dc.take();
+    }
+}
+
+impl Drop for PeerConnectionGuard {
+    fn drop(&mut self) {
+        if let (Some(pc), Some(dc)) = (self.pc.take(), self.dc.take()) {
+            // Best-effort async close. On a current-thread runtime
+            // the futures run the next time the runtime is driven;
+            // on multi-thread they fire immediately on a worker.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = dc.close().await;
+                    let _ = pc.close().await;
+                });
+            }
+        }
+    }
 }
 
 async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<()> {

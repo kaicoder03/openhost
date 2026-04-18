@@ -165,6 +165,14 @@ pub struct SessionInboundReader {
 
 impl SessionInboundReader {
     /// Install the `on_message` handler on `dc` and return the reader.
+    ///
+    /// The wake-up uses `Notify::notify_one` — critical for
+    /// correctness: if a message lands between `next_frame`'s buffer
+    /// check and its `notified().await` call, `notify_one` stores a
+    /// permit that the subsequent `notified().await` consumes
+    /// immediately. `notify_waiters` (the alternative) would be
+    /// lost-wakeup for exactly that race window, and the binding
+    /// handshake's first frame is the common case where it fires.
     pub(crate) fn install(dc: &Arc<RTCDataChannel>) -> Self {
         let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let notify: Arc<Notify> = Arc::new(Notify::new());
@@ -175,7 +183,7 @@ impl SessionInboundReader {
             let notify = Arc::clone(&notify_for_msg);
             Box::pin(async move {
                 buf.lock().await.extend_from_slice(&msg.data);
-                notify.notify_waiters();
+                notify.notify_one();
             })
         }));
         Self { buffer, notify }

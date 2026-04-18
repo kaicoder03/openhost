@@ -54,14 +54,16 @@ pub(crate) fn state_change_receiver(
 }
 
 /// Install an `on_open` handler that fires a one-shot `Notify` when
-/// the data channel becomes open. Returns the notify's signal side.
+/// the data channel becomes open. Uses `notify_one` so a permit is
+/// stored if `open` fires before any waiter awaits — the next
+/// `notified().await` returns immediately in that case.
 pub(crate) fn dc_open_signal(dc: &Arc<RTCDataChannel>) -> Arc<tokio::sync::Notify> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let inner = Arc::clone(&notify);
     dc.on_open(Box::new(move || {
         let inner = Arc::clone(&inner);
         Box::pin(async move {
-            inner.notify_waiters();
+            inner.notify_one();
         })
     }));
     notify
