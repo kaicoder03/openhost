@@ -74,6 +74,12 @@ http-body-util = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 
+# Pair-DB file watcher (PR #17). `notify-debouncer-mini` wraps
+# `notify`'s inotify/FSEvents/ReadDirectoryChangesW backends with a
+# timeout-driven debouncer so a burst of atomic-write events
+# collapses into a single reload.
+notify-debouncer-mini = "0.6"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }

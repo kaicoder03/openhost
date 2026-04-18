@@ -66,6 +66,7 @@ fn build_config(
         log: LogConfig::default(),
         pairing: PairingConfig {
             db_path: pair_db_path,
+            ..PairingConfig::default()
         },
     }
 }

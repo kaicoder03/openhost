@@ -128,12 +128,31 @@ impl Default for OfferPollConfig {
 }
 
 /// Pairing-database configuration.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PairingConfig {
     /// Path to the pairing TOML database. `None` resolves to the
     /// platform-default path under the openhost config directory.
     pub db_path: Option<PathBuf>,
+    /// Debounce window (milliseconds) for the pair-DB file watcher.
+    /// Raises to coalesce bursty atomic-write patterns; defaults to
+    /// 250 ms which is slow enough to swallow `pair add`'s
+    /// write-then-rename but fast enough to feel interactive.
+    #[serde(default = "default_pair_watch_debounce_ms")]
+    pub watch_debounce_ms: u64,
+}
+
+impl Default for PairingConfig {
+    fn default() -> Self {
+        Self {
+            db_path: None,
+            watch_debounce_ms: default_pair_watch_debounce_ms(),
+        }
+    }
+}
+
+fn default_pair_watch_debounce_ms() -> u64 {
+    250
 }
 
 fn default_enforce_allowlist() -> bool {

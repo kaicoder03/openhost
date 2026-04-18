@@ -8,6 +8,20 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #17, pair-DB file watcher)
+
+- **Automatic pair-DB reload on every platform.** New `openhost_daemon::pair_watcher` module wraps `notify-debouncer-mini` in a tokio-friendly handle: the watcher targets the pair-DB file's parent directory in non-recursive mode, filters events by filename inside a dedicated bridge thread, and forwards debounced reload triggers into the daemon's event loop via a tokio `mpsc`. The `App::run` event loop grows a third `tokio::select!` arm parallel to `shutdown_signal` and `reload_signal`; the SIGHUP path is retained as a secondary trigger on Unix so the existing SIGHUP integration test (`pairing_enforcement.rs`) continues to exercise the same reload code.
+- New `PairWatcherError` variant on `DaemonError` (`BadPath`, `Io`, `Backend`, `ThreadSpawn`). Spawn failures degrade gracefully — the watcher logs a `warn!` and returns `None`, the daemon keeps running, and pairing changes fall back to the SIGHUP path.
+- New config field `pairing.watch_debounce_ms: u64` (default 250). Operators can tune the coalesce window per deployment; the default swallows `pairing::save_atomic`'s write-then-rename burst and still feels interactive.
+- New integration test `crates/openhost-daemon/tests/pair_watcher.rs::watcher_reloads_allowlist_without_sighup`: boots `App`, modifies the pair DB on disk via `pairing::add`, and asserts `SharedState::is_client_allowed` becomes true within 3 s — without sending SIGHUP. Runs on both Unix and Windows (modulo notify-backend timing) under a multi-threaded tokio flavor so the watcher-driven reload arm of `App::run` can actually fire.
+- 3 new unit tests in `pair_watcher.rs`: fires on write, fires on initial-create (pair DB does not exist at daemon start), ignores sibling files in the same directory.
+
+### Changed (PR #17)
+
+- `openhostd pair add/remove` drops the "Send SIGHUP to the running daemon" reminder and instead prints a one-line note that a running daemon picks the change up automatically via the file watcher. SIGHUP remains documented as a fallback on Unix.
+- `App::run` factored the common post-reload logic into a new `reload_and_trigger(path, state, publisher, source)` helper. Both the SIGHUP and file-watcher arms now route through it; log lines carry a `source` field so operators can distinguish which trigger fired.
+- New dependency: `notify-debouncer-mini = "0.6"` (workspace-level; transitively pulls in `notify`, `inotify` on Linux, `fsevent-sys` on macOS, `notify-types`).
+
 ### Added (PR #16, `openhost-dial` CLI)
 
 - **New binary: `openhost-dial`**. Sends one HTTP request over openhost and prints the response. Behind the existing `cli` feature, so WASM / FFI consumers of `openhost-client` don't pull clap / tracing-subscriber / serde_json / hex transitively. Usage: `openhost-dial oh://<zbase32-pubkey>[/path] [-X METHOD] [-H 'Key: Value']... [-d BODY] [--relay URL]... [--timeout SECS] [--identity PATH] [--json]`. `-d` accepts `@path` (file), `-` (stdin), or a literal string — curl-style. `--identity <PATH>` loads a 32-byte raw Ed25519 seed (matches the daemon's `FsKeyStore` format); when omitted the binary generates an ephemeral key (useful against unauthenticated daemons, not useful against hosts with `enforce_allowlist = true` since the pubkey changes per invocation).
