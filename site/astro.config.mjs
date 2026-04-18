@@ -30,6 +30,14 @@ export default defineConfig({
           ],
         },
         {
+          label: "Guides",
+          items: [
+            { slug: "guides/install" },
+            { slug: "guides/quickstart" },
+            { slug: "guides/troubleshoot" },
+          ],
+        },
+        {
           label: "Specification",
           autogenerate: { directory: "spec" },
         },
