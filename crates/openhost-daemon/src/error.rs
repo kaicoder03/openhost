@@ -44,9 +44,42 @@ pub enum DaemonError {
     #[error(transparent)]
     Pairing(#[from] crate::pairing::PairingError),
 
+    /// Pair-DB file-watcher spawn or run failed (PR #17).
+    #[error(transparent)]
+    PairWatcher(#[from] PairWatcherError),
+
     /// Low-level I/O failure not caught by a more specific variant.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Pair-DB file-watcher failures.
+#[derive(Debug, Error)]
+pub enum PairWatcherError {
+    /// The pair-DB path is structurally unusable (no parent directory,
+    /// no filename).
+    #[error("pair-DB path is invalid: {0}")]
+    BadPath(&'static str),
+
+    /// I/O error while preparing the watcher (creating the parent
+    /// directory, stat, etc.).
+    #[error("pair watcher io: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The backend (inotify / FSEvents / ReadDirectoryChangesW) refused
+    /// to set up a watch.
+    #[error("pair watcher backend refused {path}: {source}")]
+    Backend {
+        /// Path the backend was asked to watch.
+        path: PathBuf,
+        /// Underlying notify error.
+        #[source]
+        source: notify_debouncer_mini::notify::Error,
+    },
+
+    /// Could not spawn the sync-to-async bridge thread.
+    #[error("pair watcher thread spawn: {0}")]
+    ThreadSpawn(std::io::Error),
 }
 
 /// Config-loading failures.

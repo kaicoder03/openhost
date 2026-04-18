@@ -154,8 +154,9 @@ fn run_pair(cfg: &Config, cmd: PairCmd) -> anyhow::Result<()> {
                 println!("  nickname: {n}");
             }
             eprintln!(
-                "openhostd: pair DB updated at {}. Send SIGHUP to the running daemon \
-                 (or restart) to apply.",
+                "openhostd: pair DB updated at {}. A running daemon picks \
+                 this up automatically within ~250 ms via the pair-DB file \
+                 watcher (SIGHUP still works as a fallback on Unix).",
                 db_path.display(),
             );
         }
@@ -165,8 +166,9 @@ fn run_pair(cfg: &Config, cmd: PairCmd) -> anyhow::Result<()> {
             pairing::remove(&db_path, &pk)?;
             println!("removed {pk}");
             eprintln!(
-                "openhostd: pair DB updated at {}. Send SIGHUP to the running daemon \
-                 (or restart) to apply.",
+                "openhostd: pair DB updated at {}. A running daemon picks \
+                 this up automatically within ~250 ms via the pair-DB file \
+                 watcher (SIGHUP still works as a fallback on Unix).",
                 db_path.display(),
             );
         }

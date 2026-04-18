@@ -50,9 +50,14 @@ pub struct App {
     /// on the `build_with_transport` test path that doesn't provide a
     /// resolver, keeping pre-PR #7a tests working without changes.
     poller: Option<OfferPoller>,
-    /// Resolved path to the pairing DB. Consulted on SIGHUP to reload
-    /// the allow list + trigger a republish.
+    /// Resolved path to the pairing DB. Consulted on SIGHUP / watcher
+    /// events to reload the allow list + trigger a republish.
     pair_db_path: PathBuf,
+    /// File-watcher that fires whenever `pair_db_path` is created,
+    /// modified, or removed. `None` when the watcher couldn't start —
+    /// the daemon keeps running and pairing changes fall back to the
+    /// SIGHUP path (Unix) or a restart (Windows).
+    pair_watcher: Option<crate::pair_watcher::PairWatcher>,
 }
 
 impl App {
@@ -74,6 +79,10 @@ impl App {
             resolver,
             &publisher,
         );
+        let pair_watcher = crate::pair_watcher::PairWatcher::spawn(
+            &pair_db_path,
+            Duration::from_millis(cfg.pairing.watch_debounce_ms),
+        );
         Ok(Self {
             identity,
             cert,
@@ -82,6 +91,7 @@ impl App {
             listener,
             poller,
             pair_db_path,
+            pair_watcher,
         })
     }
 
@@ -97,6 +107,10 @@ impl App {
             build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
         let publisher =
             publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
+        let pair_watcher = crate::pair_watcher::PairWatcher::spawn(
+            &pair_db_path,
+            Duration::from_millis(cfg.pairing.watch_debounce_ms),
+        );
         Ok(Self {
             identity,
             cert,
@@ -105,6 +119,7 @@ impl App {
             listener,
             poller: None,
             pair_db_path,
+            pair_watcher,
         })
     }
 
@@ -133,6 +148,10 @@ impl App {
             resolver,
             &publisher,
         );
+        let pair_watcher = crate::pair_watcher::PairWatcher::spawn(
+            &pair_db_path,
+            Duration::from_millis(cfg.pairing.watch_debounce_ms),
+        );
         Ok(Self {
             identity,
             cert,
@@ -141,6 +160,7 @@ impl App {
             listener,
             poller,
             pair_db_path,
+            pair_watcher,
         })
     }
 
@@ -197,7 +217,7 @@ impl App {
     /// info log. `Exhausted` or timeout → a `warn!` makes the partial
     /// state observable; the daemon keeps running so a later scheduled
     /// republish can still succeed.
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         self.wait_for_initial_publish().await;
         tracing::info!(
             pubkey = %self.identity.public_key(),
@@ -205,33 +225,48 @@ impl App {
             "openhostd: up",
         );
 
-        // Drive the event loop: shutdown wins over concurrent SIGHUP
-        // (`biased;` makes the select poll the shutdown arm first).
-        // Rapid SIGHUP bursts coalesce at the tokio-signal layer and
-        // at the loop boundary — we reload at most once per iteration.
-        // Reload is idempotent: a later SIGHUP just runs the load +
-        // replace_allow again, so coalescing is acceptable.
+        // Drive the event loop: shutdown wins over concurrent
+        // SIGHUP/file-watcher events (`biased;` makes the select poll
+        // the shutdown arm first). Rapid reload bursts coalesce —
+        // tokio-signal collapses SIGHUPs, notify-debouncer-mini
+        // collapses bursty filesystem writes at the 250 ms window, and
+        // the loop boundary provides a final coalescing point. Reload
+        // is idempotent: each event just re-runs load + replace_allow.
         loop {
+            // `pair_watcher.recv()` needs `&mut` access but `None` when
+            // the watcher didn't start; use a branch guard so the
+            // select resolves only when the option is populated.
+            let watcher_active = self.pair_watcher.is_some();
             tokio::select! {
                 biased;
                 _ = shutdown_signal() => {
                     break;
                 }
                 _ = reload_signal() => {
-                    match reload_pair_db(&self.pair_db_path, &self.state) {
-                        Ok(count) => {
-                            tracing::info!(
-                                count,
-                                "openhostd: pairing DB reloaded; republishing",
-                            );
-                            self.publisher.trigger();
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                ?err,
-                                "openhostd: pairing DB reload failed; keeping previous allow list",
-                            );
-                        }
+                    reload_and_trigger(
+                        &self.pair_db_path,
+                        &self.state,
+                        &self.publisher,
+                        "SIGHUP",
+                    );
+                }
+                event = async {
+                    match self.pair_watcher.as_mut() {
+                        Some(w) => w.recv().await,
+                        // Never resolves: the `watcher_active` guard
+                        // below keeps this branch disabled when the
+                        // watcher is `None`, but the future body still
+                        // needs to type-check on the `None` side.
+                        None => std::future::pending().await,
+                    }
+                }, if watcher_active => {
+                    if event.is_some() {
+                        reload_and_trigger(
+                            &self.pair_db_path,
+                            &self.state,
+                            &self.publisher,
+                            "file-watcher",
+                        );
                     }
                 }
             }
@@ -240,10 +275,15 @@ impl App {
         tracing::info!("openhostd: shutdown signal received, stopping publisher");
         // Order: listener first (tears down in-flight DTLS); poller
         // next (stops the loop that might otherwise push a late answer
-        // into the publisher); publisher last.
+        // into the publisher); pair-watcher next (drops inotify
+        // resources before the publisher whose trigger it calls);
+        // publisher last.
         self.listener.shutdown().await;
         if let Some(p) = self.poller {
             p.shutdown().await;
+        }
+        if let Some(w) = self.pair_watcher.take() {
+            w.shutdown();
         }
         self.publisher.shutdown().await;
         tracing::info!("openhostd: bye");
@@ -280,6 +320,9 @@ impl App {
         self.listener.shutdown().await;
         if let Some(p) = self.poller {
             p.shutdown().await;
+        }
+        if let Some(w) = self.pair_watcher {
+            w.shutdown();
         }
         self.publisher.shutdown().await;
     }
@@ -441,6 +484,35 @@ fn reload_pair_db(path: &Path, state: &SharedState) -> Result<usize> {
     let count = hashes.len();
     state.replace_allow(hashes);
     Ok(count)
+}
+
+/// Shared handler for both reload paths (SIGHUP + file-watcher):
+/// re-read the pair DB, swap the allow list, trigger a republish.
+/// Never panics; a failed reload logs a `warn!` and leaves the
+/// previous allow list in place.
+fn reload_and_trigger(
+    path: &Path,
+    state: &SharedState,
+    publisher: &PublishService,
+    source: &'static str,
+) {
+    match reload_pair_db(path, state) {
+        Ok(count) => {
+            tracing::info!(
+                count,
+                source,
+                "openhostd: pairing DB reloaded; republishing",
+            );
+            publisher.trigger();
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                source,
+                "openhostd: pairing DB reload failed; keeping previous allow list",
+            );
+        }
+    }
 }
 
 /// Install a global `tracing_subscriber` with the configured level filter.

@@ -28,6 +28,7 @@ pub mod forward;
 pub mod identity_store;
 pub mod listener;
 pub mod offer_poller;
+pub mod pair_watcher;
 pub mod pairing;
 pub mod publish;
 pub mod rate_limit;
