@@ -19,12 +19,49 @@ use openhost_core::pkarr_record::{OpenhostRecord, SignedRecord};
 use pkarr::{Client, SignedPacket, Timestamp};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 /// Default republish interval: 30 minutes (per spec §1).
 pub const REPUBLISH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Number of attempts (including the first try) for the initial publish.
+/// After this many consecutive failures the publisher falls back to the
+/// normal 30-minute republish cadence.
+pub const INITIAL_PUBLISH_ATTEMPTS: u32 = 3;
+
+/// Base delay for the initial-publish exp-backoff schedule. After each
+/// failed attempt the publisher sleeps `INITIAL_PUBLISH_BACKOFF * 2.pow(N-1)`
+/// before the next try, where N is the attempt that just failed.
+///
+/// Concrete schedule with `INITIAL_PUBLISH_ATTEMPTS = 3`:
+/// - attempt 1 fires at t = 0
+/// - if it fails, sleep 500 ms
+/// - attempt 2 fires at t = 500 ms
+/// - if it fails, sleep 1000 ms
+/// - attempt 3 fires at t = 1500 ms
+/// - if it fails, fall through to the regular republish ticker
+///
+/// No jitter: the retry budget is bounded (3 attempts) and a single
+/// daemon starting up does not contend for relay capacity against
+/// itself, so the textbook "jitter to avoid thundering herd" argument
+/// doesn't apply. Deterministic timing also makes the behaviour easy
+/// to test.
+pub const INITIAL_PUBLISH_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Outcome of the initial-publish retry loop. Observable via
+/// [`PublisherHandle::await_initial_publish`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialPublishOutcome {
+    /// At least one attempt succeeded. Inner value is the published
+    /// `record.ts` (= BEP44 `seq`).
+    Succeeded(u64),
+    /// Every attempt in the retry budget failed. The publisher task is
+    /// still running; subsequent triggers or scheduled republishes can
+    /// still succeed.
+    Exhausted,
+}
 
 /// Abstracts over anything that can publish a signed pkarr packet. Implemented
 /// by [`PkarrTransport`] (wrapping `pkarr::Client`) and by test fakes.
@@ -79,6 +116,11 @@ pub struct PublisherHandle {
     // path. On the shutdown path the handle is `None` by the time `Drop`
     // fires and the abort is a no-op.
     task: Option<JoinHandle<()>>,
+    /// `None` until the initial-publish retry loop produces a terminal
+    /// outcome; `Some(_)` thereafter. Exposed via
+    /// [`PublisherHandle::await_initial_publish`] so supervisors can
+    /// gate startup on reachability without scraping logs.
+    initial_publish_rx: watch::Receiver<Option<InitialPublishOutcome>>,
 }
 
 impl PublisherHandle {
@@ -93,6 +135,34 @@ impl PublisherHandle {
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
+        }
+    }
+
+    /// Wait until the initial-publish retry loop produces a terminal
+    /// outcome. Returns [`InitialPublishOutcome::Succeeded`] when any
+    /// attempt lands and [`InitialPublishOutcome::Exhausted`] after the
+    /// final retry fails.
+    ///
+    /// Typical use: the daemon's `App::build` awaits this with a timeout
+    /// before declaring "openhostd: up", so a slow relay doesn't leave
+    /// the daemon claiming to be reachable while it still isn't.
+    /// Supervisors that want a fire-and-forget bootstrap can skip calling
+    /// this entirely.
+    ///
+    /// Safe to call multiple times and from multiple tasks (the method
+    /// clones the underlying `watch::Receiver`).
+    pub async fn await_initial_publish(&self) -> InitialPublishOutcome {
+        let mut rx = self.initial_publish_rx.clone();
+        loop {
+            if let Some(outcome) = *rx.borrow_and_update() {
+                return outcome;
+            }
+            if rx.changed().await.is_err() {
+                // Sender dropped (task exited before publishing anything,
+                // e.g. aborted). Treat as Exhausted — the contract is
+                // "we won't make more attempts", which is truthful.
+                return InitialPublishOutcome::Exhausted;
+            }
         }
     }
 }
@@ -166,19 +236,23 @@ impl Publisher {
     /// plus whenever [`PublisherHandle::trigger`] is called.
     pub fn spawn(mut self) -> PublisherHandle {
         let (trigger_tx, mut trigger_rx) = mpsc::channel::<()>(1);
+        let (initial_publish_tx, initial_publish_rx) =
+            watch::channel::<Option<InitialPublishOutcome>>(None);
         let period = self.interval;
 
         let task = tokio::spawn(async move {
             // Fire an immediate publish so a freshly-spawned publisher is
             // reachable without waiting for the first tick.
             //
-            // TODO(M3): retry the initial publish with exponential backoff (3
-            // attempts) before falling back to the 30-minute cadence. A single
-            // transient relay failure here leaves the host undiscoverable until
-            // the next scheduled tick.
-            if let Err(err) = self.publish_once().await {
-                tracing::warn!(?err, "openhost-pkarr: initial publish failed");
-            }
+            // Exp-backoff retry: a single transient relay blip shouldn't
+            // leave the host undiscoverable until the next scheduled
+            // tick. Cap is intentionally low — after three consecutive
+            // failures the next attempt is the regular 30-minute tick
+            // anyway, and a loud warn! is the right signal for operators.
+            // `initial_publish_tx` is notified on every terminal outcome
+            // so supervisors that called `await_initial_publish` can
+            // proceed without scraping logs.
+            initial_publish_with_retry(&mut self, &initial_publish_tx).await;
 
             let mut ticker = interval(period);
             // The first tick returns immediately; skip it so we don't republish
@@ -212,6 +286,51 @@ impl Publisher {
         PublisherHandle {
             trigger_tx,
             task: Some(task),
+            initial_publish_rx,
+        }
+    }
+}
+
+// --- Helpers --------------------------------------------------------------
+
+/// Drive the first publish through [`INITIAL_PUBLISH_ATTEMPTS`] tries with
+/// `INITIAL_PUBLISH_BACKOFF * 2^(n-1)` between attempts. Logs at `info!` on
+/// the first success, `warn!` on every intermediate failure, `error!` if
+/// every attempt fails. In every terminal branch the outcome is published
+/// on `outcome_tx` so waiters on [`PublisherHandle::await_initial_publish`]
+/// can unblock.
+async fn initial_publish_with_retry(
+    publisher: &mut Publisher,
+    outcome_tx: &watch::Sender<Option<InitialPublishOutcome>>,
+) {
+    for attempt in 1..=INITIAL_PUBLISH_ATTEMPTS {
+        match publisher.publish_once().await {
+            Ok(ts) => {
+                tracing::info!(attempt, "openhost-pkarr: initial publish succeeded");
+                let _ = outcome_tx.send(Some(InitialPublishOutcome::Succeeded(ts)));
+                return;
+            }
+            Err(err) => {
+                let last = attempt == INITIAL_PUBLISH_ATTEMPTS;
+                if last {
+                    tracing::error!(
+                        ?err,
+                        attempt,
+                        "openhost-pkarr: initial publish failed after {INITIAL_PUBLISH_ATTEMPTS} attempts; \
+                         host will be undiscoverable until the next scheduled republish"
+                    );
+                    let _ = outcome_tx.send(Some(InitialPublishOutcome::Exhausted));
+                    return;
+                }
+                let backoff = INITIAL_PUBLISH_BACKOFF * 2u32.pow(attempt - 1);
+                tracing::warn!(
+                    ?err,
+                    attempt,
+                    retry_in_ms = backoff.as_millis() as u64,
+                    "openhost-pkarr: initial publish failed, retrying",
+                );
+                tokio::time::sleep(backoff).await;
+            }
         }
     }
 }
@@ -331,6 +450,144 @@ mod tests {
         // having moved forward.
         assert!(publisher.publish_once().await.is_err());
         assert_eq!(publisher.last_seq, Some(seed_ts));
+    }
+
+    /// Transport that fails the first `fail_count` calls and then succeeds.
+    /// Counts every call so the caller can assert how many attempts landed.
+    struct FlakyTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_count: usize,
+    }
+
+    impl FlakyTransport {
+        fn new(fail_count: usize) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_count,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Transport for FlakyTransport {
+        async fn publish(&self, _packet: &SignedPacket, _cas: Option<Timestamp>) -> Result<()> {
+            let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < self.fail_count {
+                Err(PkarrError::NotFound)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_publish_retries_until_success() {
+        // Fail the first two attempts; the third must succeed inside the
+        // retry budget (attempts 1/2/3 at 0ms / 500ms / 1500ms virtual).
+        let transport = Arc::new(FlakyTransport::new(2));
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let record_source: RecordSource = Box::new(|| sample_record(1_700_000_000));
+
+        let publisher = Publisher::new(transport.clone(), sk, record_source, None)
+            .with_interval(Duration::from_secs(3600)); // keep the ticker out
+        let handle = publisher.spawn();
+
+        // Advance virtual time past the two 500ms / 1000ms backoffs.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            transport.call_count(),
+            3,
+            "expected attempt 1 (fail) + attempt 2 (fail) + attempt 3 (success)"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_publish_gives_up_after_max_attempts() {
+        // All-fail: publisher attempts exactly INITIAL_PUBLISH_ATTEMPTS
+        // times, then falls through to the 30-min ticker without taking
+        // down the task.
+        let transport = Arc::new(FlakyTransport::new(usize::MAX));
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let record_source: RecordSource = Box::new(|| sample_record(1_700_000_000));
+
+        let publisher = Publisher::new(transport.clone(), sk, record_source, None)
+            .with_interval(Duration::from_secs(3600));
+        let handle = publisher.spawn();
+
+        // Cover the full retry schedule: 0ms + 500ms + 1000ms = 1.5s. 2s is
+        // comfortably past.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            transport.call_count(),
+            INITIAL_PUBLISH_ATTEMPTS as usize,
+            "publisher must not exceed its retry budget"
+        );
+
+        // The task must still be alive — a later tick could still succeed.
+        // Verify by triggering an immediate republish and confirming one
+        // more call fires.
+        handle.trigger();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            transport.call_count(),
+            INITIAL_PUBLISH_ATTEMPTS as usize + 1,
+            "task must still be running and able to service triggers after a failed initial publish"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_initial_publish_returns_succeeded_on_first_try() {
+        let transport = Arc::new(FakeTransport::default());
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let expected_ts = 1_700_000_000u64;
+        let record_source: RecordSource = Box::new(move || sample_record(expected_ts));
+
+        let publisher = Publisher::new(transport.clone(), sk, record_source, None)
+            .with_interval(Duration::from_secs(3600));
+        let handle = publisher.spawn();
+
+        // The virtual-time runtime will auto-advance past the publisher
+        // task's await points; `await_initial_publish` must resolve once
+        // the first attempt returns Ok.
+        match handle.await_initial_publish().await {
+            InitialPublishOutcome::Succeeded(ts) => assert_eq!(ts, expected_ts),
+            other => panic!("expected Succeeded, got {other:?}"),
+        }
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_initial_publish_returns_exhausted_after_all_fail() {
+        let transport = Arc::new(FlakyTransport::new(usize::MAX));
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let record_source: RecordSource = Box::new(|| sample_record(1_700_000_000));
+
+        let publisher = Publisher::new(transport.clone(), sk, record_source, None)
+            .with_interval(Duration::from_secs(3600));
+        let handle = publisher.spawn();
+
+        match handle.await_initial_publish().await {
+            InitialPublishOutcome::Exhausted => {}
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+        assert_eq!(
+            transport.call_count(),
+            INITIAL_PUBLISH_ATTEMPTS as usize,
+            "Exhausted should only fire after the full retry budget"
+        );
+
+        handle.shutdown().await;
     }
 
     #[tokio::test]

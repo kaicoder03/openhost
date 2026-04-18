@@ -37,7 +37,8 @@ pub use codec::{
 };
 pub use error::{PkarrError, Result};
 pub use publisher::{
-    PkarrTransport, Publisher, PublisherHandle, RecordSource, Transport, REPUBLISH_INTERVAL,
+    InitialPublishOutcome, PkarrTransport, Publisher, PublisherHandle, RecordSource, Transport,
+    INITIAL_PUBLISH_ATTEMPTS, INITIAL_PUBLISH_BACKOFF, REPUBLISH_INTERVAL,
 };
 pub use relays::DEFAULT_RELAYS;
-pub use resolver::{PkarrResolve, Resolve, Resolver};
+pub use resolver::{PkarrResolve, Resolve, Resolver, GRACE_WINDOW};
