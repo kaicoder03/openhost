@@ -24,8 +24,20 @@ use crate::publish::SharedState;
 use bytes::Bytes;
 use openhost_core::identity::SigningKey;
 use openhost_core::wire::{Frame, FrameType};
+use std::collections::HashMap;
 use std::sync::{Arc, Once};
 use tokio::sync::Mutex;
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::api::{APIBuilder, API};
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::dtls_transport::dtls_role::DTLSRole;
+use webrtc::dtls_transport::dtls_transport_state::RTCDtlsTransportState;
+use webrtc::peer_connection::certificate::RTCCertificate;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 
 /// Ensures the rustls CryptoProvider is installed exactly once per
 /// process. Required in rustls 0.23+ because the crate no longer picks
@@ -35,22 +47,14 @@ static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
 
 fn install_crypto_provider_once() {
     INSTALL_CRYPTO_PROVIDER.call_once(|| {
-        // The install may fail if a provider was already installed
-        // earlier in the process (e.g. by a different test harness);
-        // ignoring the `Err` is safe — we only need one to be active.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        match rustls::crypto::ring::default_provider().install_default() {
+            Ok(()) => tracing::debug!("openhost-daemon: installed rustls `ring` crypto provider"),
+            Err(_existing) => tracing::debug!(
+                "openhost-daemon: rustls CryptoProvider already installed; using existing"
+            ),
+        }
     });
 }
-use webrtc::api::setting_engine::SettingEngine;
-use webrtc::api::{APIBuilder, API};
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::dtls_transport::dtls_role::DTLSRole;
-use webrtc::dtls_transport::dtls_transport_state::RTCDtlsTransportState;
-use webrtc::peer_connection::certificate::RTCCertificate;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 
 /// Default budget for `handle_offer`. Covers SDP apply + ICE trickle +
 /// set_local_description. Tests can override via [`PassivePeer::with_offer_timeout`].
@@ -59,16 +63,28 @@ const DEFAULT_OFFER_TIMEOUT_SECS: u64 = 10;
 /// Fixed 502 body the stub listener replies with on every `REQUEST_HEAD`.
 /// Replaced by the real localhost-forward response in PR #6. The wire
 /// format is HTTP/1.1 (spec §4 per frame type 0x11).
-pub(crate) const RESPONSE_502_HEAD: &[u8] =
-    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+const RESPONSE_502_HEAD: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+
+/// Map key identifying one tracked `RTCPeerConnection`. We use the
+/// `Arc::as_ptr` value: unique per Arc allocation, stable for the
+/// lifetime of the map entry (because the entry keeps the Arc alive),
+/// cheap to compute, and no dep on `uuid`.
+type PcKey = usize;
+
+fn pc_key(pc: &Arc<RTCPeerConnection>) -> PcKey {
+    Arc::as_ptr(pc) as PcKey
+}
 
 /// The daemon's passive WebRTC peer.
 ///
 /// Holds a single `webrtc::api::API` so every inbound offer shares one
 /// `RTCCertificate` (the one whose fingerprint is pinned in the
 /// published record). `PassivePeer` keeps active `RTCPeerConnection`s
-/// alive inside a `Mutex<Vec<Arc<RTCPeerConnection>>>` so they aren't
-/// dropped the moment `handle_offer` returns the answer SDP.
+/// alive inside a `Mutex<HashMap<PcKey, Arc<RTCPeerConnection>>>` so
+/// they aren't dropped the moment `handle_offer` returns the answer
+/// SDP, AND so they're removed when their state reaches a terminal
+/// value (`Closed` / `Failed` / `Disconnected`). The prune hook is what
+/// prevents a long-running daemon from accumulating dead PCs forever.
 pub struct PassivePeer {
     api: Arc<API>,
     certificate: RTCCertificate,
@@ -76,7 +92,7 @@ pub struct PassivePeer {
     identity: Arc<SigningKey>,
     #[allow(dead_code)] // read by future rotation-consistency checks
     state: Arc<SharedState>,
-    active: Mutex<Vec<Arc<RTCPeerConnection>>>,
+    active: Arc<Mutex<HashMap<PcKey, Arc<RTCPeerConnection>>>>,
     offer_timeout_secs: u64,
 }
 
@@ -109,14 +125,19 @@ impl PassivePeer {
             certificate,
             identity,
             state,
-            active: Mutex::new(Vec::new()),
+            active: Arc::new(Mutex::new(HashMap::new())),
             offer_timeout_secs: DEFAULT_OFFER_TIMEOUT_SECS,
         })
     }
 
-    /// Override the `handle_offer` timeout budget. Tests use this to
-    /// fail fast when an offer is intentionally malformed past the SDP
-    /// layer.
+    /// Override the `handle_offer` timeout budget.
+    ///
+    /// **Note:** as of PR #5 no test actually exercises the timeout
+    /// path (constructing an SDP that's valid enough to pass
+    /// `check_setup_role_is_active` but hangs inside webrtc-rs's
+    /// `set_remote_description` is awkward). If the webrtc crate ever
+    /// changes its hang-on-malformed-offer behaviour, this timeout may
+    /// stop firing silently.
     pub fn with_offer_timeout(mut self, secs: u64) -> Self {
         self.offer_timeout_secs = secs;
         self
@@ -144,7 +165,8 @@ impl PassivePeer {
     }
 
     /// Number of currently-tracked peer connections. Used by tests and
-    /// future diagnostics.
+    /// future diagnostics. Kept `pub` so integration tests that assert
+    /// pruning behaviour can observe it.
     pub async fn active_count(&self) -> usize {
         self.active.lock().await.len()
     }
@@ -152,7 +174,7 @@ impl PassivePeer {
     /// Close every tracked peer connection and drop its slot.
     pub async fn shutdown(&self) {
         let peers = std::mem::take(&mut *self.active.lock().await);
-        for pc in peers {
+        for (_key, pc) in peers {
             let _ = pc.close().await;
         }
     }
@@ -164,11 +186,13 @@ impl PassivePeer {
         };
         let pc = Arc::new(self.api.new_peer_connection(config).await?);
 
-        // Wire the DataChannel handler and the DTLS-state observer BEFORE
-        // applying the remote description — webrtc-rs fires handlers off
-        // internal event loops that can race the DTLS handshake start.
+        // Wire the DataChannel handler, the DTLS-state observer, and the
+        // peer-connection-state prune hook BEFORE applying the remote
+        // description — webrtc-rs fires handlers off internal event loops
+        // that can race the DTLS handshake start.
         wire_data_channel_handler(Arc::clone(&pc));
-        wire_dtls_state_observer(Arc::clone(&pc), self.certificate.clone());
+        wire_dtls_state_observer(Arc::clone(&pc));
+        wire_prune_on_terminal_state(Arc::clone(&pc), Arc::clone(&self.active));
 
         let offer = RTCSessionDescription::offer(offer_sdp.to_string())?;
         pc.set_remote_description(offer).await?;
@@ -190,8 +214,10 @@ impl PassivePeer {
             ))?;
 
         // Keep the PC alive so the DTLS handshake can complete after we
-        // return the answer SDP.
-        self.active.lock().await.push(pc);
+        // return the answer SDP. The prune hook wired above will remove
+        // this entry on Closed / Failed / Disconnected.
+        let key = pc_key(&pc);
+        self.active.lock().await.insert(key, pc);
 
         Ok(local_desc.sdp)
     }
@@ -237,7 +263,7 @@ fn check_setup_role_is_active(sdp: &str) -> Result<(), ListenerError> {
 
 /// Log when DTLS reaches `Connected` state and mark the channel-binding
 /// TODO. Called once per `RTCPeerConnection` during setup.
-fn wire_dtls_state_observer(pc: Arc<RTCPeerConnection>, _cert: RTCCertificate) {
+fn wire_dtls_state_observer(pc: Arc<RTCPeerConnection>) {
     pc.sctp()
         .transport()
         .on_state_change(Box::new(move |state: RTCDtlsTransportState| {
@@ -271,6 +297,41 @@ fn wire_dtls_state_observer(pc: Arc<RTCPeerConnection>, _cert: RTCCertificate) {
                 }
             })
         }));
+}
+
+/// Register the peer-connection-state callback that prunes `active`
+/// when this PC reaches a terminal state (Closed / Failed /
+/// Disconnected). Captures only a `Weak` to the map + the PcKey
+/// (`usize`), so the callback doesn't form an Arc cycle with the PC
+/// itself — once the map removes the entry, both drop cleanly.
+fn wire_prune_on_terminal_state(
+    pc: Arc<RTCPeerConnection>,
+    active: Arc<Mutex<HashMap<PcKey, Arc<RTCPeerConnection>>>>,
+) {
+    let key = pc_key(&pc);
+    let weak_active = Arc::downgrade(&active);
+    pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+        let weak_active = weak_active.clone();
+        Box::pin(async move {
+            if matches!(
+                state,
+                RTCPeerConnectionState::Closed
+                    | RTCPeerConnectionState::Failed
+                    | RTCPeerConnectionState::Disconnected
+            ) {
+                if let Some(active) = weak_active.upgrade() {
+                    let removed = active.lock().await.remove(&key).is_some();
+                    if removed {
+                        tracing::debug!(
+                            ?state,
+                            pc_key = key,
+                            "openhostd: pruning terminal peer connection"
+                        );
+                    }
+                }
+            }
+        })
+    }));
 }
 
 /// Register the `on_data_channel` handler that converts raw

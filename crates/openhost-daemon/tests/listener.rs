@@ -206,6 +206,16 @@ async fn dtls_handshake_and_502_response_roundtrip() -> DaemonResult<()> {
         "answer SDP missing expected fingerprint {expected_fp_colon}"
     );
 
+    // Spec §3.1: the daemon MUST assert `a=setup:passive` in its answer.
+    // The listener pins DTLSRole::Server via SettingEngine; this assertion
+    // locks that invariant end-to-end. If webrtc-rs ever flips the mapping
+    // between `DTLSRole::Server` and the emitted `a=setup:` value, we'd
+    // fail-fast here instead of silently violating spec.
+    assert!(
+        answer_sdp.contains("a=setup:passive"),
+        "answer SDP must assert a=setup:passive per spec \u{00a7}3.1; got:\n{answer_sdp}"
+    );
+
     // Apply the answer.
     let answer = RTCSessionDescription::answer(answer_sdp).expect("parse answer");
     client_pc
@@ -292,4 +302,192 @@ fn wire_client_dc_capture(
             }
         })
     }));
+}
+
+/// Everything a test needs after a successful handshake: the client
+/// PC, its open data channel, a byte accumulator for inbound frames,
+/// and a `first_byte` signal. `received.lock().await.clone()` reads the
+/// accumulated DC bytes at any moment.
+struct ClientSession {
+    client_pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    dc: Arc<RTCDataChannel>,
+    received: Arc<Mutex<Vec<u8>>>,
+    first_byte_rx: mpsc::Receiver<()>,
+}
+
+impl ClientSession {
+    async fn close(self) {
+        let _ = self.dc.close().await;
+        let _ = self.client_pc.close().await;
+    }
+}
+
+/// Drive one full offer/answer/ICE/DTLS/SCTP setup between a fresh
+/// client `RTCPeerConnection` and the daemon. Returns a [`ClientSession`]
+/// the caller can send frames through.
+async fn establish_connection(app: &App) -> ClientSession {
+    let client_api = APIBuilder::new().build();
+    let client_pc = Arc::new(
+        client_api
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .expect("client pc builds"),
+    );
+
+    let (connected_tx, mut connected_rx) = mpsc::channel::<()>(1);
+    {
+        let connected_tx = connected_tx.clone();
+        client_pc.on_peer_connection_state_change(Box::new(move |state| {
+            let connected_tx = connected_tx.clone();
+            Box::pin(async move {
+                if state == RTCPeerConnectionState::Connected {
+                    let _ = connected_tx.try_send(());
+                }
+            })
+        }));
+    }
+
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let (first_byte_tx, first_byte_rx) = mpsc::channel::<()>(1);
+    let (dc_open_tx, mut dc_open_rx) = mpsc::channel::<()>(1);
+
+    let dc = client_pc
+        .create_data_channel("openhost", Some(RTCDataChannelInit::default()))
+        .await
+        .expect("client DC");
+
+    {
+        let dc_open_tx = dc_open_tx.clone();
+        dc.on_open(Box::new(move || {
+            let dc_open_tx = dc_open_tx.clone();
+            Box::pin(async move {
+                let _ = dc_open_tx.try_send(());
+            })
+        }));
+    }
+    wire_client_dc_capture(&dc, Arc::clone(&received), first_byte_tx);
+
+    let offer = client_pc.create_offer(None).await.expect("create_offer");
+    client_pc
+        .set_local_description(offer)
+        .await
+        .expect("set_local_description");
+    let mut client_gather = client_pc.gathering_complete_promise().await;
+    let _ = client_gather.recv().await;
+    let offer_sdp = client_pc.local_description().await.unwrap().sdp;
+
+    let answer_sdp = app.handle_offer(&offer_sdp).await.expect("daemon answers");
+    let answer = RTCSessionDescription::answer(answer_sdp).expect("parse answer");
+    client_pc
+        .set_remote_description(answer)
+        .await
+        .expect("set_remote_description");
+
+    tokio::time::timeout(Duration::from_secs(5), connected_rx.recv())
+        .await
+        .expect("DTLS handshake timed out")
+        .expect("connected channel closed");
+    tokio::time::timeout(Duration::from_secs(5), dc_open_rx.recv())
+        .await
+        .expect("data channel didn't open within 5s")
+        .expect("dc_open channel closed");
+
+    ClientSession {
+        client_pc,
+        dc,
+        received,
+        first_byte_rx,
+    }
+}
+
+#[tokio::test]
+async fn request_body_and_end_still_yield_a_single_502_response() -> DaemonResult<()> {
+    // PR #5 stub behaviour: the listener replies 502 on REQUEST_HEAD and
+    // silently drops REQUEST_BODY / REQUEST_END / PING / PONG. This
+    // test pins that behaviour so PR #6 (localhost forwarder) can't
+    // silently regress the current contract while it restructures frame
+    // handling.
+    let (_tmp, app) = build_daemon().await;
+    let mut session = establish_connection(&app).await;
+
+    let head = Frame::new(
+        FrameType::RequestHead,
+        b"POST /x HTTP/1.1\r\nHost: example\r\nContent-Length: 5\r\n\r\n".to_vec(),
+    )
+    .unwrap();
+    let body = Frame::new(FrameType::RequestBody, b"hello".to_vec()).unwrap();
+    let end = Frame::new(FrameType::RequestEnd, vec![]).unwrap();
+    let mut wire = Vec::new();
+    head.encode(&mut wire);
+    body.encode(&mut wire);
+    end.encode(&mut wire);
+    session.dc.send(&Bytes::from(wire)).await.expect("send");
+
+    tokio::time::timeout(Duration::from_secs(5), session.first_byte_rx.recv())
+        .await
+        .expect("timed out waiting for daemon response")
+        .expect("response channel closed");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bytes = session.received.lock().await.clone();
+
+    let (head, consumed) = Frame::try_decode(&bytes).unwrap().unwrap();
+    assert_eq!(head.frame_type, FrameType::ResponseHead);
+    assert!(std::str::from_utf8(&head.payload)
+        .unwrap()
+        .starts_with("HTTP/1.1 502 "),);
+
+    let (end, consumed2) = Frame::try_decode(&bytes[consumed..]).unwrap().unwrap();
+    assert_eq!(end.frame_type, FrameType::ResponseEnd);
+    assert!(end.payload.is_empty());
+
+    // Exactly one 502 pair — no extra frames from the body/end being
+    // interpreted as additional requests.
+    assert_eq!(
+        bytes.len(),
+        consumed + consumed2,
+        "daemon emitted unexpected extra bytes; drop semantics for body/end regressed"
+    );
+
+    session.close().await;
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_count_drops_after_peer_closes() -> DaemonResult<()> {
+    // The daemon must not accumulate dead RTCPeerConnections. After a
+    // client closes its side, the daemon-side PC transitions to
+    // Disconnected/Closed and the prune hook MUST remove it from the
+    // listener's active map.
+    let (_tmp, app) = build_daemon().await;
+
+    let session_a = establish_connection(&app).await;
+    let session_b = establish_connection(&app).await;
+    assert_eq!(
+        app.listener().active_count().await,
+        2,
+        "both PCs should be tracked after setup"
+    );
+
+    // Close one client; the daemon's PC should soon transition and prune.
+    session_a.close().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if app.listener().active_count().await <= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "daemon still holds {} peer connections 10 s after one closed; \
+                 prune hook regressed",
+                app.listener().active_count().await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    session_b.close().await;
+    app.shutdown().await;
+    Ok(())
 }
