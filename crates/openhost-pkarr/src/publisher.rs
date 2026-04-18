@@ -153,6 +153,11 @@ impl Publisher {
         let task = tokio::spawn(async move {
             // Fire an immediate publish so a freshly-spawned publisher is
             // reachable without waiting for the first tick.
+            //
+            // TODO(M3): retry the initial publish with exponential backoff (3
+            // attempts) before falling back to the 30-minute cadence. A single
+            // transient relay failure here leaves the host undiscoverable until
+            // the next scheduled tick.
             if let Err(err) = self.publish_once().await {
                 tracing::warn!(?err, "openhost-pkarr: initial publish failed");
             }

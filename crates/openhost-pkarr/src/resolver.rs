@@ -79,8 +79,8 @@ impl Resolver {
         cached_seq: Option<u64>,
     ) -> Result<SignedRecord> {
         let pk_bytes: [u8; PUBLIC_KEY_LEN] = pubkey.to_bytes();
-        let pkarr_pk = pkarr::PublicKey::try_from(&pk_bytes)
-            .map_err(|_| PkarrError::MalformedCanonical("pkarr PublicKey conversion"))?;
+        let pkarr_pk =
+            pkarr::PublicKey::try_from(&pk_bytes).map_err(|_| PkarrError::PublicKeyConversion)?;
 
         let packet = self
             .client

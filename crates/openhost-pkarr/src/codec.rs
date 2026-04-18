@@ -23,13 +23,14 @@ use crate::error::{PkarrError, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::Signature;
-use openhost_core::identity::{PublicKey, SigningKey, PUBLIC_KEY_LEN, SIGNING_KEY_LEN};
+use openhost_core::identity::{PublicKey, SigningKey, PUBLIC_KEY_LEN};
 use openhost_core::pkarr_record::{
     IceBlob, OpenhostRecord, SignedRecord, ALLOW_ENTRY_LEN, CLIENT_HASH_LEN, DTLS_FINGERPRINT_LEN,
     MAX_DISC_LEN, PROTOCOL_VERSION, SALT_LEN,
 };
 use pkarr::dns::Name;
 use pkarr::{Keypair, SignedPacket, Timestamp};
+use zeroize::Zeroizing;
 
 /// The TXT record name at which the encoded openhost blob is stored.
 pub const OPENHOST_TXT_NAME: &str = "_openhost";
@@ -72,7 +73,7 @@ pub fn encode(signed: &SignedRecord, signing_key: &SigningKey) -> Result<SignedP
 
     let encoded = URL_SAFE_NO_PAD.encode(&blob);
 
-    let seed: [u8; SIGNING_KEY_LEN] = signing_key.to_bytes();
+    let seed = Zeroizing::new(signing_key.to_bytes());
     let keypair = Keypair::from_secret_key(&seed);
 
     let name = Name::new_unchecked(OPENHOST_TXT_NAME);
@@ -126,6 +127,7 @@ pub fn decode(packet: &SignedPacket) -> Result<SignedRecord> {
     let signature = Signature::from_bytes(&sig_bytes);
 
     let record = parse_canonical_bytes(&blob[SIGNATURE_LEN..])?;
+    record.validate(record.ts)?;
 
     Ok(SignedRecord { record, signature })
 }
@@ -419,6 +421,23 @@ mod tests {
             decode(&packet),
             Err(PkarrError::BlobTooShort { .. })
         ));
+    }
+
+    #[test]
+    fn bep44_sig_flip_fails_deserialization() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let signed = SignedRecord::sign(reference_record(), &sk).unwrap();
+        let packet = encode(&signed, &sk).unwrap();
+
+        // as_bytes() layout: [0..32]=pk  [32..96]=BEP44-sig  [96..104]=ts  [104..]=DNS
+        let mut wire = packet.as_bytes().to_vec();
+        wire[32] ^= 0xFF; // flip first byte of the BEP44 Ed25519 signature
+
+        // pkarr rejects the tampered bytes before we even get to decode().
+        assert!(
+            SignedPacket::deserialize(&wire).is_err(),
+            "tampered BEP44 sig must fail pkarr deserialization"
+        );
     }
 
     #[test]

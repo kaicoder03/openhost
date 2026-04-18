@@ -85,4 +85,8 @@ pub enum PkarrError {
     /// a compare-and-swap conflict rejected the write).
     #[error("pkarr publish error: {0}")]
     Publish(#[from] pkarr::errors::PublishError),
+
+    /// The openhost `PublicKey` could not be converted to a pkarr `PublicKey`.
+    #[error("failed to convert openhost public key to pkarr public key")]
+    PublicKeyConversion,
 }
