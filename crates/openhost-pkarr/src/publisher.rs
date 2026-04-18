@@ -67,9 +67,18 @@ pub type RecordSource = Box<dyn FnMut() -> OpenhostRecord + Send>;
 
 /// Handle returned from [`Publisher::spawn`] — keeps the background task
 /// alive and provides a trigger channel for on-demand republishes.
+///
+/// Dropping the handle aborts the background task; explicit [`shutdown`]
+/// does the same and additionally awaits task completion.
+///
+/// [`shutdown`]: PublisherHandle::shutdown
 pub struct PublisherHandle {
     trigger_tx: mpsc::Sender<()>,
-    task: JoinHandle<()>,
+    // `Option` so `shutdown` can `take()` the `JoinHandle` to await it,
+    // while `Drop` still has something to `abort()` on the non-shutdown
+    // path. On the shutdown path the handle is `None` by the time `Drop`
+    // fires and the abort is a no-op.
+    task: Option<JoinHandle<()>>,
 }
 
 impl PublisherHandle {
@@ -80,15 +89,24 @@ impl PublisherHandle {
     }
 
     /// Abort the background republish task and await its completion.
-    pub async fn shutdown(self) {
-        self.task.abort();
-        let _ = self.task.await;
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
+}
 
-    /// Borrow the underlying `JoinHandle` for callers that want their own
-    /// shutdown semantics.
-    pub fn task(&self) -> &JoinHandle<()> {
-        &self.task
+impl Drop for PublisherHandle {
+    fn drop(&mut self) {
+        // If the caller never invoked `shutdown`, make sure the background
+        // task is cancelled — otherwise it would keep republishing with the
+        // `Arc<SigningKey>` until process exit, because the tokio `interval`
+        // arm inside `spawn` never resolves to an error that could trigger
+        // `select!`'s `else` branch on its own.
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -174,53 +192,35 @@ impl Publisher {
                             tracing::warn!(?err, "openhost-pkarr: scheduled republish failed");
                         }
                     }
-                    Some(()) = trigger_rx.recv() => {
-                        if let Err(err) = self.publish_once().await {
-                            tracing::warn!(?err, "openhost-pkarr: triggered republish failed");
+                    trigger = trigger_rx.recv() => match trigger {
+                        Some(()) => {
+                            if let Err(err) = self.publish_once().await {
+                                tracing::warn!(?err, "openhost-pkarr: triggered republish failed");
+                            }
                         }
+                        // Trigger channel closed: the `PublisherHandle` was
+                        // dropped without calling `shutdown`. `Drop` for the
+                        // handle already aborts us, but exit the loop cleanly
+                        // in case someone kept the handle alive only through
+                        // the task itself.
+                        None => break,
                     }
-                    else => break,
                 }
             }
         });
 
-        PublisherHandle { trigger_tx, task }
+        PublisherHandle {
+            trigger_tx,
+            task: Some(task),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openhost_core::crypto::allowlist_hash;
-    use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
-    };
+    use crate::test_support::{sample_record, RFC_SEED};
     use std::sync::Mutex;
-
-    const RFC_SEED: [u8; 32] = [
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ];
-
-    fn sample_record(ts: u64) -> OpenhostRecord {
-        let salt = [0x11u8; SALT_LEN];
-        let client_pk = [0xAAu8; 32];
-        let hash = allowlist_hash(&salt, &client_pk);
-        OpenhostRecord {
-            version: PROTOCOL_VERSION,
-            ts,
-            dtls_fp: [0x42u8; DTLS_FINGERPRINT_LEN],
-            roles: "server".to_string(),
-            salt,
-            allow: vec![hash],
-            ice: vec![IceBlob {
-                client_hash: hash.to_vec(),
-                ciphertext: vec![0xEE; 72],
-            }],
-            disc: "dht=1".to_string(),
-        }
-    }
 
     #[derive(Default)]
     struct FakeTransport {
@@ -295,6 +295,43 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    /// Transport that always reports a publish failure — lets us verify that
+    /// `publish_once` leaves `last_seq` unchanged after an error.
+    struct FailingTransport;
+
+    #[async_trait]
+    impl Transport for FailingTransport {
+        async fn publish(&self, _packet: &SignedPacket, _cas: Option<Timestamp>) -> Result<()> {
+            Err(PkarrError::NotFound)
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_failure_leaves_last_seq_unchanged() {
+        let transport = Arc::new(FailingTransport);
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+
+        let seed_ts: u64 = 1_699_000_000;
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let record_source: RecordSource = Box::new(move || {
+            let i = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sample_record(1_700_000_000 + i * 10)
+        });
+
+        let mut publisher =
+            Publisher::new(transport.clone(), sk, record_source, Some(seed_ts));
+
+        // First publish fails — `last_seq` MUST remain at the seeded value
+        // so the next attempt still sends the correct CAS.
+        assert!(publisher.publish_once().await.is_err());
+        assert_eq!(publisher.last_seq, Some(seed_ts));
+
+        // Second failure: same invariant, regardless of the record_source
+        // having moved forward.
+        assert!(publisher.publish_once().await.is_err());
+        assert_eq!(publisher.last_seq, Some(seed_ts));
     }
 
     #[tokio::test]

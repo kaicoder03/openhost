@@ -26,7 +26,7 @@ openhost uses three public substrates, in descending order of preference for res
 
 ### 2.1 Public Pkarr HTTP relays
 
-Pkarr relays are HTTPS endpoints that accept signed BEP44 records and serve them to clients. A client implementation **MUST** ship with a bundled list of known public relays, **MUST** query at least three in parallel for any resolution, and **MUST** accept the record with the highest `seq` value whose signature and internal timestamp both validate.
+Pkarr relays are HTTPS endpoints that accept signed BEP44 records and serve them to clients. A client implementation **MUST** ship with a bundled list of known public relays, **MUST** query at least three independent substrates in parallel for any resolution (the bundled relays plus the Mainline DHT on native platforms, or — on browsers, where UDP is unavailable — at least three relays), and **MUST** accept the record with the highest `seq` value whose signature and internal timestamp both validate.
 
 Browsers cannot speak the Mainline DHT directly (no UDP in the browser sandbox), so Pkarr relays are the primary substrate for the browser extension.
 

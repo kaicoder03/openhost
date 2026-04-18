@@ -59,35 +59,11 @@ pub fn build_event(signed: &SignedRecord, signing_key: &SigningKey) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openhost_core::crypto::allowlist_hash;
-    use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
-    };
-
-    const RFC_SEED: [u8; 32] = [
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ];
+    use crate::test_support::{sample_record, RFC_SEED};
 
     fn sample_signed() -> (SigningKey, SignedRecord) {
         let sk = SigningKey::from_bytes(&RFC_SEED);
-        let salt = [0x11u8; SALT_LEN];
-        let hash = allowlist_hash(&salt, &[0xAA; 32]);
-        let record = OpenhostRecord {
-            version: PROTOCOL_VERSION,
-            ts: 1_700_000_000,
-            dtls_fp: [0x42u8; DTLS_FINGERPRINT_LEN],
-            roles: "server".to_string(),
-            salt,
-            allow: vec![hash],
-            ice: vec![IceBlob {
-                client_hash: hash.to_vec(),
-                ciphertext: vec![0xEE; 72],
-            }],
-            disc: String::new(),
-        };
-        let signed = SignedRecord::sign(record, &sk).unwrap();
+        let signed = SignedRecord::sign(sample_record(1_700_000_000), &sk).unwrap();
         (sk, signed)
     }
 

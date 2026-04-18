@@ -89,4 +89,26 @@ pub enum PkarrError {
     /// The openhost `PublicKey` could not be converted to a pkarr `PublicKey`.
     #[error("failed to convert openhost public key to pkarr public key")]
     PublicKeyConversion,
+
+    /// More than one `_openhost` TXT record was present in the packet. Each
+    /// packet **MUST** carry exactly one.
+    #[error("signed packet contains more than one `_openhost` TXT record")]
+    MultipleOpenhostRecords,
+
+    /// `record.ts` (in seconds) overflowed `u64` when converted to pkarr
+    /// microseconds. Only triggers past year ~586,000 AD; here purely as
+    /// defense-in-depth against silent wraparound.
+    #[error("record.ts={ts} overflows when converted to microseconds")]
+    TimestampOverflow {
+        /// The original `record.ts` in seconds.
+        ts: u64,
+    },
+
+    /// The upstream `pkarr::dns` crate failed to build a TXT record from the
+    /// encoded openhost blob. In practice this only fires if a character
+    /// string would exceed 255 bytes, which should not happen under the
+    /// BEP44 1000-byte ceiling — if it does, the cause is preserved here for
+    /// diagnosis.
+    #[error("failed to build _openhost TXT record: {0}")]
+    TxtBuildFailed(String),
 }

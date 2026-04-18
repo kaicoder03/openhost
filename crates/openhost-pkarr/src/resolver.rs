@@ -82,6 +82,13 @@ impl Resolver {
         let pkarr_pk =
             pkarr::PublicKey::try_from(&pk_bytes).map_err(|_| PkarrError::PublicKeyConversion)?;
 
+        // TODO(M3): `pkarr::Client::resolve_most_recent` returns as soon as it
+        // has a validated response; it does not implement the 1.5-second
+        // grace window from spec §3 rule 5 ("continue waiting on in-flight
+        // queries for up to 1.5 seconds after the first accepted record; if
+        // a later-arriving record has a higher `seq`, prefer it"). Adding
+        // that requires either a custom race over individual substrate calls
+        // or an upstream pkarr change.
         let packet = self
             .client
             .resolve_most_recent(&pkarr_pk)
@@ -119,36 +126,9 @@ impl Resolver {
 mod tests {
     use super::*;
     use crate::codec::encode;
-    use openhost_core::crypto::allowlist_hash;
+    use crate::test_support::{sample_record, RFC_SEED};
     use openhost_core::identity::SigningKey;
-    use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, MAX_RECORD_AGE_SECS, PROTOCOL_VERSION,
-        SALT_LEN,
-    };
-
-    const RFC_SEED: [u8; 32] = [
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ];
-
-    fn sample_record(ts: u64) -> OpenhostRecord {
-        let salt = [0x11u8; SALT_LEN];
-        let hash = allowlist_hash(&salt, &[0xAA; 32]);
-        OpenhostRecord {
-            version: PROTOCOL_VERSION,
-            ts,
-            dtls_fp: [0x42u8; DTLS_FINGERPRINT_LEN],
-            roles: "server".to_string(),
-            salt,
-            allow: vec![hash],
-            ice: vec![IceBlob {
-                client_hash: hash.to_vec(),
-                ciphertext: vec![0xEE; 72],
-            }],
-            disc: String::new(),
-        }
-    }
+    use openhost_core::pkarr_record::MAX_RECORD_AGE_SECS;
 
     struct FakeResolve {
         packet: Option<SignedPacket>,
@@ -241,5 +221,49 @@ mod tests {
             .await
             .expect("equal cached_seq is allowed (monotonic non-decreasing)");
         assert_eq!(record.record.ts, ts);
+    }
+
+    #[tokio::test]
+    async fn rejects_timestamp_drift_between_packet_and_record() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let record_ts = 1_700_000_000u64;
+        let signed =
+            openhost_core::pkarr_record::SignedRecord::sign(sample_record(record_ts), &sk)
+                .unwrap();
+
+        // Re-implement the encode path but pin the outer pkarr timestamp at
+        // a value that disagrees with `record.ts` by more than 1s. We hold
+        // the signing key, so the outer BEP44 signature still validates —
+        // the drift guard in the resolver is what should catch this.
+        let canonical = signed.record.canonical_signing_bytes().unwrap();
+        let mut blob = Vec::with_capacity(64 + canonical.len());
+        blob.extend_from_slice(&signed.signature.to_bytes());
+        blob.extend_from_slice(&canonical);
+        let encoded = URL_SAFE_NO_PAD.encode(&blob);
+
+        let keypair = pkarr::Keypair::from_secret_key(&sk.to_bytes());
+        let drifted_micros = (record_ts + 5) * codec::MICROS_PER_SECOND;
+        let packet = SignedPacket::builder()
+            .txt(
+                pkarr::dns::Name::new_unchecked(codec::OPENHOST_TXT_NAME),
+                pkarr::dns::rdata::TXT::try_from(encoded.as_str()).unwrap(),
+                codec::OPENHOST_TXT_TTL,
+            )
+            .timestamp(pkarr::Timestamp::from(drifted_micros))
+            .sign(&keypair)
+            .unwrap();
+
+        let resolver = Resolver::new(Arc::new(FakeResolve {
+            packet: Some(packet),
+        }));
+
+        let err = resolver
+            .resolve(&sk.public_key(), record_ts, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PkarrError::TimestampDrift { .. }));
     }
 }

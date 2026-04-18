@@ -13,4 +13,10 @@
 /// The first entry is also carried in `pkarr::DEFAULT_RELAYS`; the second is
 /// operated by the Iroh project. Both are informational examples — consumers
 /// **MUST** allow the end-user to override this list at runtime.
+///
+/// Spec §2.1 requires "at least three substrates in parallel". On native
+/// platforms the bundled two relays plus the Mainline DHT (queried directly
+/// by `pkarr::Client`) satisfy that count. Browser-targeted consumers, which
+/// cannot speak the DHT, **MUST** extend this list to at least three relays
+/// before shipping.
 pub const DEFAULT_RELAYS: &[&str] = &["https://pkarr.pubky.app", "https://relay.iroh.network"];

@@ -28,6 +28,9 @@ pub mod publisher;
 pub mod relays;
 pub mod resolver;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use codec::{
     decode, encode, packet_public_key, BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME,
     OPENHOST_TXT_TTL,

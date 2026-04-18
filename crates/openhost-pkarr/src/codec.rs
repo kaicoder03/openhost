@@ -78,9 +78,16 @@ pub fn encode(signed: &SignedRecord, signing_key: &SigningKey) -> Result<SignedP
 
     let name = Name::new_unchecked(OPENHOST_TXT_NAME);
     let txt = pkarr::dns::rdata::TXT::try_from(encoded.as_str())
-        .map_err(|e| PkarrError::MalformedCanonical(txt_build_err(e)))?;
+        .map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?;
 
-    let ts = Timestamp::from(signed.record.ts.saturating_mul(MICROS_PER_SECOND));
+    let ts_micros = signed
+        .record
+        .ts
+        .checked_mul(MICROS_PER_SECOND)
+        .ok_or(PkarrError::TimestampOverflow {
+            ts: signed.record.ts,
+        })?;
+    let ts = Timestamp::from(ts_micros);
 
     let packet = SignedPacket::builder()
         .txt(name, txt, OPENHOST_TXT_TTL)
@@ -101,15 +108,21 @@ pub fn encode(signed: &SignedRecord, signing_key: &SigningKey) -> Result<SignedP
 
 /// Decode a [`pkarr::SignedPacket`] back into a [`SignedRecord`].
 ///
+/// **Important: this function does NOT verify the inner Ed25519 signature.**
 /// Verification of the outer BEP44 signature has already happened inside the
-/// pkarr crate by the time a `SignedPacket` exists. The inner openhost
-/// signature is copied verbatim into the returned [`SignedRecord`]; callers
-/// (typically the resolver) are responsible for calling
-/// [`SignedRecord::verify`] with a `now_ts` to validate the openhost-layer
-/// freshness window.
+/// pkarr crate by the time a `SignedPacket` exists, but the inner openhost
+/// signature is copied verbatim into the returned [`SignedRecord`]. Callers
+/// (typically the resolver) **MUST** call [`SignedRecord::verify`] with a
+/// `now_ts` before trusting any field of the returned record.
+///
+/// `decode` does run `record.validate(record.ts)` to reject records whose
+/// schema invariants (empty `roles`, oversize `disc`, etc.) are violated;
+/// the `ts` passed there is the record's own `ts`, so the 2-hour freshness
+/// window is *not* enforced here. That still happens in `verify`.
 ///
 /// Returns [`PkarrError::MissingOpenhostRecord`] if no `_openhost` TXT record
-/// is present, and [`PkarrError::BlobTooShort`] if the decoded blob is shorter
+/// is present, [`PkarrError::MultipleOpenhostRecords`] if more than one is
+/// present, and [`PkarrError::BlobTooShort`] if the decoded blob is shorter
 /// than the 64-byte signature prefix.
 pub fn decode(packet: &SignedPacket) -> Result<SignedRecord> {
     let text = collect_openhost_txt(packet)?;
@@ -143,12 +156,19 @@ pub fn packet_public_key(packet: &SignedPacket) -> Result<PublicKey> {
 }
 
 fn collect_openhost_txt(packet: &SignedPacket) -> Result<String> {
-    let mut saw_any = false;
+    let mut seen_txt = 0usize;
     let mut out = String::new();
 
     for rr in packet.resource_records(OPENHOST_TXT_NAME) {
-        saw_any = true;
         if let pkarr::dns::rdata::RData::TXT(txt) = &rr.rdata {
+            seen_txt += 1;
+            if seen_txt > 1 {
+                // More than one TXT RR at `_openhost`. The spec mandates
+                // exactly one; concatenating would yield a base64url blob
+                // that almost certainly wouldn't decode, but fail loudly so
+                // a misconfigured publisher is easy to diagnose.
+                return Err(PkarrError::MultipleOpenhostRecords);
+            }
             for (key, value) in txt.iter_raw() {
                 out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
                 if let Some(v) = value {
@@ -159,15 +179,11 @@ fn collect_openhost_txt(packet: &SignedPacket) -> Result<String> {
         }
     }
 
-    if !saw_any {
+    if seen_txt == 0 {
         return Err(PkarrError::MissingOpenhostRecord);
     }
 
     Ok(out)
-}
-
-fn txt_build_err(_e: pkarr::dns::SimpleDnsError) -> &'static str {
-    "failed to build _openhost TXT record"
 }
 
 /// Inverse of [`OpenhostRecord::canonical_signing_bytes`].
@@ -312,33 +328,15 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openhost_core::crypto::allowlist_hash;
-    use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
-    };
+    use crate::test_support::{sample_record, RFC_SEED};
 
-    const RFC_SEED: [u8; 32] = [
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ];
-
+    /// Codec-flavoured reference record — distinct from the shared
+    /// [`sample_record`] in that `disc` is non-empty, giving the encoded
+    /// canonical bytes a non-trivial UTF-8 segment to exercise.
     fn reference_record() -> OpenhostRecord {
-        let salt = [0x11u8; SALT_LEN];
-        let client_pk = [0xAAu8; 32];
-        let hash = allowlist_hash(&salt, &client_pk);
         OpenhostRecord {
-            version: PROTOCOL_VERSION,
-            ts: 1_700_000_000,
-            dtls_fp: [0x42u8; DTLS_FINGERPRINT_LEN],
-            roles: "server".to_string(),
-            salt,
-            allow: vec![hash],
-            ice: vec![IceBlob {
-                client_hash: hash.to_vec(),
-                ciphertext: vec![0xEE; 72],
-            }],
             disc: "dht=1; relay=pkarr.example".to_string(),
+            ..sample_record(1_700_000_000)
         }
     }
 
@@ -420,6 +418,29 @@ mod tests {
         assert!(matches!(
             decode(&packet),
             Err(PkarrError::BlobTooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_multiple_openhost_records() {
+        let keypair = Keypair::from_secret_key(&RFC_SEED);
+        let packet = SignedPacket::builder()
+            .txt(
+                Name::new_unchecked(OPENHOST_TXT_NAME),
+                pkarr::dns::rdata::TXT::try_from("AAA").unwrap(),
+                OPENHOST_TXT_TTL,
+            )
+            .txt(
+                Name::new_unchecked(OPENHOST_TXT_NAME),
+                pkarr::dns::rdata::TXT::try_from("BBB").unwrap(),
+                OPENHOST_TXT_TTL,
+            )
+            .sign(&keypair)
+            .unwrap();
+
+        assert!(matches!(
+            decode(&packet),
+            Err(PkarrError::MultipleOpenhostRecords)
         ));
     }
 
