@@ -33,7 +33,7 @@ Create `~/.config/openhost/daemon.toml` on the host machine:
 
 ```toml
 [identity]
-store = { type = "fs", path = "~/.config/openhost/identity.key" }
+store = { kind = "fs", path = "~/.config/openhost/identity.key" }
 
 [pkarr]
 # Relays default to the bundled public list; leaving this empty uses them.
@@ -108,20 +108,27 @@ That's a real HTTP request, traversing the client's NAT, hole-punched through We
 
 ## 5. Pair the client (switch to enforced mode)
 
-Ephemeral keys are fine for the smoke test; for actual use the daemon should only accept your client's identity. On the client:
+Ephemeral keys are fine for the smoke test; for actual use the daemon should only accept your client's identity. `openhost-dial` accepts a 32-byte raw Ed25519 seed via `--identity`, in the same on-disk format the daemon's filesystem identity store uses.
+
+On the **client** machine:
 
 ```bash
-# Persist the client's identity so future dials use the same pubkey.
-dd if=/dev/urandom of=~/.config/openhost/client.key bs=32 count=1
+# Persist a client-side identity seed.
+install -d -m 0700 ~/.config/openhost
+dd if=/dev/urandom of=~/.config/openhost/client.key bs=32 count=1 2>/dev/null
 chmod 0600 ~/.config/openhost/client.key
 
-# Print the pubkey that matches that seed.
-openhost-dial --help >/dev/null  # any command with --identity picks it up
+# Dial once with --identity so the log line prints the matching pubkey.
+# The first line openhost-dial writes to stderr is:
+#   openhost-dial: client_pk=<zbase32-pubkey> dialing GET
+openhost-dial --identity ~/.config/openhost/client.key oh://<daemon-pubkey>/ 2>&1 | head -1
 ```
 
-There is no standalone keygen CLI in v0.1; the ephemeral-keypair path is usable today, and pairing against a persistent key will be simpler once the `openhost-keygen` helper lands (tracked in [`ROADMAP.md`](https://github.com/kaicoder03/openhost/blob/main/ROADMAP.md)). For now, using the `--identity` flag with a file you created with `dd` is the supported approach.
+Copy the `<zbase32-pubkey>` from that log line. That's your stable client identity; every `--identity` dial with the same seed file yields the same pubkey.
 
-Grab the matching pubkey (a future tool will print it; until then, the easiest path is to pipe it through any client tool that logs `client_pk=`). Add it to the host:
+There is no standalone keygen CLI at `v0.1.0` — deriving the pubkey by dialing once (even if the dial itself fails because the client isn't paired yet) is the supported workflow. A dedicated helper may be added in a future release.
+
+On the **host** machine:
 
 ```bash
 openhostd pair add <client-pubkey-zbase32>
@@ -137,7 +144,7 @@ enforce_allowlist = true                  # was: false
 watched_clients = ["<client-pubkey-zbase32>"]
 ```
 
-Restart the daemon. Now only paired clients succeed.
+Restart the daemon so the new `watched_clients` takes effect (the file-watcher reloads pair entries, not offer-poll config). From now on, only paired clients succeed.
 
 ## 6. Verify the record on its own
 
