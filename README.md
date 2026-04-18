@@ -11,7 +11,7 @@ openhost lets you reach services running on your own computers — from any pair
 
 ## Status
 
-**Pre-alpha.** The protocol is being specified. No user-facing builds are shipping yet. Watch the repo for the first M1 tag.
+**`v0.1.0` shipped** — the daemon, client library, WebRTC listener, channel binding, and HTTP forwarder are all in `main` and tagged. No binary releases yet; build from source. See [`CHANGELOG.md`](CHANGELOG.md) for what landed, [`ROADMAP.md`](ROADMAP.md) for what's next, and [`SECURITY.md`](SECURITY.md) before exposing a service.
 
 ## How it works
 
@@ -40,11 +40,15 @@ cargo check --workspace
 cd site && pnpm install && pnpm dev
 ```
 
+## Roadmap
+
+Post-v0.1 work is sequenced in [`ROADMAP.md`](ROADMAP.md). Phase 1 closes the three known limitations from the `v0.1.0` release notes and Phase 2 lands operator-facing docs (quickstart, install, troubleshoot, worked examples for Jellyfin and Home Assistant). Phase 3+ tracks longer-horizon work: distributable binaries, observability, keychain backends, the `webrtc-rs` sans-I/O migration, browser extension, and native apps.
+
 ## Security
 
 Reports of vulnerabilities: **please use GitHub's private Security Advisories** rather than filing a public issue. See [`SECURITY.md`](SECURITY.md) for scope and response commitments.
 
-The threat model is documented in [`spec/04-security.md`](spec/04-security.md). **openhost is pre-alpha software and has not been audited. Do not use it to expose services you cannot afford to have compromised.**
+The threat model is documented in [`spec/04-security.md`](spec/04-security.md). **openhost is pre-audit software: `v0.1.0` has shipped but no third-party security review has taken place. Do not use it to expose services you cannot afford to have compromised.**
 
 ## License
 
