@@ -16,10 +16,14 @@
 //! - [`resolver`] — race relays + DHT, decode, verify freshness and
 //!   `seq` monotonicity.
 //! - [`relays`] — bundled default list of public Pkarr HTTP relays.
+//! - `nostr` (feature `nostr`) — optional NIP-78 envelope builder for the
+//!   tertiary Nostr substrate. Envelope-only; no WebSocket publish.
 //! - [`error`] — crate-wide error type.
 
 pub mod codec;
 pub mod error;
+#[cfg(feature = "nostr")]
+pub mod nostr;
 pub mod publisher;
 pub mod relays;
 pub mod resolver;
