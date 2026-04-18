@@ -8,6 +8,19 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #18, site operator guides)
+
+- New **Guides** section under `site/src/content/docs/guides/` with three pages:
+  - **`install.md`** — Rust 1.90 prerequisites, `cargo build --release` commands for the daemon + `--features cli` client crate, binary destinations, install hints (`~/.local/bin`), per-platform notes (macOS / Linux / Windows), and a pointer at Phase 3+ distributable-binary work in `ROADMAP.md`.
+  - **`quickstart.md`** — six-step walkthrough: upstream HTTP service on the host (`python3 -m http.server`), minimal `~/.config/openhost/daemon.toml` (identity, pkarr, dtls, forward sections), `openhostd run` + `openhostd identity show`, `openhost-dial oh://<pubkey>/` from the client, switching to `enforce_allowlist = true` + `openhostd pair add`, and `openhost-resolve --json` as a diagnostic. Includes an inline caveat on the residual BEP44 answer-size gap (tracked in `ROADMAP.md` post-Phase-2).
+  - **`troubleshoot.md`** — failure-mode playbook structured by symptom: DHT/relay miss, relay 5xx, `PollAnswerTimeout` (three common causes including the residual size gap and pair-watcher unreliability on network filesystems), DTLS handshake failure, and pair-DB changes not propagating. Each section carries 2–4 verification steps with concrete commands.
+- Starlight sidebar now carries a **Guides** section between **Get started** and **Specification**. `site/astro.config.mjs` extended with three explicit slugs so ordering is deterministic.
+
+### Verification (PR #18)
+
+- `cd site && pnpm install && pnpm build` — 10 pages generated (was 7), including the three new `/guides/*/index.html` routes.
+- No code changes; `cargo check --workspace` unaffected.
+
 ### Added (PR #17, pair-DB file watcher)
 
 - **Automatic pair-DB reload on every platform.** New `openhost_daemon::pair_watcher` module wraps `notify-debouncer-mini` in a tokio-friendly handle: the watcher targets the pair-DB file's parent directory in non-recursive mode, filters events by filename inside a dedicated bridge thread, and forwards debounced reload triggers into the daemon's event loop via a tokio `mpsc`. The `App::run` event loop grows a third `tokio::select!` arm parallel to `shutdown_signal` and `reload_signal`; the SIGHUP path is retained as a secondary trigger on Unix so the existing SIGHUP integration test (`pairing_enforcement.rs`) continues to exercise the same reload code.
