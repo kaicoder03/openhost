@@ -28,7 +28,9 @@ pub mod forward;
 pub mod identity_store;
 pub mod listener;
 pub mod offer_poller;
+pub mod pairing;
 pub mod publish;
+pub mod rate_limit;
 pub mod signal;
 
 pub use app::{init_tracing, App};
@@ -38,3 +40,4 @@ pub use error::{DaemonError, OfferPollError, Result};
 pub use forward::{ForwardResponse, Forwarder};
 pub use listener::PassivePeer;
 pub use offer_poller::{OfferPoller, OfferPollerConfig};
+pub use pairing::{PairEntry, PairingDb, PairingError};

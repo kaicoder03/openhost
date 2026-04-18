@@ -41,6 +41,7 @@ fn real_config(dir: &TempDir) -> Config {
         },
         forward: None,
         log: LogConfig::default(),
+        pairing: Default::default(),
     }
 }
 

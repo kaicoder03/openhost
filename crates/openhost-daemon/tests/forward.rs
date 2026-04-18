@@ -48,6 +48,7 @@ fn test_config(dir: &TempDir, upstream_port: u16) -> Config {
             max_body_bytes: 1024 * 1024,
         }),
         log: LogConfig::default(),
+        pairing: Default::default(),
     }
 }
 

@@ -79,6 +79,56 @@ callers can drive the listener directly for tests or custom signalling.
   is pinned in the daemon's published record (`openhost-resolve` prints
   it if you want to verify).
 
+## Pairing (PR #7b)
+
+The daemon will only process offers from clients you've explicitly
+paired with it. The pair DB is a plaintext TOML file at
+`~/.config/openhost/allow.toml` (path overridable via
+`pairing.db_path`). Each entry carries the client's z-base-32 pubkey
+and an optional nickname:
+
+```toml
+[[pair]]
+pubkey   = "yRyanemyt4kh9s51tt51mbe8zf88w73fnoh4q4zz7zs68x6d3a9o"
+nickname = "my laptop"
+```
+
+Manage entries via the CLI:
+
+```bash
+openhostd pair list
+openhostd pair add <zbase32-pubkey> --nickname "my laptop"
+openhostd pair remove <zbase32-pubkey>
+```
+
+On Unix, `openhostd pair add/remove` edits the file atomically and
+prints a reminder to SIGHUP the running daemon to apply the change
+without a restart. On Windows, restart the daemon to reload.
+
+Enforcement is on by default (`pkarr.offer_poll.enforce_allowlist =
+true`). Unpaired clients' offers are dropped at poll time with a
+`warn!` pointing at the CLI command. For isolated networks where the
+risk model doesn't require pairing, set `enforce_allowlist = false`
+to preserve the permissive PR #7a behavior.
+
+Abuse control: each paired client has a token-bucket rate limit (3
+burst, one refill per 5 seconds by default). Beyond the bucket the
+offer is dropped + logged without tearing down the poller.
+
+```toml
+[pkarr.offer_poll]
+enforce_allowlist        = true
+rate_limit_burst         = 3
+rate_limit_refill_secs   = 5.0
+watched_clients          = [ ... ]          # see below
+```
+
+**Relationship to `watched_clients`.** `watched_clients` is the set
+of pubkey zones the daemon polls; the pair DB is the set of pubkeys
+allowed to connect. Typically they overlap 1:1, but the two knobs are
+kept separate so operators can continue watching a zone after
+revoking a pair (useful for debugging pkarr-side outages).
+
 ## Offer-record polling (spec §3.3, PR #7a)
 
 The daemon picks up inbound WebRTC offers by polling pkarr for

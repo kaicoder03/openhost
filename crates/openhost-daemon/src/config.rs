@@ -34,6 +34,9 @@ pub struct Config {
     /// Logging.
     #[serde(default)]
     pub log: LogConfig,
+    /// Pairing-database configuration.
+    #[serde(default)]
+    pub pairing: PairingConfig,
 }
 
 /// Identity keystore configuration.
@@ -94,6 +97,21 @@ pub struct OfferPollConfig {
     /// this many seconds per watched client, dropping floods without
     /// killing the loop. Defaults to 5.
     pub per_client_throttle_secs: u64,
+    /// Whether to require the client pubkey to be in the allowlist
+    /// (pairing DB) before processing its offer. Defaults to `true`.
+    /// Setting this to `false` preserves the permissive PR #7a
+    /// behavior; do so only on isolated networks.
+    #[serde(default = "default_enforce_allowlist")]
+    pub enforce_allowlist: bool,
+    /// Token-bucket burst capacity per client pubkey. At most this
+    /// many offers per client are processed back-to-back before the
+    /// refill rate kicks in. Defaults to 3.
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+    /// Token-bucket refill rate in seconds per token. Defaults to 5.0
+    /// (one token per 5 s).
+    #[serde(default = "default_rate_limit_refill_secs")]
+    pub rate_limit_refill_secs: f64,
 }
 
 impl Default for OfferPollConfig {
@@ -102,8 +120,32 @@ impl Default for OfferPollConfig {
             poll_secs: 1,
             watched_clients: Vec::new(),
             per_client_throttle_secs: 5,
+            enforce_allowlist: default_enforce_allowlist(),
+            rate_limit_burst: default_rate_limit_burst(),
+            rate_limit_refill_secs: default_rate_limit_refill_secs(),
         }
     }
+}
+
+/// Pairing-database configuration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PairingConfig {
+    /// Path to the pairing TOML database. `None` resolves to the
+    /// platform-default path under the openhost config directory.
+    pub db_path: Option<PathBuf>,
+}
+
+fn default_enforce_allowlist() -> bool {
+    true
+}
+
+fn default_rate_limit_burst() -> u32 {
+    3
+}
+
+fn default_rate_limit_refill_secs() -> f64 {
+    5.0
 }
 
 /// DTLS certificate configuration.
@@ -210,6 +252,18 @@ impl Config {
         if self.pkarr.offer_poll.poll_secs == 0 {
             return Err(ConfigError::Invalid("pkarr.offer_poll.poll_secs must be > 0").into());
         }
+        if self.pkarr.offer_poll.rate_limit_burst == 0 {
+            return Err(
+                ConfigError::Invalid("pkarr.offer_poll.rate_limit_burst must be > 0").into(),
+            );
+        }
+        let refill = self.pkarr.offer_poll.rate_limit_refill_secs;
+        if !refill.is_finite() || refill <= 0.0 {
+            return Err(ConfigError::Invalid(
+                "pkarr.offer_poll.rate_limit_refill_secs must be finite and > 0",
+            )
+            .into());
+        }
         // Validate each watched-client pubkey parses as z-base-32 at
         // load time so a typo fails loudly rather than silently
         // producing a poller that never finds anything.
@@ -286,6 +340,7 @@ pub fn seed_config(data_dir: &Path) -> Config {
         },
         forward: None,
         log: LogConfig::default(),
+        pairing: PairingConfig::default(),
     }
 }
 
