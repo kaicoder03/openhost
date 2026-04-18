@@ -27,7 +27,7 @@ use crate::error::ForwardError;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
@@ -195,10 +195,21 @@ impl Forwarder {
         }
 
         let (parts, body) = response.into_parts();
-        let collected = body
+
+        // Cap the upstream response at the same `max_body_bytes` budget.
+        // Without this a misconfigured (or malicious) upstream could
+        // stream unbounded bytes into the daemon's RAM via
+        // `BodyExt::collect`. `Limited` yields the whole body up to the
+        // cap and errors if the upstream exceeds it — we surface that as
+        // `UpstreamResponse` so the caller distinguishes it from a
+        // connection failure.
+        let limited = Limited::new(body, self.max_body_bytes);
+        let collected = limited
             .collect()
             .await
-            .map_err(|e| ForwardError::UpstreamUnreachable(e.to_string()))?
+            .map_err(|_| {
+                ForwardError::UpstreamResponse("upstream response exceeded max_body_bytes")
+            })?
             .to_bytes();
 
         let head_bytes = encode_response_head(parts.status, parts.headers, collected.len())?;
@@ -264,7 +275,8 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
         let name = line[..colon].trim();
-        let value = line[colon + 1..].trim_start_matches(' ');
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
+        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)

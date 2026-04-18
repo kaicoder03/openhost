@@ -85,7 +85,6 @@ struct UpstreamReceived {
     path: Option<String>,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    count: usize,
 }
 
 enum UpstreamResponder {
@@ -133,7 +132,6 @@ async fn spawn_upstream(responder: UpstreamResponder) -> (u16, UpstreamState) {
                             let state = conn_state.clone();
                             async move {
                                 let mut recv = state.received.lock().await;
-                                recv.count += 1;
                                 recv.method = Some(req.method().to_string());
                                 recv.path = Some(
                                     req.uri()
@@ -203,7 +201,6 @@ struct ClientSession {
     client_pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     dc: Arc<RTCDataChannel>,
     received: Arc<Mutex<Vec<u8>>>,
-    first_byte_rx: mpsc::Receiver<()>,
 }
 
 impl ClientSession {
@@ -236,7 +233,6 @@ async fn establish_connection(app: &App) -> ClientSession {
     }
 
     let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let (first_byte_tx, first_byte_rx) = mpsc::channel::<()>(1);
     let (dc_open_tx, mut dc_open_rx) = mpsc::channel::<()>(1);
 
     let dc = client_pc
@@ -254,17 +250,11 @@ async fn establish_connection(app: &App) -> ClientSession {
         }));
     }
     let received_for_dc = Arc::clone(&received);
-    let first_byte_tx_for_dc = first_byte_tx.clone();
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let received = Arc::clone(&received_for_dc);
-        let first_byte_tx = first_byte_tx_for_dc.clone();
         Box::pin(async move {
             let mut buf = received.lock().await;
-            let was_empty = buf.is_empty();
             buf.extend_from_slice(&msg.data);
-            if was_empty && !buf.is_empty() {
-                let _ = first_byte_tx.try_send(());
-            }
         })
     }));
 
@@ -297,20 +287,17 @@ async fn establish_connection(app: &App) -> ClientSession {
         client_pc,
         dc,
         received,
-        first_byte_rx,
     }
 }
 
 /// Send a full request on `session` and collect the full response.
-/// Returns (response_head_frame, response_body_bytes, extra_bytes_after_end).
-async fn round_trip(
-    session: &mut ClientSession,
-    head: &[u8],
-    body: &[u8],
-    extra_headers: Option<&[u8]>,
-) -> (Frame, Vec<u8>) {
-    let _ = extra_headers; // unused here; kept for future variants
-
+/// Returns (response_head_frame, response_body_bytes).
+///
+/// Polls `session.received` until a complete `RESPONSE_END` frame is
+/// decoded — no fixed-sleep timing assumption. PR #6's listener now
+/// sends each response frame as its own data-channel message, so the
+/// receiving side must wait for multiple notifications.
+async fn round_trip(session: &mut ClientSession, head: &[u8], body: &[u8]) -> (Frame, Vec<u8>) {
     let req_head = Frame::new(FrameType::RequestHead, head.to_vec()).unwrap();
     let mut wire = Vec::new();
     req_head.encode(&mut wire);
@@ -323,30 +310,58 @@ async fn round_trip(
         .encode(&mut wire);
     session.dc.send(&Bytes::from(wire)).await.expect("send");
 
-    tokio::time::timeout(Duration::from_secs(5), session.first_byte_rx.recv())
-        .await
-        .expect("timed out waiting for daemon response")
-        .expect("response channel closed");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let bytes = session.received.lock().await.clone();
+    let (head_frame, body_out) = wait_for_full_response(session).await;
+    (head_frame, body_out)
+}
 
-    let (head_frame, consumed) = Frame::try_decode(&bytes).unwrap().unwrap();
-    assert_eq!(head_frame.frame_type, FrameType::ResponseHead);
+/// Wait up to 10s for a full `RESPONSE_HEAD` + `RESPONSE_BODY*` +
+/// `RESPONSE_END` sequence to arrive on `session.received`. Returns
+/// the head frame and the concatenated body bytes.
+async fn wait_for_full_response(session: &mut ClientSession) -> (Frame, Vec<u8>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut head_frame: Option<Frame> = None;
+    let mut body_out: Vec<u8> = Vec::new();
+    let mut offset = 0usize;
+    let mut saw_end = false;
 
-    // Concatenate any RESPONSE_BODY frames between HEAD and END.
-    let mut offset = consumed;
-    let mut body_out = Vec::new();
     loop {
-        let (frame, used) = Frame::try_decode(&bytes[offset..]).unwrap().unwrap();
-        offset += used;
-        match frame.frame_type {
-            FrameType::ResponseBody => body_out.extend_from_slice(&frame.payload),
-            FrameType::ResponseEnd => break,
-            other => panic!("unexpected frame between HEAD and END: {other:?}"),
+        let bytes = session.received.lock().await.clone();
+        while offset < bytes.len() {
+            match Frame::try_decode(&bytes[offset..]) {
+                Ok(Some((frame, used))) => {
+                    offset += used;
+                    match frame.frame_type {
+                        FrameType::ResponseHead => head_frame = Some(frame),
+                        FrameType::ResponseBody => body_out.extend_from_slice(&frame.payload),
+                        FrameType::ResponseEnd => {
+                            saw_end = true;
+                            break;
+                        }
+                        other => panic!("unexpected response frame: {other:?}"),
+                    }
+                }
+                Ok(None) => break, // need more bytes
+                Err(e) => panic!("frame decode failed: {e:?}"),
+            }
         }
+        if saw_end {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for RESPONSE_END; got head={:?} body_bytes={}",
+                head_frame.is_some(),
+                body_out.len()
+            );
+        }
+        // Yield — webrtc-rs event loop needs to drain its own tasks.
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    (head_frame, body_out)
+    (
+        head_frame.expect("RESPONSE_HEAD must arrive before RESPONSE_END"),
+        body_out,
+    )
 }
 
 #[tokio::test]
@@ -356,7 +371,7 @@ async fn forwarder_round_trip_returns_upstream_200() -> DaemonResult<()> {
     let mut session = establish_connection(&app).await;
 
     let head = b"GET /hello HTTP/1.1\r\nHost: some.other.host\r\nAccept: */*\r\n\r\n";
-    let (resp_head, body) = round_trip(&mut session, head, b"", None).await;
+    let (resp_head, body) = round_trip(&mut session, head, b"").await;
 
     let head_text = std::str::from_utf8(&resp_head.payload).unwrap();
     assert!(
@@ -378,7 +393,7 @@ async fn forwarder_forwards_request_body_verbatim() -> DaemonResult<()> {
     let mut session = establish_connection(&app).await;
 
     let head = b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n\r\n";
-    let (resp_head, body) = round_trip(&mut session, head, b"ping\n", None).await;
+    let (resp_head, body) = round_trip(&mut session, head, b"ping\n").await;
     let head_text = std::str::from_utf8(&resp_head.payload).unwrap();
     assert!(head_text.starts_with("HTTP/1.1 200 "));
     assert_eq!(body, b"ping\n");
@@ -411,7 +426,7 @@ async fn forwarder_strips_hop_by_hop_and_provenance_before_upstream() -> DaemonR
                  Forwarded: by=attacker\r\n\
                  X-Custom: retained\r\n\
                  \r\n";
-    let _ = round_trip(&mut session, head, b"", None).await;
+    let _ = round_trip(&mut session, head, b"").await;
 
     let recv = state.received.lock().await;
     let keys: Vec<&str> = recv.headers.iter().map(|(k, _)| k.as_str()).collect();
@@ -468,7 +483,7 @@ async fn forwarder_pins_host_header_to_target() -> DaemonResult<()> {
     let mut session = establish_connection(&app).await;
 
     let head = b"GET / HTTP/1.1\r\nHost: evil.example:1234\r\n\r\n";
-    let _ = round_trip(&mut session, head, b"", None).await;
+    let _ = round_trip(&mut session, head, b"").await;
 
     let recv = state.received.lock().await;
     let host = recv
@@ -501,13 +516,106 @@ async fn forwarder_upstream_unreachable_returns_502() -> DaemonResult<()> {
     let mut session = establish_connection(&app).await;
 
     let head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-    let (resp_head, body) = round_trip(&mut session, head, b"", None).await;
+    let (resp_head, body) = round_trip(&mut session, head, b"").await;
     let head_text = std::str::from_utf8(&resp_head.payload).unwrap();
     assert!(
         head_text.starts_with("HTTP/1.1 502 "),
         "expected 502 when upstream unreachable, got: {head_text}"
     );
     assert!(body.is_empty(), "502 stub body should be empty");
+
+    session.close().await;
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarder_request_body_exceeding_cap_triggers_error_frame_and_teardown() -> DaemonResult<()>
+{
+    // Configure a tiny 256-byte cap so the test doesn't have to allocate
+    // megabytes. Any inbound body larger than the cap should trigger a
+    // spec §5 ERROR frame + channel teardown — NOT a 502 response.
+    let (port, _state) = spawn_upstream(UpstreamResponder::default()).await;
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = test_config(&tmp, port);
+    if let Some(forward) = cfg.forward.as_mut() {
+        forward.max_body_bytes = 256;
+    }
+    let app = App::build_with_transport(cfg, Arc::new(NoopTransport) as Arc<dyn Transport>)
+        .await
+        .expect("daemon builds");
+    let session = establish_connection(&app).await;
+
+    // Send a 1 KiB body — well over the cap.
+    let head = b"POST /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    let big_body = vec![0x41u8; 1024];
+    let req_head = Frame::new(FrameType::RequestHead, head.to_vec()).unwrap();
+    let req_body = Frame::new(FrameType::RequestBody, big_body).unwrap();
+    let req_end = Frame::new(FrameType::RequestEnd, vec![]).unwrap();
+    let mut wire = Vec::new();
+    req_head.encode(&mut wire);
+    req_body.encode(&mut wire);
+    req_end.encode(&mut wire);
+    session.dc.send(&Bytes::from(wire)).await.expect("send");
+
+    // Wait up to 5 s for the ERROR frame. The channel will be torn down
+    // after so we won't see anything else.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let err_frame = loop {
+        let bytes = session.received.lock().await.clone();
+        if let Ok(Some((frame, _))) = Frame::try_decode(&bytes) {
+            break frame;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "no frame arrived after oversized REQUEST_BODY; received buffer has {} bytes",
+                bytes.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        err_frame.frame_type,
+        FrameType::Error,
+        "expected spec §5 ERROR frame, got {:?}",
+        err_frame.frame_type
+    );
+    let diagnostic = String::from_utf8_lossy(&err_frame.payload);
+    assert!(
+        diagnostic.contains("body"),
+        "ERROR diagnostic should mention the body-cap violation; got {diagnostic:?}"
+    );
+
+    session.close().await;
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ping_frame_is_answered_with_pong() -> DaemonResult<()> {
+    let (port, _state) = spawn_upstream(UpstreamResponder::default()).await;
+    let (_tmp, app) = build_daemon(port).await;
+    let session = establish_connection(&app).await;
+
+    let ping = Frame::new(FrameType::Ping, vec![]).unwrap();
+    let mut wire = Vec::new();
+    ping.encode(&mut wire);
+    session.dc.send(&Bytes::from(wire)).await.expect("send");
+
+    // Wait for a Pong frame to arrive on the client side.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pong = loop {
+        let bytes = session.received.lock().await.clone();
+        if let Ok(Some((frame, _))) = Frame::try_decode(&bytes) {
+            break frame;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("daemon did not respond to Ping within 5 s");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(pong.frame_type, FrameType::Pong);
+    assert!(pong.payload.is_empty(), "Pong payload MUST be empty");
 
     session.close().await;
     app.shutdown().await;

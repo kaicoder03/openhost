@@ -66,6 +66,13 @@ const DEFAULT_OFFER_TIMEOUT_SECS: u64 = 10;
 /// format is HTTP/1.1 (spec §4 per frame type 0x11).
 const RESPONSE_502_HEAD: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
 
+/// Default request-body cap applied when the daemon has no `[forward]`
+/// section configured — the stub 502 path still accumulates
+/// `REQUEST_BODY` frames until `REQUEST_END` arrives, so without a cap
+/// a hostile client could pile unbounded bytes into the per-DC
+/// `RequestInProgress` buffer before we ever get to refuse them.
+const STUB_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Map key identifying one tracked `RTCPeerConnection`. We use the
 /// `Arc::as_ptr` value: unique per Arc allocation, stable for the
 /// lifetime of the map entry (because the entry keeps the Arc alive),
@@ -442,9 +449,13 @@ async fn handle_frame(
                 let _ = send_error_frame(dc, "REQUEST_BODY before REQUEST_HEAD").await;
                 return FrameOutcome::Teardown;
             }
+            // Always cap the accumulated body — even on the stub-502 path
+            // where the bytes will be discarded on REQUEST_END. Without
+            // this, a hostile client could inflate memory on a daemon
+            // with no `[forward]` configured.
             let cap = forwarder
                 .map(Forwarder::max_body_bytes)
-                .unwrap_or(usize::MAX);
+                .unwrap_or(STUB_MAX_BODY_BYTES);
             if req.body.len().saturating_add(frame.payload.len()) > cap {
                 tracing::warn!(cap, "openhostd: request body exceeded cap; tearing down");
                 let _ = send_error_frame(dc, "request body too large").await;
@@ -522,16 +533,23 @@ async fn handle_frame(
 }
 
 /// Emit a forwarder response as `RESPONSE_HEAD` + `RESPONSE_BODY*` +
-/// `RESPONSE_END`. The body is chunked across multiple frames when it
-/// exceeds `MAX_PAYLOAD_LEN`.
+/// `RESPONSE_END`. Each frame is sent as its own SCTP message via
+/// [`RTCDataChannel::send`]. Bundling everything into one `send`
+/// overflows browser-side data-channel message caps (Chrome ≈ 256 KiB,
+/// historically 64 KiB) — one-frame-per-message keeps us within
+/// browser limits and also matches the "openhost frames are self-
+/// contained" contract the spec implies.
+///
+/// Body chunks are bounded by [`MAX_PAYLOAD_LEN`] (16 MiB − 1) per
+/// the wire codec; larger upstream bodies get split into multiple
+/// `RESPONSE_BODY` frames.
 async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(), webrtc::Error> {
-    let head =
-        Frame::new(FrameType::ResponseHead, resp.head_bytes).expect("response head is well-formed");
-    let mut out = Vec::with_capacity(1024);
-    head.encode(&mut out);
+    send_frame(
+        dc,
+        Frame::new(FrameType::ResponseHead, resp.head_bytes).expect("response head is well-formed"),
+    )
+    .await?;
 
-    // Chunk the body into RESPONSE_BODY frames bounded by the wire
-    // codec's per-frame max.
     let body = resp.body;
     let mut offset = 0;
     while offset < body.len() {
@@ -539,14 +557,23 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
         let slice = body.slice(offset..end);
         let body_frame = Frame::new(FrameType::ResponseBody, slice.to_vec())
             .expect("chunk length bounded by MAX_PAYLOAD_LEN");
-        body_frame.encode(&mut out);
+        send_frame(dc, body_frame).await?;
         offset = end;
     }
 
-    let end_frame = Frame::new(FrameType::ResponseEnd, Vec::new()).expect("ResponseEnd empty");
-    end_frame.encode(&mut out);
+    send_frame(
+        dc,
+        Frame::new(FrameType::ResponseEnd, Vec::new()).expect("ResponseEnd empty"),
+    )
+    .await?;
+    Ok(())
+}
 
-    dc.send(&Bytes::from(out)).await?;
+/// Encode one frame and send it as its own data-channel message.
+async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<(), webrtc::Error> {
+    let mut buf = Vec::with_capacity(5 + frame.payload.len());
+    frame.encode(&mut buf);
+    dc.send(&Bytes::from(buf)).await?;
     Ok(())
 }
 
@@ -554,15 +581,17 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
 /// no forwarder is configured AND as the fallback when the forwarder
 /// errors (upstream unreachable, body too large, etc.).
 async fn emit_stub_502(dc: &RTCDataChannel) -> Result<(), webrtc::Error> {
-    let response_head = Frame::new(FrameType::ResponseHead, RESPONSE_502_HEAD.to_vec())
-        .expect("502 head payload is well-formed");
-    let response_end =
-        Frame::new(FrameType::ResponseEnd, Vec::new()).expect("ResponseEnd has empty payload");
-
-    let mut out = Vec::with_capacity(RESPONSE_502_HEAD.len() + 16);
-    response_head.encode(&mut out);
-    response_end.encode(&mut out);
-    dc.send(&Bytes::from(out)).await?;
+    send_frame(
+        dc,
+        Frame::new(FrameType::ResponseHead, RESPONSE_502_HEAD.to_vec())
+            .expect("502 head payload is well-formed"),
+    )
+    .await?;
+    send_frame(
+        dc,
+        Frame::new(FrameType::ResponseEnd, Vec::new()).expect("ResponseEnd has empty payload"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -570,12 +599,12 @@ async fn emit_stub_502(dc: &RTCDataChannel) -> Result<(), webrtc::Error> {
 /// effort — failure is logged by the caller but doesn't prevent
 /// teardown.
 async fn send_error_frame(dc: &RTCDataChannel, reason: &str) -> Result<(), webrtc::Error> {
-    let frame = Frame::new(FrameType::Error, reason.as_bytes().to_vec())
-        .expect("error diagnostic is well-formed");
-    let mut out = Vec::with_capacity(5 + reason.len());
-    frame.encode(&mut out);
-    dc.send(&Bytes::from(out)).await?;
-    Ok(())
+    send_frame(
+        dc,
+        Frame::new(FrameType::Error, reason.as_bytes().to_vec())
+            .expect("error diagnostic is well-formed"),
+    )
+    .await
 }
 
 #[cfg(test)]
