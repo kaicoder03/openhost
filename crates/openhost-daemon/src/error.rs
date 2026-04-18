@@ -40,6 +40,10 @@ pub enum DaemonError {
     #[error(transparent)]
     OfferPoll(#[from] OfferPollError),
 
+    /// Pairing-database operation failed.
+    #[error(transparent)]
+    Pairing(#[from] crate::pairing::PairingError),
+
     /// Low-level I/O failure not caught by a more specific variant.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

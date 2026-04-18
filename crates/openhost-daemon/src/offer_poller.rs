@@ -25,6 +25,7 @@
 
 use crate::listener::PassivePeer;
 use crate::publish::SharedState;
+use crate::rate_limit::TokenBucket;
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_pkarr::{
     decode_offer_from_packet, hash_offer_sdp, AnswerEntry, AnswerPlaintext, Resolve,
@@ -45,6 +46,14 @@ pub struct OfferPollerConfig {
     pub watched_clients: Vec<PublicKey>,
     /// At most one offer per client per this duration is processed.
     pub per_client_throttle: Duration,
+    /// Whether to require the unsealed client pubkey to be in the
+    /// allow list before running `handle_offer`. See PR #7b.
+    pub enforce_allowlist: bool,
+    /// Token-bucket burst capacity per client pubkey.
+    pub rate_limit_burst: u32,
+    /// Token-bucket refill rate in tokens per second (= 1.0 /
+    /// `rate_limit_refill_secs` in the config).
+    pub rate_limit_refill_per_sec: f64,
 }
 
 impl Default for OfferPollerConfig {
@@ -53,6 +62,9 @@ impl Default for OfferPollerConfig {
             poll_interval: Duration::from_secs(1),
             watched_clients: Vec::new(),
             per_client_throttle: Duration::from_secs(5),
+            enforce_allowlist: true,
+            rate_limit_burst: 3,
+            rate_limit_refill_per_sec: 1.0 / 5.0,
         }
     }
 }
@@ -127,13 +139,17 @@ impl Drop for OfferPoller {
     }
 }
 
-/// Seen-cache entry: the highest `ts` we've already processed for this
-/// client, plus when we last touched the entry (for TTL eviction).
-#[derive(Debug, Clone, Copy)]
-struct Seen {
+/// Per-client cache entry. Bundles:
+/// - Seen-cache: the highest `ts` we've processed + last-touch time
+///   (for TTL eviction).
+/// - Token bucket: abuse-control gate on how often we'll spend CPU
+///   running `handle_offer` for this client.
+#[derive(Debug, Clone)]
+struct ClientState {
     last_ts: u64,
     last_touched: Instant,
     last_processed: Option<Instant>,
+    bucket: TokenBucket,
 }
 
 const SEEN_TTL: Duration = Duration::from_secs(600);
@@ -147,7 +163,7 @@ async fn run_poll_loop(
     cfg: OfferPollerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut seen: HashMap<PublicKey, Seen> = HashMap::new();
+    let mut seen: HashMap<PublicKey, ClientState> = HashMap::new();
     let mut ticker = tokio::time::interval(cfg.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval(..)` fires immediately on the first tick; that's exactly
@@ -185,7 +201,7 @@ async fn poll_one_cycle(
     state: &SharedState,
     publisher_trigger: &Arc<dyn Fn() + Send + Sync>,
     cfg: &OfferPollerConfig,
-    seen: &mut HashMap<PublicKey, Seen>,
+    seen: &mut HashMap<PublicKey, ClientState>,
 ) {
     let now_instant = Instant::now();
     let daemon_pk = identity.public_key();
@@ -230,7 +246,7 @@ async fn process_client_packet(
     state: &SharedState,
     publisher_trigger: &Arc<dyn Fn() + Send + Sync>,
     cfg: &OfferPollerConfig,
-    seen: &mut HashMap<PublicKey, Seen>,
+    seen: &mut HashMap<PublicKey, ClientState>,
     now_instant: Instant,
 ) {
     let offer_record = match decode_offer_from_packet(packet, daemon_pk) {
@@ -255,11 +271,16 @@ async fn process_client_packet(
     let packet_ts: u64 = packet.timestamp().into();
     let packet_ts_secs = packet_ts / openhost_pkarr::MICROS_PER_SECOND;
 
-    // Dedup + throttle.
-    let entry = seen.entry(*client_pk).or_insert(Seen {
+    // Dedup + throttle. Entry construction seeds a fresh token bucket.
+    let entry = seen.entry(*client_pk).or_insert_with(|| ClientState {
         last_ts: 0,
         last_touched: now_instant,
         last_processed: None,
+        bucket: TokenBucket::new(
+            cfg.rate_limit_burst,
+            cfg.rate_limit_refill_per_sec,
+            now_instant,
+        ),
     });
     entry.last_touched = now_instant;
     if packet_ts_secs <= entry.last_ts {
@@ -303,6 +324,38 @@ async fn process_client_packet(
             outer = %client_pk,
             inner = %plaintext.client_pk,
             "offer poll: inner client_pk mismatch; tearing down",
+        );
+        entry.last_ts = packet_ts_secs;
+        entry.last_processed = Some(now_instant);
+        return;
+    }
+
+    // PR #7b allowlist gate: reject offers from unpaired clients.
+    // Runs BEFORE the rate-limit consume so an unpaired flood can't
+    // drain a legitimate client's bucket (each pk has its own entry
+    // anyway, but the ordering is also cheap and readable).
+    //
+    // Note on log severity: the FIRST rejection for an unpaired pk
+    // logs at `warn!` so operators see the actionable message. Any
+    // subsequent tick from the same unpaired pk falls into the
+    // per-client throttle branch above and logs at `debug!` instead
+    // — preventing a single misconfigured client from flooding the
+    // daemon's `warn!` stream.
+    if cfg.enforce_allowlist && !state.is_client_allowed(client_pk) {
+        tracing::warn!(
+            client = %client_pk,
+            "offer poll: client is not in allowlist; skipping. Add via 'openhostd pair add'.",
+        );
+        entry.last_ts = packet_ts_secs;
+        entry.last_processed = Some(now_instant);
+        return;
+    }
+
+    // PR #7b rate-limit gate: consume a token. On empty bucket, skip.
+    if !entry.bucket.try_consume(now_instant) {
+        tracing::warn!(
+            client = %client_pk,
+            "offer poll: client rate-limited; skipping",
         );
         entry.last_ts = packet_ts_secs;
         entry.last_processed = Some(now_instant);

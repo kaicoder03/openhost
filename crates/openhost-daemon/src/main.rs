@@ -12,8 +12,10 @@
 //! tokio runtime.
 
 use clap::{Parser, Subcommand};
+use openhost_core::identity::PublicKey;
 use openhost_daemon::config::{self, Config};
 use openhost_daemon::identity_store::{load_or_create, FsKeyStore, KeyStore};
+use openhost_daemon::pairing;
 use openhost_daemon::{dtls_cert, init_tracing, App};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,6 +40,10 @@ enum Command {
     /// Identity management.
     #[command(subcommand)]
     Identity(IdentityCmd),
+
+    /// Pairing database management (authorized clients).
+    #[command(subcommand)]
+    Pair(PairCmd),
 }
 
 #[derive(Debug, Subcommand)]
@@ -47,6 +53,26 @@ enum IdentityCmd {
 
     /// Regenerate the DTLS certificate (keeps the Ed25519 identity).
     Rotate,
+}
+
+#[derive(Debug, Subcommand)]
+enum PairCmd {
+    /// Add a client to the pairing database.
+    Add {
+        /// z-base-32 client pubkey (52 chars).
+        pubkey: String,
+        /// Optional human-readable nickname for the operator's sanity.
+        /// Stays local; never enters the published pkarr record.
+        #[arg(long)]
+        nickname: Option<String>,
+    },
+    /// Remove a client from the pairing database.
+    Remove {
+        /// z-base-32 client pubkey (52 chars).
+        pubkey: String,
+    },
+    /// List the currently-paired clients.
+    List,
 }
 
 fn main() -> ExitCode {
@@ -106,8 +132,58 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 so the new fingerprint lands in the next signed record."
             );
         }
+        Command::Pair(pair_cmd) => run_pair(&cfg, pair_cmd)?,
     }
 
+    Ok(())
+}
+
+fn run_pair(cfg: &Config, cmd: PairCmd) -> anyhow::Result<()> {
+    let db_path = cfg
+        .pairing
+        .db_path
+        .clone()
+        .unwrap_or_else(pairing::default_db_path);
+    match cmd {
+        PairCmd::Add { pubkey, nickname } => {
+            let pk = PublicKey::from_zbase32(&pubkey)
+                .map_err(|e| anyhow::anyhow!("invalid pubkey {pubkey:?}: {e}"))?;
+            pairing::add(&db_path, &pk, nickname.clone())?;
+            println!("added {pk}");
+            if let Some(n) = nickname {
+                println!("  nickname: {n}");
+            }
+            eprintln!(
+                "openhostd: pair DB updated at {}. Send SIGHUP to the running daemon \
+                 (or restart) to apply.",
+                db_path.display(),
+            );
+        }
+        PairCmd::Remove { pubkey } => {
+            let pk = PublicKey::from_zbase32(&pubkey)
+                .map_err(|e| anyhow::anyhow!("invalid pubkey {pubkey:?}: {e}"))?;
+            pairing::remove(&db_path, &pk)?;
+            println!("removed {pk}");
+            eprintln!(
+                "openhostd: pair DB updated at {}. Send SIGHUP to the running daemon \
+                 (or restart) to apply.",
+                db_path.display(),
+            );
+        }
+        PairCmd::List => {
+            let db = pairing::load(&db_path)?;
+            if db.pairs.is_empty() {
+                eprintln!("openhostd: pair DB at {} is empty", db_path.display());
+            } else {
+                for entry in &db.pairs {
+                    match &entry.nickname {
+                        Some(n) => println!("{}  # {n}", entry.pubkey),
+                        None => println!("{}", entry.pubkey),
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

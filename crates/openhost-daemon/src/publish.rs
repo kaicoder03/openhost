@@ -16,7 +16,8 @@
 use crate::config::PkarrConfig;
 use crate::error::{PublishError, Result as DaemonResult};
 use hkdf::Hkdf;
-use openhost_core::identity::SigningKey;
+use openhost_core::crypto::allowlist_hash;
+use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::pkarr_record::{
     IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
 };
@@ -129,6 +130,47 @@ impl SharedState {
     /// Snapshot of the current allow list.
     pub fn allow(&self) -> Vec<[u8; 16]> {
         self.allow.read().expect("allow lock poisoned").clone()
+    }
+
+    /// Replace the entire allow list. Used by `App::run`'s SIGHUP
+    /// reload path to swap in a freshly-loaded pairing DB without
+    /// tearing down live sessions.
+    pub fn replace_allow(&self, hashes: Vec<[u8; 16]>) {
+        *self.allow.write().expect("allow lock poisoned") = hashes;
+    }
+
+    /// Whether a client pubkey's HMAC projection is currently in the
+    /// allow list. Recomputes `allowlist_hash(salt, client_pk)` and
+    /// consults the current snapshot.
+    #[must_use]
+    pub fn is_client_allowed(&self, client_pk: &PublicKey) -> bool {
+        let hash = allowlist_hash(&self.salt, &client_pk.to_bytes());
+        self.allow
+            .read()
+            .expect("allow lock poisoned")
+            .contains(&hash)
+    }
+
+    /// Insert a single precomputed hash into the allow list. Idempotent
+    /// (duplicate entries are dropped). Most callers use
+    /// [`replace_allow`] instead; this is exposed for mutation-style
+    /// tests and for a future TOFU-pairing flow.
+    ///
+    /// [`replace_allow`]: SharedState::replace_allow
+    pub fn add_client_hash(&self, hash: [u8; 16]) {
+        let mut guard = self.allow.write().expect("allow lock poisoned");
+        if !guard.contains(&hash) {
+            guard.push(hash);
+        }
+    }
+
+    /// Remove a single hash from the allow list. Returns whether the
+    /// hash was present before the call.
+    pub fn remove_client_hash(&self, hash: [u8; 16]) -> bool {
+        let mut guard = self.allow.write().expect("allow lock poisoned");
+        let before = guard.len();
+        guard.retain(|e| *e != hash);
+        before != guard.len()
     }
 
     /// Snapshot of the current ICE blob set.
@@ -390,6 +432,45 @@ mod tests {
         let sk_b = SigningKey::from_bytes(&other_seed);
         let s_other = SharedState::new(&sk_b, [0; DTLS_FINGERPRINT_LEN]).salt();
         assert_ne!(s1, s_other, "distinct identities must yield distinct salts");
+    }
+
+    #[test]
+    fn is_client_allowed_rehashes_and_checks() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let state = SharedState::new(&sk, [0; DTLS_FINGERPRINT_LEN]);
+        let client_pk = SigningKey::from_bytes(&[0x22; 32]).public_key();
+        assert!(!state.is_client_allowed(&client_pk));
+        let hash = allowlist_hash(&state.salt(), &client_pk.to_bytes());
+        state.add_client_hash(hash);
+        assert!(state.is_client_allowed(&client_pk));
+    }
+
+    #[test]
+    fn replace_allow_overwrites() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let state = SharedState::new(&sk, [0; DTLS_FINGERPRINT_LEN]);
+        state.add_client_hash([0x11; 16]);
+        state.replace_allow(vec![[0x22; 16], [0x33; 16]]);
+        let snap = state.allow();
+        assert_eq!(snap, vec![[0x22; 16], [0x33; 16]]);
+    }
+
+    #[test]
+    fn add_client_hash_is_idempotent() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let state = SharedState::new(&sk, [0; DTLS_FINGERPRINT_LEN]);
+        state.add_client_hash([0x11; 16]);
+        state.add_client_hash([0x11; 16]);
+        assert_eq!(state.allow().len(), 1);
+    }
+
+    #[test]
+    fn remove_client_hash_returns_presence() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let state = SharedState::new(&sk, [0; DTLS_FINGERPRINT_LEN]);
+        state.add_client_hash([0x11; 16]);
+        assert!(state.remove_client_hash([0x11; 16]));
+        assert!(!state.remove_client_hash([0x11; 16]));
     }
 
     #[test]

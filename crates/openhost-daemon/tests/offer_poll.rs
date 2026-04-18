@@ -51,6 +51,13 @@ fn daemon_config(
                 poll_secs: 1,
                 watched_clients: watched.iter().map(|pk| pk.to_zbase32()).collect(),
                 per_client_throttle_secs: 5,
+                // PR #7a semantics: tests here predate PR #7b's
+                // allowlist gate. The PR #7b integration tests in
+                // `tests/pairing_enforcement.rs` cover the enforced
+                // path explicitly.
+                enforce_allowlist: false,
+                rate_limit_burst: 3,
+                rate_limit_refill_secs: 5.0,
             },
         },
         dtls: DtlsConfig {
@@ -59,6 +66,7 @@ fn daemon_config(
         },
         forward: None,
         log: LogConfig::default(),
+        pairing: Default::default(),
     }
 }
 

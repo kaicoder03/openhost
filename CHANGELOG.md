@@ -8,8 +8,23 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Allowlist enforcement is on by default** (`pkarr.offer_poll.enforce_allowlist = true`). Upgraders running PR #7a configurations will see every inbound offer rejected until they either (a) pair their clients via `openhostd pair add <pubkey>`, or (b) explicitly set `enforce_allowlist = false` in the config. The daemon logs a startup `warn!` when enforcement is on, the pair DB is empty, and `watched_clients` is non-empty — operators see the misconfiguration in the first line of the boot log. The escape-hatch (`false`) preserves PR #7a's permissive behavior unchanged.
+
 ### Added
 
+- `openhost-daemon` M7b allowlist enforcement + per-client rate limit:
+  - New `openhost-daemon::pairing` module: plaintext TOML pair DB at `~/.config/openhost/allow.toml` (overridable via `pairing.db_path`), atomic write with mode 0600 on Unix, `PairingDb::compute_hashes` projects entries into the `_allow` HMAC hashes already published in the `_openhost` record. Missing file = empty list (first-run ergonomics); malformed file or duplicate entries = hard error.
+  - New `openhost-daemon::rate_limit::TokenBucket` — pure synchronous token-bucket keyed per `client_pk`. Caller threads `now: Instant` in, keeping the poller's existing `now_instant` reuse clean and making unit tests deterministic.
+  - `SharedState` gets `replace_allow`, `is_client_allowed`, `add_client_hash`, `remove_client_hash` helpers; `allow` now mutates at runtime via SIGHUP.
+  - `OfferPoller` gains two new gates, evaluated after unseal + cross-check: (1) `is_client_allowed` when `enforce_allowlist = true` (default); (2) `TokenBucket::try_consume` per `client_pk`. Both failure paths advance the dedup cursor so a bypass flood can't drive the daemon into a decrypt-every-tick workload. Allowlist runs before rate-limit so unauthorised peers can't drain legitimate peers' buckets.
+  - `signal::reload_signal()` awaits SIGHUP on Unix (returns `Pending` on Windows — pairing changes require a daemon restart there). `App::run` now drives `tokio::select! { biased; shutdown => break; reload => reload_pair_db + publisher.trigger(); }`, hot-swapping the allow list without tearing down live sessions.
+  - New CLI subcommand tree `openhostd pair {add <pubkey> [--nickname <str>], remove <pubkey>, list}`. Each mutation rewrites the TOML atomically and prints a reminder to SIGHUP the running daemon.
+  - Config surface: new `[pairing] db_path` top-level section + `pkarr.offer_poll.{enforce_allowlist, rate_limit_burst, rate_limit_refill_secs}`. `Config::validate` rejects zero burst, non-finite / non-positive refill.
+  - New `DaemonError::Pairing(PairingError)` variant. `PairingError::{Io, Toml, TomlSer, InvalidPubkey, Duplicate, AlreadyPresent, NotPresent}`.
+  - 4 new integration tests in `tests/pairing_enforcement.rs`: authorized client processed, unauthorized client rejected, `enforce_allowlist = false` preserves PR #7a behavior, and `rate_limit_burst = 2` caps a 5-offer burst to exactly 2 `handle_offer` calls. 15 new unit tests across `pairing` + `rate_limit` + `publish` (allowlist helpers).
+  - **Out of scope for this PR:** mid-session revocation of an already-authenticated DC (the binding-time cross-check of the allow list is a PR #7c item — today an authenticated session survives until the client naturally disconnects or the daemon shuts down). The offer-poll gate is the primary line of defense.
 - `openhost-daemon` M7a offer-record polling + per-client answer publishing:
   - New `openhost-pkarr::offer` module: `OfferRecord`/`OfferPlaintext`/`AnswerEntry`/`AnswerPlaintext` types, domain-separated inner-plaintext codec (`openhost-offer-inner1` / `openhost-answer-inner1`), sealed-box wrappers over libsodium `crypto_box_seal`, `host_hash_label` + `client_hash_label` helpers (z-base-32 of a 16-byte hash), and `encode_with_answers` which emits a single `SignedPacket` carrying the main `_openhost` TXT PLUS one extra `_answer-<client-hash>` TXT per queued answer. The encoder auto-evicts the oldest answers when the packet would exceed BEP44's 1000-byte `v` limit. 15 unit tests covering roundtrip, tamper, encoding invariance (with-empty-answers packets are byte-identical to `encode()`), and eviction.
   - New `openhost-pkarr::AnswerSource` hook on `Publisher` — a `FnMut() -> Vec<AnswerEntry>` the publisher calls each tick, folding the snapshot into the outgoing packet via `encode_with_answers`. Daemons that don't need it pass `None` and the bytes match the plain codec exactly.

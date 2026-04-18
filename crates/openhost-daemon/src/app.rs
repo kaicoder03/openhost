@@ -20,10 +20,12 @@ use crate::forward::Forwarder;
 use crate::identity_store::{load_or_create, FsKeyStore, KeyStore};
 use crate::listener::PassivePeer;
 use crate::offer_poller::{OfferPoller, OfferPollerConfig};
+use crate::pairing;
 use crate::publish::{self, PublishService, SharedState};
-use crate::signal::shutdown_signal;
+use crate::signal::{reload_signal, shutdown_signal};
 use openhost_core::identity::SigningKey;
 use openhost_pkarr::{InitialPublishOutcome, Resolve, Transport};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,12 +50,17 @@ pub struct App {
     /// on the `build_with_transport` test path that doesn't provide a
     /// resolver, keeping pre-PR #7a tests working without changes.
     poller: Option<OfferPoller>,
+    /// Resolved path to the pairing DB. Consulted on SIGHUP to reload
+    /// the allow list + trigger a republish.
+    pair_db_path: PathBuf,
 }
 
 impl App {
     /// Build the daemon against the real pkarr network.
     pub async fn build(cfg: Config) -> Result<Self> {
         let (identity, cert, state) = init_common(&cfg).await?;
+        let pair_db_path = resolve_pair_db_path(&cfg);
+        load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
         let listener =
             build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
@@ -74,6 +81,7 @@ impl App {
             publisher,
             listener,
             poller,
+            pair_db_path,
         })
     }
 
@@ -82,6 +90,8 @@ impl App {
     /// offer-polling path.
     pub async fn build_with_transport(cfg: Config, transport: Arc<dyn Transport>) -> Result<Self> {
         let (identity, cert, state) = init_common(&cfg).await?;
+        let pair_db_path = resolve_pair_db_path(&cfg);
+        load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
         let listener =
             build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
@@ -94,6 +104,7 @@ impl App {
             publisher,
             listener,
             poller: None,
+            pair_db_path,
         })
     }
 
@@ -107,6 +118,8 @@ impl App {
         resolver: Arc<dyn Resolve>,
     ) -> Result<Self> {
         let (identity, cert, state) = init_common(&cfg).await?;
+        let pair_db_path = resolve_pair_db_path(&cfg);
+        load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
         let listener =
             build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
@@ -127,7 +140,14 @@ impl App {
             publisher,
             listener,
             poller,
+            pair_db_path,
         })
+    }
+
+    /// Path to the pairing DB this daemon is using. Exposed for
+    /// integration tests that want to mutate the DB and send SIGHUP.
+    pub fn pair_db_path(&self) -> &Path {
+        &self.pair_db_path
     }
 
     /// The host's Ed25519 identity.
@@ -184,7 +204,39 @@ impl App {
             dtls_fp = %self.cert.fingerprint_colon_hex(),
             "openhostd: up",
         );
-        shutdown_signal().await;
+
+        // Drive the event loop: shutdown wins over concurrent SIGHUP
+        // (`biased;` makes the select poll the shutdown arm first).
+        // Rapid SIGHUP bursts coalesce at the tokio-signal layer and
+        // at the loop boundary — we reload at most once per iteration.
+        // Reload is idempotent: a later SIGHUP just runs the load +
+        // replace_allow again, so coalescing is acceptable.
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_signal() => {
+                    break;
+                }
+                _ = reload_signal() => {
+                    match reload_pair_db(&self.pair_db_path, &self.state) {
+                        Ok(count) => {
+                            tracing::info!(
+                                count,
+                                "openhostd: pairing DB reloaded; republishing",
+                            );
+                            self.publisher.trigger();
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                "openhostd: pairing DB reload failed; keeping previous allow list",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::info!("openhostd: shutdown signal received, stopping publisher");
         // Order: listener first (tears down in-flight DTLS); poller
         // next (stops the loop that might otherwise push a late answer
@@ -316,6 +368,9 @@ fn build_offer_poller(
             poll_interval: Duration::from_secs(cfg_poll.poll_secs),
             watched_clients: watched,
             per_client_throttle: Duration::from_secs(cfg_poll.per_client_throttle_secs),
+            enforce_allowlist: cfg_poll.enforce_allowlist,
+            rate_limit_burst: cfg_poll.rate_limit_burst,
+            rate_limit_refill_per_sec: 1.0 / cfg_poll.rate_limit_refill_secs,
         },
     ))
 }
@@ -337,6 +392,55 @@ fn build_forwarder(cfg: &Config) -> Result<Option<Arc<Forwarder>>> {
         }
         None => Ok(None),
     }
+}
+
+/// Resolve the pairing DB path from config, falling back to the
+/// platform default.
+fn resolve_pair_db_path(cfg: &Config) -> PathBuf {
+    cfg.pairing
+        .db_path
+        .clone()
+        .unwrap_or_else(pairing::default_db_path)
+}
+
+/// Load the pairing DB into `state.allow`. Missing file = empty allow
+/// list (not an error). Malformed file IS an error.
+fn load_pair_db_into_state(path: &Path, state: &SharedState, cfg: &Config) -> Result<()> {
+    let db = pairing::load(path)?;
+    let hashes = db.compute_hashes(&state.salt());
+    let count = hashes.len();
+    state.replace_allow(hashes);
+    tracing::info!(
+        count,
+        path = %path.display(),
+        "openhostd: loaded pairing DB",
+    );
+    // Startup warn: enforce_allowlist=on + empty DB + non-empty
+    // watched_clients is almost always a misconfiguration — operators
+    // upgrading from PR #7a will otherwise see every connection
+    // rejected without a clear explanation in the log.
+    if cfg.pkarr.offer_poll.enforce_allowlist
+        && count == 0
+        && !cfg.pkarr.offer_poll.watched_clients.is_empty()
+    {
+        tracing::warn!(
+            "openhostd: allowlist enforcement is on but the pair DB is empty; \
+             no client offer will be accepted. Add clients with \
+             `openhostd pair add <pubkey>` or set \
+             `pkarr.offer_poll.enforce_allowlist = false` in the config.",
+        );
+    }
+    Ok(())
+}
+
+/// Re-read the pairing DB + swap the allow list atomically. Used by
+/// the SIGHUP handler. Returns the new entry count on success.
+fn reload_pair_db(path: &Path, state: &SharedState) -> Result<usize> {
+    let db = pairing::load(path)?;
+    let hashes = db.compute_hashes(&state.salt());
+    let count = hashes.len();
+    state.replace_allow(hashes);
+    Ok(count)
 }
 
 /// Install a global `tracing_subscriber` with the configured level filter.
