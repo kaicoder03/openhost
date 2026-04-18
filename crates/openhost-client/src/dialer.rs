@@ -27,8 +27,8 @@ use openhost_core::pkarr_record::SignedRecord;
 use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::offer::{OfferPlaintext, OfferRecord, OFFER_TXT_PREFIX, OFFER_TXT_TTL};
 use openhost_pkarr::{
-    decode_answer_from_packet, hash_offer_sdp, host_hash_label, PkarrResolve, PkarrTransport,
-    Resolve, Resolver, Transport, DEFAULT_RELAYS,
+    decode_answer_fragments_from_packet, hash_offer_sdp, host_hash_label, PkarrResolve,
+    PkarrTransport, Resolve, Resolver, Transport, DEFAULT_RELAYS,
 };
 use pkarr::dns::rdata::TXT;
 use pkarr::dns::Name;
@@ -390,7 +390,7 @@ impl Dialer {
                 return Err(ClientError::PollAnswerTimeout(budget.as_secs()));
             }
             if let Some(packet) = self.resolver.resolve_most_recent(&pkarr_pk).await {
-                match decode_answer_from_packet(&packet, daemon_salt, &client_pk) {
+                match decode_answer_fragments_from_packet(&packet, daemon_salt, &client_pk) {
                     Ok(Some(entry)) => {
                         let opened = entry
                             .open(&self.identity)
