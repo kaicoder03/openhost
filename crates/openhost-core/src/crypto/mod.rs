@@ -72,8 +72,8 @@ pub mod x25519_from_ed25519 {
         // Zeroize scratch buffers before returning.
         let out = XSecretKey::from_bytes(&clamped);
         seed.zeroize();
-        let mut hash_copy = hash;
-        hash_copy.zeroize();
+        let mut hash = hash;
+        hash.zeroize();
         clamped.zeroize();
         out
     }
