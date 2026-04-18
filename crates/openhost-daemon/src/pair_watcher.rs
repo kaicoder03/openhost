@@ -28,7 +28,22 @@
 //! directory) emits a `warn!` at `spawn` time and returns `None`; the
 //! daemon keeps running and pairing changes fall back to the SIGHUP
 //! path (Unix) or a restart (Windows). Errors after spawn are logged
-//! and the thread survives.
+//! and the thread survives. A panicking bridge thread (unexpected but
+//! possible if a downstream `tracing` subscriber fails) is caught and
+//! logged via `tracing::error!` before the thread exits, so silent
+//! failure of auto-reload is observable in the daemon's log.
+//!
+//! # Filesystem caveats
+//!
+//! The underlying `notify` crate uses inotify on Linux, FSEvents on
+//! macOS, and ReadDirectoryChangesW on Windows. Events do **not** fire
+//! reliably on network filesystems (NFS, SMB, FUSE-backed mounts).
+//! Operators who put the pair DB on a remote filesystem should expect
+//! the watcher to silently miss events and should either move the DB
+//! to a local path or rely on SIGHUP (Unix) / daemon restart (Windows)
+//! to apply changes. The initial spawn usually still succeeds on such
+//! filesystems, so `warn!`-on-failure is not a substitute for this
+//! caveat.
 
 use crate::error::PairWatcherError;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
@@ -107,7 +122,25 @@ impl PairWatcher {
         let target_display = path.display().to_string();
         let join = thread::Builder::new()
             .name("openhost-pair-watcher".into())
-            .spawn(move || Self::bridge(sync_rx, async_tx, &target_filename, &target_display))
+            .spawn(move || {
+                // Catch unwind so a panicking event callback (e.g., a
+                // `tracing` subscriber that failed half-way through) is
+                // loud rather than silent. Auto-reload stops either way,
+                // but an error line in the log is the difference
+                // between a bug report and a mystery.
+                let path = target_display.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::bridge(sync_rx, async_tx, &target_filename, &target_display)
+                }));
+                if let Err(payload) = result {
+                    let msg = panic_payload_msg(&payload);
+                    tracing::error!(
+                        path = %path,
+                        panic = %msg,
+                        "openhostd: pair-DB watcher bridge thread panicked; auto-reload disabled until daemon restart",
+                    );
+                }
+            })
             .map_err(PairWatcherError::ThreadSpawn)?;
 
         tracing::info!(
@@ -176,11 +209,23 @@ impl PairWatcher {
     pub fn shutdown(mut self) {
         drop(self._debouncer);
         if let Some(join) = self.join.take() {
-            // `unwrap_or_else(|_|)` swallows a panicking bridge thread —
-            // logged there already. Joining still matters for
-            // deterministic shutdown.
+            // A panicking bridge thread is caught and logged before
+            // the thread exits; `join` here just returns `Err(_)` if
+            // the panic propagated past the catch, which we still
+            // discard — shutdown should not itself panic.
             let _ = join.join();
         }
+    }
+}
+
+/// Best-effort extraction of a panic payload's `&str` message.
+fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 
