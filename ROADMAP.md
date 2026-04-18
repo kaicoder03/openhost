@@ -16,7 +16,7 @@ Three items from the `v0.1.0` release notes are user-visible enough to block a m
 - **Ship `openhost-dial` as a first-class client CLI.** `v0.1.0` shipped `openhost-resolve` for record inspection only. A new `openhost-dial oh://<host>[/path]` binary makes the first end-to-end HTTP round-trip achievable from the terminal — no Rust library integration required.
 - **Hot-reload the pairing allowlist on every platform.** Today `openhostd pair add/remove` needs SIGHUP on Unix and a full daemon restart on Windows. A file-watcher on the pair-DB path removes the requirement for both, with SIGHUP retained as a secondary trigger.
 
-Each PR lands with tests, documentation, and a short note in `CHANGELOG.md`.
+Each Phase 1 PR lands with tests, documentation, and a short note in `CHANGELOG.md`.
 
 ## Phase 2 — docs so testers can actually try it
 
