@@ -1,0 +1,34 @@
+# openhostd configuration for exposing a Jellyfin REST API.
+#
+# READ the README in this directory first — WebSocket-based features
+# (live notifications, some playback paths) do NOT work at v0.1.0
+# because Upgrade: websocket is globally rejected.
+
+[identity]
+store = { kind = "fs", path = "~/.config/openhost/identity.key" }
+
+[pkarr]
+relays = []
+republish_secs = 1800
+
+[pkarr.offer_poll]
+enforce_allowlist = false
+poll_secs = 1
+watched_clients = []
+
+[dtls]
+cert_path = "~/.config/openhost/dtls.pem"
+rotate_secs = 86400
+
+[forward]
+# Jellyfin's default HTTP port. Change to match your install if you've
+# reconfigured it (the Jellyfin web UI defaults to 8096 over HTTP and
+# 8920 over HTTPS; openhost forwards plaintext HTTP only at v0.1.0).
+target = "http://127.0.0.1:8096"
+
+# Jellyfin's API responses can include large JPG posters and library
+# metadata. 32 MiB is comfortable; raise if you hit the cap.
+max_body_bytes = 33554432   # 32 MiB
+
+[log]
+level = "info"

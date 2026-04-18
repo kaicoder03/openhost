@@ -1,0 +1,37 @@
+# openhostd configuration for exposing Home Assistant's REST API.
+#
+# READ the README in this directory first — the HASS web UI and
+# Companion apps both rely on WebSockets, which openhost v0.1.0
+# rejects globally. This example enables the REST API surface only.
+
+[identity]
+store = { kind = "fs", path = "~/.config/openhost/identity.key" }
+
+[pkarr]
+relays = []
+republish_secs = 1800
+
+[pkarr.offer_poll]
+enforce_allowlist = false
+poll_secs = 1
+watched_clients = []
+
+[dtls]
+cert_path = "~/.config/openhost/dtls.pem"
+rotate_secs = 86400
+
+[forward]
+# Home Assistant's default port.
+target = "http://127.0.0.1:8123"
+
+# HASS rejects requests whose `Host` header doesn't match one of the
+# entries in `http.use_x_forwarded_for` / `http.trusted_proxies`.
+# Pinning the forwarded Host to the upstream's authority sidesteps
+# that check entirely — HASS sees a request that looks like it came
+# from localhost, because on the daemon's side of the hop it did.
+host_override = "127.0.0.1:8123"
+
+max_body_bytes = 16777216   # 16 MiB
+
+[log]
+level = "info"
