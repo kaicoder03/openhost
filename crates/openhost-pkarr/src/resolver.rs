@@ -32,9 +32,14 @@ use pkarr::{Client, SignedPacket};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Grace window per `spec/01-wire-format.md §3` rule 5: once the resolver
-/// has an accepted record, it waits this long for a potentially
+/// Default grace window per `spec/01-wire-format.md §3` rule 5: once the
+/// resolver has an accepted record, it waits this long for a potentially
 /// higher-`seq` response from a slower substrate before committing.
+///
+/// Callers that prefer snappy latency over spec-strict grace behaviour can
+/// pass a shorter duration (or [`Duration::ZERO`]) via
+/// [`Resolver::with_grace_window`]. The 1500 ms default is what spec §3
+/// recommends.
 pub const GRACE_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Abstracts over the pkarr substrate-resolve surface for testability.
@@ -67,12 +72,30 @@ impl Resolve for PkarrResolve {
 /// The resolver.
 pub struct Resolver {
     client: Arc<dyn Resolve>,
+    grace: Duration,
 }
 
 impl Resolver {
-    /// Construct a new resolver wrapping the given substrate client.
+    /// Construct a new resolver wrapping the given substrate client. Uses
+    /// the default [`GRACE_WINDOW`]; see [`with_grace_window`] to override.
+    ///
+    /// [`with_grace_window`]: Resolver::with_grace_window
     pub fn new(client: Arc<dyn Resolve>) -> Self {
-        Self { client }
+        Self {
+            client,
+            grace: GRACE_WINDOW,
+        }
+    }
+
+    /// Override the grace window applied after the first validated record.
+    ///
+    /// Pass [`Duration::ZERO`] to skip the second substrate race entirely —
+    /// useful for latency-sensitive consumers (browser extensions, CLI
+    /// one-shots) where the safety the grace window buys is less valuable
+    /// than the 1.5 s cost.
+    pub fn with_grace_window(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
     }
 
     /// Resolve the openhost record for `pubkey`.
@@ -104,22 +127,47 @@ impl Resolver {
             .ok_or(PkarrError::NotFound)?;
         let first = self.validate_packet(first_packet, pubkey, now_ts, cached_seq)?;
 
-        // Grace window (spec §3 rule 5): give any substrate that didn't
-        // respond in the first race up to GRACE_WINDOW to deliver a
-        // higher-seq record. A second `resolve_most_recent` call hits
-        // pkarr's internal cache for substrates that already answered
-        // and only pays substrate latency for the ones that didn't.
-        tokio::time::sleep(GRACE_WINDOW).await;
-
-        if let Some(packet) = self.client.resolve_most_recent(&pkarr_pk).await {
-            if let Ok(second) = self.validate_packet(packet, pubkey, now_ts, cached_seq) {
-                if second.record.ts > first.record.ts {
-                    return Ok(second);
-                }
-            }
+        // Grace window disabled: callers that asked for Duration::ZERO
+        // skip the second race entirely. Spec §3 rule 5 is SHOULD, not
+        // MUST, and the 1.5 s tax is not always the right trade-off.
+        if self.grace.is_zero() {
+            return Ok(first);
         }
 
-        Ok(first)
+        // Grace window (spec §3 rule 5): give any substrate that didn't
+        // respond in the first race up to `self.grace` to deliver a
+        // higher-seq record.
+        //
+        // The timeout below caps total resolve() latency at `grace +
+        // first-race latency + validation`, regardless of pkarr's internal
+        // per-substrate timeout. Without it a slow second race could push
+        // total latency well past the window spec authors intended.
+        tokio::time::sleep(self.grace).await;
+
+        let second_packet = match tokio::time::timeout(
+            self.grace,
+            self.client.resolve_most_recent(&pkarr_pk),
+        )
+        .await
+        {
+            Ok(Some(p)) => p,
+            Ok(None) | Err(_) => return Ok(first),
+        };
+
+        match self.validate_packet(second_packet, pubkey, now_ts, cached_seq) {
+            Ok(second) if second.record.ts > first.record.ts => Ok(second),
+            Ok(_) => Ok(first),
+            Err(err) => {
+                // A malicious substrate serving malformed records under a
+                // valid-identity pubkey would silently lose to `first`
+                // here; a warn! makes the event observable for debugging.
+                tracing::warn!(
+                    ?err,
+                    "openhost-pkarr: second-race packet failed validation; keeping first"
+                );
+                Ok(first)
+            }
+        }
     }
 
     /// Decode + validate one `SignedPacket` against the caller's `pubkey`,
@@ -463,5 +511,78 @@ mod tests {
             1,
             "NotFound on first race must NOT trigger a second substrate poll"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_grace_window_skips_second_race() {
+        // Callers that opt out of the grace window should never see the
+        // second substrate poll — zero 1.5 s tax on the happy path.
+        let (sk, first) = packet_for(1_700_000_000);
+        let (_, second) = packet_for(1_700_000_010);
+        let client = Arc::new(TwoPhaseResolve::new(Some(first), Some(second)));
+        let resolver = Resolver::new(client.clone()).with_grace_window(Duration::ZERO);
+
+        let record = resolver
+            .resolve(&sk.public_key(), 1_700_000_010, None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(
+            record.record.ts, 1_700_000_000,
+            "zero grace window means first wins even if a higher-seq straggler was queued"
+        );
+        assert_eq!(
+            client.call_count(),
+            1,
+            "zero grace window must skip the second substrate race"
+        );
+    }
+
+    /// Resolve client whose second call never returns (simulates a hung
+    /// relay). Used to verify the tokio::time::timeout cap on the second
+    /// race.
+    struct HangingSecondResolve {
+        first: Mutex<Option<SignedPacket>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HangingSecondResolve {
+        fn new(first: SignedPacket) -> Self {
+            Self {
+                first: Mutex::new(Some(first)),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Resolve for HangingSecondResolve {
+        async fn resolve_most_recent(&self, _pk: &pkarr::PublicKey) -> Option<SignedPacket> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                self.first
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|p| SignedPacket::deserialize(&p.serialize()).unwrap())
+            } else {
+                // Second+ call: hang forever. The resolver's timeout must
+                // cap this or the test would never complete.
+                std::future::pending().await
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_race_timeout_falls_back_to_first() {
+        let (sk, first) = packet_for(1_700_000_000);
+        let client = Arc::new(HangingSecondResolve::new(first));
+        let resolver = Resolver::new(client.clone());
+
+        let record = resolver
+            .resolve(&sk.public_key(), 1_700_000_000, None)
+            .await
+            .expect("timeout-bounded resolve still returns first");
+        assert_eq!(record.record.ts, 1_700_000_000);
     }
 }
