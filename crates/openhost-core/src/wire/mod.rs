@@ -48,6 +48,17 @@ pub enum FrameType {
     /// Transparent RFC 6455 WebSocket frame, following a successful upgrade.
     WsFrame = 0x21,
 
+    /// Channel-binding nonce sent by the daemon post-DTLS-Connected
+    /// (spec §3 step 9). Payload: 32 random bytes.
+    AuthNonce = 0x30,
+    /// Client's channel-binding response (spec §3 step 9).
+    /// Payload: 32-byte Ed25519 `client_pk` || 64-byte
+    /// `sig_client(auth_bytes(host_pk, client_pk, nonce))`.
+    AuthClient = 0x31,
+    /// Daemon's channel-binding response (spec §3 step 9).
+    /// Payload: 64-byte `sig_host(auth_bytes(host_pk, client_pk, nonce))`.
+    AuthHost = 0x32,
+
     /// Application-layer diagnostic error. Payload is a UTF-8 string.
     Error = 0xF0,
 
@@ -69,6 +80,9 @@ impl FrameType {
             0x13 => Self::ResponseEnd,
             0x20 => Self::WsUpgrade,
             0x21 => Self::WsFrame,
+            0x30 => Self::AuthNonce,
+            0x31 => Self::AuthClient,
+            0x32 => Self::AuthHost,
             0xF0 => Self::Error,
             0xFE => Self::Ping,
             0xFF => Self::Pong,

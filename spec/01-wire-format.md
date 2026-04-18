@@ -126,6 +126,29 @@ Client                                                    Daemon
   │ 10. HTTP-over-DataChannel framing begins (§4).           │
 ```
 
+> **TODO(v0.1 freeze).** Two implementation deviations from step 9 need
+> to be reconciled against this text before v0.1 ships:
+>
+> 1. **Message order is inverted.** The reference implementation in
+>    `openhost-daemon` sends `AuthNonce` first, then the *client* signs
+>    (`AuthClient` = 32-byte `client_pk` || 64-byte `sig_client`), then
+>    the daemon replies (`AuthHost` = 64-byte `sig_host`). This is
+>    required because PR #5.5 ships before PR #7's offer-record
+>    plumbing — without an offer record, the daemon has no source of
+>    truth for `client_pk` before the client speaks, and cannot compute
+>    `auth_bytes` on its own. Once PR #7 lands, the spec text and the
+>    flow should reunify.
+> 2. **Binding bytes live in HKDF `info`, not exporter `context`.**
+>    `webrtc-dtls` v0.17.x rejects a non-empty exporter `context`
+>    (`ContextUnsupported`). The reference implementation calls
+>    `tls_exporter(label = "EXPORTER-openhost-auth-v1", context = "",
+>    length = 32)` and then passes `info = "openhost-auth-v1" || h || c
+>    || n` into HKDF. This is cryptographically equivalent (the
+>    exporter secret is still session-unique; HKDF still commits to
+>    `host_pk || client_pk || nonce`) but the spec layers it the other
+>    way. The fix lands when the upstream DTLS crate accepts a
+>    non-empty context.
+
 ### 3.1 DTLS role
 
 The daemon **MUST** assert `a=setup:passive` in its SDP. The client **MUST** assert `a=setup:active`. Receivers **MUST** reject SDP that does not match these assignments.
@@ -163,6 +186,13 @@ payload        = *OCTET                 ; exactly `length` octets
 ;                          daemon configuration explicitly permits WebSocket upgrades
 ;                          for the target path.
 ;   0x21  WS_FRAME         Transparent RFC 6455 frame after a successful 0x20 exchange.
+;
+;   0x30  AUTH_NONCE       Daemon → Client. 32 random bytes. Sent once per data
+;                          channel, immediately after DTLS Connected (§3 step 9).
+;   0x31  AUTH_CLIENT      Client → Daemon. 32-byte Ed25519 client_pk || 64-byte
+;                          Ed25519 sig_client(auth_bytes(host_pk, client_pk, nonce)).
+;   0x32  AUTH_HOST        Daemon → Client. 64-byte Ed25519
+;                          sig_host(auth_bytes(host_pk, client_pk, nonce)).
 ;
 ;   0xFE  PING             Empty payload; keepalive request.
 ;   0xFF  PONG             Empty payload; keepalive response.

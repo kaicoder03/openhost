@@ -18,7 +18,10 @@ pub mod channel_binding;
 pub mod sealed_box;
 
 pub use allowlist_hmac::{allowlist_hash, ALLOWLIST_HASH_LEN};
-pub use channel_binding::{auth_bytes, AUTH_BYTES_LEN, AUTH_CONTEXT_LABEL, AUTH_HKDF_SALT};
+pub use channel_binding::{
+    auth_bytes, auth_bytes_bound, exporter_context, AUTH_BYTES_LEN, AUTH_CONTEXT_LABEL,
+    AUTH_HKDF_SALT,
+};
 pub use sealed_box::{
     open as sealed_box_open, seal as sealed_box_seal, XPublicKey, XSecretKey, XPUBLIC_KEY_LEN,
     XSECRET_KEY_LEN,
