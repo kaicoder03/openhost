@@ -13,6 +13,7 @@
 
 use crate::codec;
 use crate::error::{PkarrError, Result};
+use crate::offer::{encode_with_answers, AnswerEntry};
 use async_trait::async_trait;
 use openhost_core::identity::SigningKey;
 use openhost_core::pkarr_record::{OpenhostRecord, SignedRecord};
@@ -102,6 +103,16 @@ impl Transport for PkarrTransport {
 /// current `allow` list) and set a fresh `ts` per publication.
 pub type RecordSource = Box<dyn FnMut() -> OpenhostRecord + Send>;
 
+/// Produces a snapshot of the daemon's per-client answer records each
+/// publish cycle (PR #7a). The returned entries are folded into the
+/// same [`SignedPacket`] as the main `_openhost` TXT; see
+/// [`crate::offer::encode_with_answers`] for the layout.
+///
+/// Typical producer: a closure over the daemon's `SharedState` that
+/// calls `drain_answer_snapshot`. Publishers without an answer source
+/// (the common case before PR #7a) pass `None`.
+pub type AnswerSource = Box<dyn FnMut() -> Vec<AnswerEntry> + Send>;
+
 /// Handle returned from [`Publisher::spawn`] — keeps the background task
 /// alive and provides a trigger channel for on-demand republishes.
 ///
@@ -128,6 +139,17 @@ impl PublisherHandle {
     /// channel is full (a publish is already queued).
     pub fn trigger(&self) {
         let _ = self.trigger_tx.try_send(());
+    }
+
+    /// Return a cloneable `Arc<dyn Fn() + Send + Sync>` that, when
+    /// called, triggers a republish. Useful for handing into other
+    /// subsystems (e.g. the daemon's offer poller) without coupling
+    /// them to `PublisherHandle` directly.
+    pub fn trigger_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let tx = self.trigger_tx.clone();
+        Arc::new(move || {
+            let _ = tx.try_send(());
+        })
     }
 
     /// Abort the background republish task and await its completion.
@@ -185,6 +207,7 @@ pub struct Publisher {
     transport: Arc<dyn Transport>,
     signing_key: Arc<SigningKey>,
     record_source: RecordSource,
+    answer_source: Option<AnswerSource>,
     last_seq: Option<u64>,
     interval: Duration,
 }
@@ -205,6 +228,7 @@ impl Publisher {
             transport,
             signing_key,
             record_source,
+            answer_source: None,
             last_seq: initial_last_seq,
             interval: REPUBLISH_INTERVAL,
         }
@@ -216,13 +240,56 @@ impl Publisher {
         self
     }
 
+    /// Install an [`AnswerSource`]. When set, every publish folds the
+    /// source's snapshot into the same `SignedPacket` as the main
+    /// `_openhost` record.
+    pub fn with_answer_source(mut self, source: AnswerSource) -> Self {
+        self.answer_source = Some(source);
+        self
+    }
+
     /// Sign, encode, and publish a single record **now**. Updates `last_seq`
     /// on success.
+    ///
+    /// When an answer source is installed via [`with_answer_source`], the
+    /// emitted packet carries one `_answer._<client-hash>` TXT per entry
+    /// alongside the main `_openhost` TXT.
+    ///
+    /// [`with_answer_source`]: Publisher::with_answer_source
     pub async fn publish_once(&mut self) -> Result<u64> {
         let record = (self.record_source)();
         let ts = record.ts;
+        // Bump the record ts forward if it would collide with the last
+        // published seq (BEP44 CAS requires strictly monotonic seq).
+        // This matters under PR #7a's 1 Hz poll cadence: two offers
+        // arriving within the same wall-clock second would otherwise
+        // share a seq and the second publish would fail with a CAS
+        // conflict.
+        let ts = match self.last_seq {
+            Some(last) if ts <= last => {
+                let bumped = last.saturating_add(1);
+                tracing::warn!(
+                    previous = last,
+                    would_be = ts,
+                    bumped_to = bumped,
+                    "openhost-pkarr: record.ts would collide with last seq; bumping",
+                );
+                bumped
+            }
+            _ => ts,
+        };
+        let mut record = record;
+        record.ts = ts;
         let signed = SignedRecord::sign(record, &self.signing_key)?;
-        let packet = codec::encode(&signed, &self.signing_key)?;
+        let answers = match self.answer_source.as_mut() {
+            Some(source) => source(),
+            None => Vec::new(),
+        };
+        let packet = if answers.is_empty() {
+            codec::encode(&signed, &self.signing_key)?
+        } else {
+            encode_with_answers(&signed, &self.signing_key, &answers)?
+        };
         let cas = self
             .last_seq
             .map(|s| Timestamp::from(s * codec::MICROS_PER_SECOND));
@@ -604,5 +671,108 @@ mod tests {
         let calls = transport.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, Some(seed_ts));
+    }
+
+    // ---- Answer-source hook (PR #7a) ----
+
+    /// Transport that captures the full serialized packet bytes so tests
+    /// can decode and inspect the TXT records the publisher emitted.
+    #[derive(Default)]
+    struct CapturingTransport {
+        packets: Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl Transport for CapturingTransport {
+        async fn publish(&self, packet: &SignedPacket, _cas: Option<Timestamp>) -> Result<()> {
+            // Use `serialize()` (not `as_bytes()`) so the captured bytes
+            // round-trip through `SignedPacket::deserialize`: the former
+            // prepends the 8-byte last_seen that deserialize expects.
+            self.packets.lock().unwrap().push(packet.serialize());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_once_without_answer_source_matches_plain_codec() {
+        let transport = Arc::new(CapturingTransport::default());
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let record_source: RecordSource = Box::new(|| sample_record(1_700_000_000));
+        let mut publisher = Publisher::new(transport.clone(), sk, record_source, None);
+        publisher.publish_once().await.unwrap();
+        // Rebuild the expected packet via plain codec::encode and compare
+        // against the captured packet's `as_bytes()` view (i.e. strip the
+        // 8-byte last_seen prefix the capture prepended).
+        let captured = &transport.packets.lock().unwrap()[0];
+        let captured_core = &captured[8..];
+        let expected = codec::encode(
+            &SignedRecord::sign(
+                sample_record(1_700_000_000),
+                &SigningKey::from_bytes(&RFC_SEED),
+            )
+            .unwrap(),
+            &SigningKey::from_bytes(&RFC_SEED),
+        )
+        .unwrap();
+        assert_eq!(captured_core, expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn publish_once_folds_in_answer_entries() {
+        use crate::offer::{hash_offer_sdp, AnswerEntry, AnswerPlaintext};
+        use openhost_core::pkarr_record::SALT_LEN;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let transport = Arc::new(CapturingTransport::default());
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        let daemon_pk = sk.public_key();
+        let record_source: RecordSource = Box::new(|| sample_record(1_700_000_000));
+
+        let client_sk = SigningKey::from_bytes(&[0x77u8; 32]);
+        let client_pk = client_sk.public_key();
+        let salt = [0x11u8; SALT_LEN];
+        let answer_sdp = "v=0\r\na=setup:passive\r\n";
+        let plaintext = AnswerPlaintext {
+            daemon_pk,
+            offer_sdp_hash: hash_offer_sdp("v=0\r\na=setup:active\r\n"),
+            answer_sdp: answer_sdp.to_string(),
+        };
+        let mut rng = StdRng::from_seed([0x42; 32]);
+        let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, 42).unwrap();
+
+        let answer_source: AnswerSource = {
+            let entry = entry.clone();
+            Box::new(move || vec![entry.clone()])
+        };
+        let mut publisher = Publisher::new(transport.clone(), sk, record_source, None)
+            .with_answer_source(answer_source);
+        publisher.publish_once().await.unwrap();
+
+        let raw = &transport.packets.lock().unwrap()[0];
+        let packet = SignedPacket::deserialize(raw).unwrap();
+        let decoded = crate::offer::decode_answer_from_packet(&packet, &salt, &client_pk)
+            .unwrap()
+            .expect("answer TXT present");
+        let opened = decoded.open(&client_sk).unwrap();
+        assert_eq!(opened.answer_sdp, answer_sdp);
+    }
+
+    #[tokio::test]
+    async fn publish_once_bumps_colliding_ts() {
+        let transport = Arc::new(FakeTransport::default());
+        let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
+        // Both record_source calls return the SAME ts — simulates two
+        // offers processed in the same wall-clock second under the
+        // PR #7a poll cadence.
+        let record_source: RecordSource = Box::new(|| sample_record(1_700_000_000));
+        let mut publisher = Publisher::new(transport.clone(), sk, record_source, None);
+
+        let first = publisher.publish_once().await.unwrap();
+        let second = publisher.publish_once().await.unwrap();
+        assert_eq!(first, 1_700_000_000);
+        // The second publish's ts MUST be strictly greater than the first,
+        // otherwise BEP44 CAS would reject it.
+        assert!(second > first, "colliding ts must bump forward");
     }
 }

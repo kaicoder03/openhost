@@ -19,10 +19,11 @@ use crate::error::Result;
 use crate::forward::Forwarder;
 use crate::identity_store::{load_or_create, FsKeyStore, KeyStore};
 use crate::listener::PassivePeer;
+use crate::offer_poller::{OfferPoller, OfferPollerConfig};
 use crate::publish::{self, PublishService, SharedState};
 use crate::signal::shutdown_signal;
 use openhost_core::identity::SigningKey;
-use openhost_pkarr::{InitialPublishOutcome, Transport};
+use openhost_pkarr::{InitialPublishOutcome, Resolve, Transport};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +44,10 @@ pub struct App {
     state: Arc<SharedState>,
     publisher: PublishService,
     listener: Arc<PassivePeer>,
+    /// Offer-record poller. `Some` on the production build path; `None`
+    /// on the `build_with_transport` test path that doesn't provide a
+    /// resolver, keeping pre-PR #7a tests working without changes.
+    poller: Option<OfferPoller>,
 }
 
 impl App {
@@ -52,18 +57,29 @@ impl App {
         let forwarder = build_forwarder(&cfg)?;
         let listener =
             build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
-        let publisher = publish::start(&cfg.pkarr, identity.clone(), state.clone()).await?;
+        let (publisher, resolver) =
+            publish::start(&cfg.pkarr, identity.clone(), state.clone()).await?;
+        let poller = build_offer_poller(
+            &cfg,
+            identity.clone(),
+            Arc::clone(&listener),
+            state.clone(),
+            resolver,
+            &publisher,
+        );
         Ok(Self {
             identity,
             cert,
             state,
             publisher,
             listener,
+            poller,
         })
     }
 
-    /// Build the daemon with a caller-supplied [`Transport`]. Used by
-    /// integration tests to swap in a fake that doesn't open sockets.
+    /// Build the daemon with a caller-supplied [`Transport`] (no
+    /// resolver). Used by integration tests that don't exercise the
+    /// offer-polling path.
     pub async fn build_with_transport(cfg: Config, transport: Arc<dyn Transport>) -> Result<Self> {
         let (identity, cert, state) = init_common(&cfg).await?;
         let forwarder = build_forwarder(&cfg)?;
@@ -77,6 +93,40 @@ impl App {
             state,
             publisher,
             listener,
+            poller: None,
+        })
+    }
+
+    /// Build the daemon with caller-supplied transport AND resolver.
+    /// PR #7a integration tests use this to drive a scripted offer
+    /// response through the full poll → handle_offer → answer-publish
+    /// flow without hitting the network.
+    pub async fn build_with_transport_and_resolve(
+        cfg: Config,
+        transport: Arc<dyn Transport>,
+        resolver: Arc<dyn Resolve>,
+    ) -> Result<Self> {
+        let (identity, cert, state) = init_common(&cfg).await?;
+        let forwarder = build_forwarder(&cfg)?;
+        let listener =
+            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+        let publisher =
+            publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
+        let poller = build_offer_poller(
+            &cfg,
+            identity.clone(),
+            Arc::clone(&listener),
+            state.clone(),
+            resolver,
+            &publisher,
+        );
+        Ok(Self {
+            identity,
+            cert,
+            state,
+            publisher,
+            listener,
+            poller,
         })
     }
 
@@ -136,7 +186,13 @@ impl App {
         );
         shutdown_signal().await;
         tracing::info!("openhostd: shutdown signal received, stopping publisher");
+        // Order: listener first (tears down in-flight DTLS); poller
+        // next (stops the loop that might otherwise push a late answer
+        // into the publisher); publisher last.
         self.listener.shutdown().await;
+        if let Some(p) = self.poller {
+            p.shutdown().await;
+        }
         self.publisher.shutdown().await;
         tracing::info!("openhostd: bye");
         Ok(())
@@ -170,6 +226,9 @@ impl App {
     /// signal. Intended for integration tests.
     pub async fn shutdown(self) {
         self.listener.shutdown().await;
+        if let Some(p) = self.poller {
+            p.shutdown().await;
+        }
         self.publisher.shutdown().await;
     }
 }
@@ -219,6 +278,46 @@ async fn build_listener(
 ) -> Result<Arc<PassivePeer>> {
     let peer = PassivePeer::new(cert.certificate.clone(), identity, state, forwarder).await?;
     Ok(Arc::new(peer))
+}
+
+/// Spawn an [`OfferPoller`] from the config's `offer_poll` section.
+/// Returns `None` when `watched_clients` is empty — no poller is
+/// needed.
+fn build_offer_poller(
+    cfg: &Config,
+    identity: Arc<SigningKey>,
+    listener: Arc<PassivePeer>,
+    state: Arc<SharedState>,
+    resolver: Arc<dyn Resolve>,
+    publisher: &PublishService,
+) -> Option<OfferPoller> {
+    let cfg_poll = &cfg.pkarr.offer_poll;
+    // Parse z-base-32 client pubkeys; `Config::validate` already
+    // guaranteed they decode, so the unwrap cannot fire in prod.
+    let watched: Vec<_> = cfg_poll
+        .watched_clients
+        .iter()
+        .filter_map(|s| openhost_core::identity::PublicKey::from_zbase32(s).ok())
+        .collect();
+    if watched.is_empty() {
+        return None;
+    }
+    let trigger: Arc<dyn Fn() + Send + Sync> = {
+        let handle = publisher.trigger_handle();
+        Arc::new(move || handle())
+    };
+    Some(OfferPoller::spawn(
+        identity,
+        resolver,
+        listener,
+        state,
+        trigger,
+        OfferPollerConfig {
+            poll_interval: Duration::from_secs(cfg_poll.poll_secs),
+            watched_clients: watched,
+            per_client_throttle: Duration::from_secs(cfg_poll.per_client_throttle_secs),
+        },
+    ))
 }
 
 /// Build a [`Forwarder`] from the daemon's `ForwardConfig`, or return

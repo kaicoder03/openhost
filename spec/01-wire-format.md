@@ -157,6 +157,78 @@ The daemon **MUST** assert `a=setup:passive` in its SDP. The client **MUST** ass
 
 The `fp` value in the host's Pkarr record pins the expected DTLS certificate fingerprint. A client **MUST** abort the connection if the fingerprint negotiated during the DTLS handshake does not exactly equal `fp`. This prevents unknown-key-share attacks even in the presence of a malicious Pkarr relay (see [`04-security.md`](04-security.md)).
 
+### 3.3 Offer and answer records
+
+> **TODO(v0.1 freeze).** This section describes the PR #7a implementation of
+> offer-record polling + per-client answer publishing. The
+> names/sizes below are wire-visible; treat as authoritative for the
+> reference implementation. Fold into the main spec text at v0.1 cut.
+
+**Offer (client → daemon).** Per §3 step 5, the client publishes a
+`SignedPacket` under its own Ed25519 pubkey containing **one** TXT
+record at the single-label name
+
+```
+_offer-<host-hash-label>
+```
+
+where `host-hash-label = z_base_32(SHA-256(b"openhost-offer-host-v1" || daemon_pk)[0..16])`
+— a 26-character lower-case alphanumeric string. The TXT value is
+`base64url_nopad(sealed_ct)` where `sealed_ct` is a libsodium sealed-box
+(`crypto_box_seal`) of the following canonical plaintext, addressed to
+`public_key_to_x25519(daemon_pk)`:
+
+```
+offer_plaintext = 0x01
+               || "openhost-offer-inner1"       (21 bytes)
+               || client_pk                     (32 bytes)
+               || sdp_len                       (u32 big-endian)
+               || offer_sdp_utf8                (sdp_len bytes)
+```
+
+The inner `client_pk` MUST match the outer BEP44 signer pubkey. The
+daemon verifies this on decode and rejects a mismatch.
+
+**Answer (daemon → client).** The daemon publishes answer records as
+**extra** TXT entries inside its existing `_openhost` `SignedPacket`, at
+the single-label name
+
+```
+_answer-<client-hash-label>
+```
+
+where `client-hash-label = z_base_32(allowlist_hash(daemon_salt, client_pk))`
+— reusing the same HMAC construction `_allow` uses (see §2). Putting
+the answer TXT inside the same packet as `_openhost` is required because
+BEP44 permits only one mutable item per pubkey.
+
+The TXT value is `base64url_nopad(sealed_ct)` with plaintext:
+
+```
+answer_plaintext = 0x01
+                || "openhost-answer-inner1"     (22 bytes)
+                || daemon_pk                    (32 bytes)
+                || offer_sdp_hash               (32 bytes, SHA-256 of the
+                                                 UTF-8 offer SDP being
+                                                 answered)
+                || sdp_len                      (u32 big-endian)
+                || answer_sdp_utf8              (sdp_len bytes)
+```
+
+`offer_sdp_hash` binds the answer to a specific offer; a racing
+adversary cannot splice a valid answer onto a different offer. The
+inner `daemon_pk` MUST match the outer BEP44 signer.
+
+TXT TTL for both records is 30 seconds (ephemeral per-handshake).
+
+**Encoder constraint (eviction).** The main `_openhost` record + all
+`_answer.*` entries MUST fit in the BEP44 1000-byte limit. When an
+answer would overflow, the daemon evicts oldest entries (lowest
+creation timestamp first). This implies the answer publish path is
+best-effort — under congestion the oldest paired client loses its
+pending answer. The v0.1 freeze PR tightens this via separate ICE
+trickle records so full SDPs fit.
+
 ## 4. HTTP-over-DataChannel framing (ABNF)
 
 Frames on an openhost data channel are binary, length-prefixed, and typed.

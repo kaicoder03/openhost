@@ -36,6 +36,7 @@ fn test_config(dir: &TempDir, upstream_port: u16) -> Config {
         pkarr: PkarrConfig {
             relays: vec![],
             republish_secs: 3600,
+            offer_poll: Default::default(),
         },
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),

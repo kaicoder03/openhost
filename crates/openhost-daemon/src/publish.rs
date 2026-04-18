@@ -21,9 +21,11 @@ use openhost_core::pkarr_record::{
     IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
 };
 use openhost_pkarr::{
-    PkarrTransport, Publisher, PublisherHandle, RecordSource, Transport, DEFAULT_RELAYS,
+    AnswerEntry, AnswerSource, PkarrResolve, PkarrTransport, Publisher, PublisherHandle,
+    RecordSource, Resolve, Transport, CLIENT_HASH_LEN, DEFAULT_RELAYS,
 };
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +54,15 @@ pub struct SharedState {
     allow: RwLock<Vec<[u8; 16]>>,
     ice: RwLock<Vec<IceBlob>>,
     roles: String,
+    /// Per-client answer records queued for publication. Keyed by
+    /// `client_hash` (HMAC of `client_pk` under the daemon's salt) so a
+    /// later answer for the same client overwrites the previous one.
+    /// Drained on every publish via [`drain_answer_snapshot`]; the
+    /// entries remain in the map across publishes so stale resolvers
+    /// still see the most recent answer.
+    ///
+    /// [`drain_answer_snapshot`]: SharedState::drain_answer_snapshot
+    answers: RwLock<HashMap<[u8; CLIENT_HASH_LEN], AnswerEntry>>,
 }
 
 impl SharedState {
@@ -70,7 +81,29 @@ impl SharedState {
             allow: RwLock::new(Vec::new()),
             ice: RwLock::new(Vec::new()),
             roles: "server".to_string(),
+            answers: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Queue an answer entry for publication. The entry is keyed on
+    /// `entry.client_hash`; a later entry for the same client overwrites
+    /// the previous one.
+    pub fn push_answer(&self, entry: AnswerEntry) {
+        self.answers
+            .write()
+            .expect("answers lock poisoned")
+            .insert(entry.client_hash, entry);
+    }
+
+    /// Snapshot of every queued answer. The publisher's `AnswerSource`
+    /// calls this on each publish.
+    pub fn drain_answer_snapshot(&self) -> Vec<AnswerEntry> {
+        self.answers
+            .read()
+            .expect("answers lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Replace the DTLS fingerprint (for cert rotation). Callers MUST
@@ -134,6 +167,14 @@ impl PublishService {
         self.handle.trigger();
     }
 
+    /// Return a cloneable trigger callable. The offer poller uses this
+    /// to request an immediate republish whenever it stashes a new
+    /// answer; a plain `Fn()` keeps the poller agnostic of the
+    /// underlying channel plumbing.
+    pub fn trigger_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+        self.handle.trigger_handle()
+    }
+
     /// Wait for the underlying publisher's initial-publish retry loop
     /// to terminate (success or exhaustion). Delegates to
     /// [`openhost_pkarr::PublisherHandle::await_initial_publish`].
@@ -152,13 +193,20 @@ impl PublishService {
 }
 
 /// Start the publisher against a real `pkarr::Client`.
+///
+/// Returns the running [`PublishService`] alongside a [`Resolve`] handle
+/// built from the same underlying `pkarr::Client` — the offer poller
+/// (PR #7a) uses that handle to look up per-client offer records.
 pub async fn start(
     cfg: &PkarrConfig,
     identity: Arc<SigningKey>,
     state: Arc<SharedState>,
-) -> DaemonResult<PublishService> {
-    let transport = build_default_transport(cfg)?;
-    Ok(start_with_transport(cfg, identity, state, transport))
+) -> DaemonResult<(PublishService, Arc<dyn Resolve>)> {
+    let client = build_default_client(cfg)?;
+    let transport: Arc<dyn Transport> = Arc::new(PkarrTransport::new(Arc::clone(&client)));
+    let resolver: Arc<dyn Resolve> = Arc::new(PkarrResolve::new(client));
+    let service = start_with_transport(cfg, identity, state, transport);
+    Ok((service, resolver))
 }
 
 /// Start the publisher against an already-constructed [`Transport`].
@@ -173,16 +221,24 @@ pub fn start_with_transport(
         let state = state.clone();
         Box::new(move || state.snapshot_record())
     };
+    let answer_source: AnswerSource = {
+        let state = state.clone();
+        Box::new(move || state.drain_answer_snapshot())
+    };
 
     let publisher = Publisher::new(transport, identity, record_source, None)
-        .with_interval(Duration::from_secs(cfg.republish_secs));
+        .with_interval(Duration::from_secs(cfg.republish_secs))
+        .with_answer_source(answer_source);
 
     PublishService {
         handle: publisher.spawn(),
     }
 }
 
-fn build_default_transport(cfg: &PkarrConfig) -> DaemonResult<Arc<dyn Transport>> {
+/// Build a `pkarr::Client` from the daemon config. Shared between the
+/// publisher side (via [`PkarrTransport`]) and the resolver side (via
+/// [`PkarrResolve`]) so both sides consult the same relay set.
+pub(crate) fn build_default_client(cfg: &PkarrConfig) -> DaemonResult<Arc<pkarr::Client>> {
     let relays: Vec<&str> = if cfg.relays.is_empty() {
         DEFAULT_RELAYS.to_vec()
     } else {
@@ -206,7 +262,7 @@ fn build_default_transport(cfg: &PkarrConfig) -> DaemonResult<Arc<dyn Transport>
         .build()
         .map_err(|e| PublishError::ClientBuild(e.to_string()))?;
 
-    Ok(Arc::new(PkarrTransport::new(Arc::new(client))))
+    Ok(Arc::new(client))
 }
 
 #[cfg(test)]
@@ -242,6 +298,7 @@ mod tests {
         PkarrConfig {
             relays: vec![],
             republish_secs: 3600, // keep the ticker inert; only the initial publish fires
+            offer_poll: Default::default(),
         }
     }
 

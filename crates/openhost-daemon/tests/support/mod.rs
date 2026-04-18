@@ -21,9 +21,10 @@ use openhost_daemon::channel_binding::{
     AUTH_HOST_PAYLOAD_LEN, AUTH_NONCE_LEN, EXPORTER_LABEL, EXPORTER_SECRET_LEN,
 };
 use openhost_daemon::App;
-use openhost_pkarr::{Result as PkarrResult, Transport};
+use openhost_pkarr::{Resolve, Result as PkarrResult, Transport};
 use pkarr::{SignedPacket, Timestamp};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use webrtc::api::APIBuilder;
@@ -45,6 +46,68 @@ pub struct NoopTransport;
 impl Transport for NoopTransport {
     async fn publish(&self, _packet: &SignedPacket, _cas: Option<Timestamp>) -> PkarrResult<()> {
         Ok(())
+    }
+}
+
+/// A [`Transport`] that records every published packet as serialized
+/// bytes (via `SignedPacket::serialize`, which prepends the 8-byte
+/// last_seen prefix that `deserialize` expects).
+///
+/// Used by PR #7a's offer-poll integration tests to inspect the TXT
+/// records the daemon emits in response to a scripted offer.
+#[derive(Default)]
+pub struct CaptureTransport {
+    pub packets: StdMutex<Vec<Vec<u8>>>,
+}
+
+impl CaptureTransport {
+    pub fn snapshot(&self) -> Vec<Vec<u8>> {
+        self.packets.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Transport for CaptureTransport {
+    async fn publish(&self, packet: &SignedPacket, _cas: Option<Timestamp>) -> PkarrResult<()> {
+        self.packets.lock().unwrap().push(packet.serialize());
+        Ok(())
+    }
+}
+
+/// A [`Resolve`] that serves whatever `SignedPacket` is stashed under a
+/// given pkarr pubkey. Tests stage a sealed offer via `set_packet`
+/// before kicking the poller.
+#[derive(Default)]
+pub struct ScriptedResolve {
+    // Key: pkarr pubkey's 32-byte representation (z-base-32 form).
+    // Value: serialized `SignedPacket` bytes (via `serialize()`).
+    map: StdMutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl ScriptedResolve {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Stash a packet to be returned for `pubkey`. Later calls overwrite.
+    pub fn set_packet(&self, pubkey: &PublicKey, packet: &SignedPacket) {
+        let key = pubkey.to_zbase32();
+        self.map.lock().unwrap().insert(key, packet.serialize());
+    }
+
+    /// Remove the stashed packet for `pubkey`. Subsequent resolves return None.
+    pub fn clear(&self, pubkey: &PublicKey) {
+        let key = pubkey.to_zbase32();
+        self.map.lock().unwrap().remove(&key);
+    }
+}
+
+#[async_trait]
+impl Resolve for ScriptedResolve {
+    async fn resolve_most_recent(&self, pubkey: &pkarr::PublicKey) -> Option<SignedPacket> {
+        let key = pubkey.to_z32();
+        let raw = self.map.lock().unwrap().get(&key).cloned()?;
+        SignedPacket::deserialize(&raw).ok()
     }
 }
 
@@ -130,6 +193,7 @@ pub fn test_config_noforward(dir: &tempfile::TempDir) -> openhost_daemon::Config
         pkarr: PkarrConfig {
             relays: vec![],
             republish_secs: 3600,
+            offer_poll: Default::default(),
         },
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),
