@@ -20,6 +20,10 @@ once it reaches a tagged release.
   - `pkarr_record` module: `OpenhostRecord` schema, canonical deterministic signing bytes, and `SignedRecord::sign`/`verify` with 2-hour freshness window.
   - Reference JSON test vectors under `spec/test-vectors/` for every primitive, consumed by the crate's integration tests so the spec and implementation cannot drift.
   - End-to-end protocol exercise that walks spec §8 across all four modules.
+- `openhost-pkarr` M3.2 resolver + publisher hardening:
+  - `resolver::resolve` now implements the 1.5-second grace window from `spec/01-wire-format.md §3` rule 5. After the first validated record is accepted, the resolver sleeps `openhost_pkarr::GRACE_WINDOW` and issues a second substrate race; any higher-`seq` record that validates during the window is preferred. A factored `validate_packet` helper applies identical drift / verify / seq-regression checks to both races. `NotFound` on the first race fast-fails without waiting.
+  - `publisher::spawn` wraps the initial publish in an exponential-backoff retry: `INITIAL_PUBLISH_ATTEMPTS = 3`, backoffs `INITIAL_PUBLISH_BACKOFF * 2^(n-1)` = 500 ms / 1 s between attempts. On success: `info!`. On intermediate failure: `warn!` with the next retry delay. On all-fail: `error!` and a fall-through to the normal 30-minute ticker so the task stays alive.
+  - New tests (+7): `resolver` grace-window cases — prefers higher-seq straggler, keeps first on lower-seq / absent / validation-failing second, no straggler race on NotFound; `publisher` retry cases — succeeds after two transport failures, gives up cleanly after `INITIAL_PUBLISH_ATTEMPTS`. Grace-window tests use `#[tokio::test(start_paused = true)]` via the `test-util` tokio feature so virtual time skips the 1.5 s sleep.
 - `openhost-daemon` M3.1 bootstrap:
   - Library + `openhostd` binary: `run`, `identity show`, `identity rotate` subcommands.
   - `config` module: TOML schema for identity, Pkarr, DTLS, logging; `deny_unknown_fields`; HTTPS-only relay URL validation. `directories` backs the platform default path.

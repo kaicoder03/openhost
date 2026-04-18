@@ -33,4 +33,6 @@ hex = { workspace = true, optional = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 hex = { workspace = true }
-tokio = { workspace = true }
+# `test-util` for `tokio::time::pause`/`start_paused=true` — keeps grace-window
+# tests from actually sleeping 1.5s each.
+tokio = { workspace = true, features = ["test-util"] }

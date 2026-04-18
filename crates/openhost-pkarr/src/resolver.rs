@@ -14,6 +14,11 @@
 //!    internal consistency.
 //! 4. If the caller supplied a `cached_seq`, reject any record whose
 //!    `record.ts < cached_seq` (spec §3 rule 5).
+//! 5. **Grace window** — after accepting the first validated record, wait
+//!    [`GRACE_WINDOW`] for a higher-`seq` straggler from a slower
+//!    substrate and prefer it if one arrives. Implements the "continue
+//!    waiting on in-flight queries for up to 1.5 seconds" rule from
+//!    `spec/01-wire-format.md §3` rule 5.
 //!
 //! A [`Resolve`] trait lets tests plug a fake client. The real `pkarr::Client`
 //! is adapted by [`PkarrResolve`].
@@ -25,6 +30,12 @@ use openhost_core::identity::{PublicKey, PUBLIC_KEY_LEN};
 use openhost_core::pkarr_record::SignedRecord;
 use pkarr::{Client, SignedPacket};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Grace window per `spec/01-wire-format.md §3` rule 5: once the resolver
+/// has an accepted record, it waits this long for a potentially
+/// higher-`seq` response from a slower substrate before committing.
+pub const GRACE_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Abstracts over the pkarr substrate-resolve surface for testability.
 #[async_trait]
@@ -82,23 +93,50 @@ impl Resolver {
         let pkarr_pk =
             pkarr::PublicKey::try_from(&pk_bytes).map_err(|_| PkarrError::PublicKeyConversion)?;
 
-        // TODO(M3): `pkarr::Client::resolve_most_recent` returns as soon as it
-        // has a validated response; it does not implement the 1.5-second
-        // grace window from spec §3 rule 5 ("continue waiting on in-flight
-        // queries for up to 1.5 seconds after the first accepted record; if
-        // a later-arriving record has a higher `seq`, prefer it"). Adding
-        // that requires either a custom race over individual substrate calls
-        // or an upstream pkarr change.
-        let packet = self
+        // First race: fail-fast if NotFound or first packet fails validation.
+        // `resolve_most_recent` already queries all configured substrates in
+        // parallel and returns the highest-seq response it saw within its
+        // internal timeout.
+        let first_packet = self
             .client
             .resolve_most_recent(&pkarr_pk)
             .await
             .ok_or(PkarrError::NotFound)?;
+        let first = self.validate_packet(first_packet, pubkey, now_ts, cached_seq)?;
+
+        // Grace window (spec §3 rule 5): give any substrate that didn't
+        // respond in the first race up to GRACE_WINDOW to deliver a
+        // higher-seq record. A second `resolve_most_recent` call hits
+        // pkarr's internal cache for substrates that already answered
+        // and only pays substrate latency for the ones that didn't.
+        tokio::time::sleep(GRACE_WINDOW).await;
+
+        if let Some(packet) = self.client.resolve_most_recent(&pkarr_pk).await {
+            if let Ok(second) = self.validate_packet(packet, pubkey, now_ts, cached_seq) {
+                if second.record.ts > first.record.ts {
+                    return Ok(second);
+                }
+            }
+        }
+
+        Ok(first)
+    }
+
+    /// Decode + validate one `SignedPacket` against the caller's `pubkey`,
+    /// `now_ts`, and `cached_seq`. Factored out so the grace-window path
+    /// can apply identical checks to both races.
+    fn validate_packet(
+        &self,
+        packet: SignedPacket,
+        pubkey: &PublicKey,
+        now_ts: u64,
+        cached_seq: Option<u64>,
+    ) -> Result<SignedRecord> {
+        let packet_ts_micros: u64 = packet.timestamp().into();
+        let packet_ts_secs = packet_ts_micros / codec::MICROS_PER_SECOND;
 
         let signed = codec::decode(&packet)?;
 
-        let packet_ts_micros: u64 = packet.timestamp().into();
-        let packet_ts_secs = packet_ts_micros / codec::MICROS_PER_SECOND;
         let drift = packet_ts_secs.abs_diff(signed.record.ts);
         if drift > 1 {
             return Err(PkarrError::TimestampDrift {
@@ -152,7 +190,7 @@ mod tests {
         (sk, packet)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resolves_fresh_record() {
         let ts = 1_700_000_000;
         let (sk, packet) = packet_for(ts);
@@ -167,7 +205,7 @@ mod tests {
         assert_eq!(record.record.ts, ts);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn returns_not_found_when_substrate_empty() {
         let sk = SigningKey::from_bytes(&RFC_SEED);
         let resolver = Resolver::new(Arc::new(FakeResolve { packet: None }));
@@ -178,7 +216,7 @@ mod tests {
         assert!(matches!(err, PkarrError::NotFound));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rejects_stale_record() {
         let ts = 1_700_000_000;
         let (sk, packet) = packet_for(ts);
@@ -193,7 +231,7 @@ mod tests {
         assert!(matches!(err, PkarrError::Core(_)));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rejects_seq_regression() {
         let ts = 1_700_000_000;
         let (sk, packet) = packet_for(ts);
@@ -208,7 +246,7 @@ mod tests {
         assert!(matches!(err, PkarrError::SeqRegression { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn accepts_cached_seq_equal_to_record_ts() {
         let ts = 1_700_000_000;
         let (sk, packet) = packet_for(ts);
@@ -223,7 +261,7 @@ mod tests {
         assert_eq!(record.record.ts, ts);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rejects_timestamp_drift_between_packet_and_record() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine as _;
@@ -264,5 +302,166 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PkarrError::TimestampDrift { .. }));
+    }
+
+    // -- Grace-window tests ----------------------------------------------
+    //
+    // `TwoPhaseResolve` answers the first `resolve_most_recent` call with
+    // `first` and every subsequent call with `second`. Lets us simulate a
+    // slow substrate delivering a higher-`seq` straggler inside the 1.5s
+    // window.
+
+    use std::sync::Mutex;
+
+    struct TwoPhaseResolve {
+        first: Mutex<Option<SignedPacket>>,
+        second: Mutex<Option<SignedPacket>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TwoPhaseResolve {
+        fn new(first: Option<SignedPacket>, second: Option<SignedPacket>) -> Self {
+            Self {
+                first: Mutex::new(first),
+                second: Mutex::new(second),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Resolve for TwoPhaseResolve {
+        async fn resolve_most_recent(&self, _pk: &pkarr::PublicKey) -> Option<SignedPacket> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // First call drains `first`; every later call reads `second`.
+            if let Some(p) = self.first.lock().unwrap().take() {
+                return Some(SignedPacket::deserialize(&p.serialize()).unwrap());
+            }
+            self.second
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|p| SignedPacket::deserialize(&p.serialize()).unwrap())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_window_prefers_higher_seq_straggler() {
+        let (sk, first) = packet_for(1_700_000_000);
+        let (_, second) = packet_for(1_700_000_010);
+        let client = Arc::new(TwoPhaseResolve::new(Some(first), Some(second)));
+        let resolver = Resolver::new(client.clone());
+
+        let record = resolver
+            .resolve(&sk.public_key(), 1_700_000_010, None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(
+            record.record.ts, 1_700_000_010,
+            "higher-seq straggler inside the grace window must win"
+        );
+        assert_eq!(
+            client.call_count(),
+            2,
+            "resolver must race the substrates twice (first + after grace)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_window_keeps_first_if_second_has_lower_seq() {
+        let (sk, first) = packet_for(1_700_000_050);
+        let (_, second) = packet_for(1_700_000_010);
+        let client = Arc::new(TwoPhaseResolve::new(Some(first), Some(second)));
+        let resolver = Resolver::new(client.clone());
+
+        let record = resolver
+            .resolve(&sk.public_key(), 1_700_000_050, None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(record.record.ts, 1_700_000_050);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_window_keeps_first_if_second_returns_nothing() {
+        let (sk, first) = packet_for(1_700_000_000);
+        let client = Arc::new(TwoPhaseResolve::new(Some(first), None));
+        let resolver = Resolver::new(client.clone());
+
+        let record = resolver
+            .resolve(&sk.public_key(), 1_700_000_000, None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(record.record.ts, 1_700_000_000);
+        assert_eq!(client.call_count(), 2, "grace-window race still fires");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_window_keeps_first_if_second_fails_validation() {
+        // Second packet has a drift > 1s between outer timestamp and inner
+        // record.ts — validate_packet rejects it. Resolver must fall back
+        // to the valid first packet.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let (sk, first) = packet_for(1_700_000_000);
+
+        let signed =
+            openhost_core::pkarr_record::SignedRecord::sign(sample_record(1_700_000_010), &sk)
+                .unwrap();
+        let canonical = signed.record.canonical_signing_bytes().unwrap();
+        let mut blob = Vec::with_capacity(64 + canonical.len());
+        blob.extend_from_slice(&signed.signature.to_bytes());
+        blob.extend_from_slice(&canonical);
+        let encoded = URL_SAFE_NO_PAD.encode(&blob);
+        let keypair = pkarr::Keypair::from_secret_key(&sk.to_bytes());
+        // Outer ts drifts 5s from inner record.ts=1_700_000_010 → rejected.
+        let drifted_micros = (1_700_000_010 + 5) * codec::MICROS_PER_SECOND;
+        let second = SignedPacket::builder()
+            .txt(
+                pkarr::dns::Name::new_unchecked(codec::OPENHOST_TXT_NAME),
+                pkarr::dns::rdata::TXT::try_from(encoded.as_str()).unwrap(),
+                codec::OPENHOST_TXT_TTL,
+            )
+            .timestamp(pkarr::Timestamp::from(drifted_micros))
+            .sign(&keypair)
+            .unwrap();
+
+        let client = Arc::new(TwoPhaseResolve::new(Some(first), Some(second)));
+        let resolver = Resolver::new(client.clone());
+
+        let record = resolver
+            .resolve(&sk.public_key(), 1_700_000_000, None)
+            .await
+            .expect("first packet remains valid even though second fails validation");
+        assert_eq!(record.record.ts, 1_700_000_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_window_skipped_when_first_not_found() {
+        // If the first race returns None, the resolver fast-fails with
+        // NotFound — no point waiting 1.5s for a straggler that nobody
+        // has reason to believe exists.
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let client = Arc::new(TwoPhaseResolve::new(None, None));
+        let resolver = Resolver::new(client.clone());
+
+        let err = resolver
+            .resolve(&sk.public_key(), 1_700_000_000, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PkarrError::NotFound));
+        assert_eq!(
+            client.call_count(),
+            1,
+            "NotFound on first race must NOT trigger a second substrate poll"
+        );
     }
 }
