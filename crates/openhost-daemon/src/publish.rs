@@ -17,7 +17,6 @@ use crate::config::PkarrConfig;
 use crate::error::{PublishError, Result as DaemonResult};
 use hkdf::Hkdf;
 use openhost_core::identity::SigningKey;
-use zeroize::Zeroize;
 use openhost_core::pkarr_record::{
     IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
 };
@@ -27,6 +26,7 @@ use openhost_pkarr::{
 use sha2::Sha256;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 /// Domain-separation salt for the allowlist-salt derivation. Stable across
 /// openhost protocol versions so a daemon rebooted on the same identity

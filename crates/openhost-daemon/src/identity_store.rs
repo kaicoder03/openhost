@@ -14,8 +14,8 @@
 use crate::error::{KeyStoreError, Result as DaemonResult};
 use async_trait::async_trait;
 use openhost_core::identity::{SigningKey, SIGNING_KEY_LEN};
-use zeroize::Zeroize;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 
 /// Crate-local result alias for keystore operations.
 pub type Result<T> = core::result::Result<T, KeyStoreError>;
