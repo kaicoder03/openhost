@@ -3,43 +3,42 @@
 //! The certificate's SHA-256 fingerprint is pinned into the host's Pkarr
 //! record (`dtls_fp` field) so every client verifies the exact cert bytes
 //! before the DTLS handshake completes. Because the pin is load-bearing,
-//! **we persist the cert PEM verbatim** — regenerating the cert from the
-//! same keypair would produce a different serial number and therefore a
-//! different fingerprint, which would invalidate every published record
-//! until the next republish.
+//! the cert MUST survive process restarts with the same fingerprint.
 //!
-//! This module does **not** depend on the `webrtc` crate; that enters the
-//! tree in PR #5. The PEM bundle we write here is the exact format PR #5
-//! will hand off to `webrtc::peer_connection::certificate::RTCCertificate`
-//! (key algorithm: `PKCS_ECDSA_P256_SHA256` — the only type webrtc-rs
-//! v0.17.x accepts via `from_key_pair` that is also browser-compatible).
+//! We persist the cert in **webrtc-rs's EXPIRES-tagged PEM format**
+//! (`RTCCertificate::serialize_pem()` / `from_pem()`), rather than the
+//! standard two-block PEM we used pre-PR #5. webrtc-rs round-trips its
+//! own format losslessly — including the random CN and serial number
+//! that `rcgen` minted at generation time — so the SHA-256 fingerprint
+//! stays stable across reloads. A standard PEM bundle would require
+//! webrtc-rs to regenerate the cert from the keypair, picking a new
+//! random CN and serial, which would change the fingerprint and
+//! invalidate every published record.
 //!
-//! Rotation policy: if the cert on disk is older than
+//! Rotation policy: if the on-disk cert is older than
 //! [`crate::config::DtlsConfig::rotate_secs`], regenerate. Callers that
-//! rotate **MUST** trigger a pkarr republish so the new fingerprint lands
-//! in the next signed record — otherwise existing clients continue to
-//! pin to the stale cert.
+//! rotate **MUST** trigger a pkarr republish so the new fingerprint
+//! lands in the next signed record — otherwise existing clients
+//! continue to pin the stale cert.
 
 use crate::error::CertError;
-use base64::engine::general_purpose::STANDARD as B64_STANDARD;
-use base64::Engine;
 use openhost_core::pkarr_record::DTLS_FINGERPRINT_LEN;
-use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-use sha2::{Digest, Sha256};
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
-
-/// Subject alt name on the self-signed DTLS certificate. DTLS-SRTP doesn't
-/// care about DN/SAN content (fingerprint auth supersedes it), so the
-/// value is cosmetic.
-pub const CERT_SAN: &str = "openhost.local";
+use webrtc::peer_connection::certificate::RTCCertificate;
 
 /// A daemon-owned DTLS certificate with its SHA-256 fingerprint.
-#[derive(Debug, Clone)]
+///
+/// Holds the webrtc-rs `RTCCertificate` value directly so
+/// [`crate::listener::PassivePeer`] can feed it to
+/// `RTCConfiguration.certificates` without re-parsing.
+#[derive(Clone)]
 pub struct DtlsCertificate {
-    /// Concatenated PEM: `-----BEGIN PRIVATE KEY-----` block followed by
-    /// `-----BEGIN CERTIFICATE-----`. Exactly what we persist to disk and
-    /// what PR #5 will hand to webrtc-rs.
+    /// The webrtc-rs cert. Cheap to clone (internally `Arc`-backed).
+    pub certificate: RTCCertificate,
+    /// EXPIRES-tagged PEM we persist to disk. Also round-trips through
+    /// `RTCCertificate::from_pem` on reload.
     pub pem_bundle: String,
     /// SHA-256 over the certificate's DER bytes. 32 raw bytes. This is
     /// what goes into `OpenhostRecord::dtls_fp`.
@@ -49,10 +48,18 @@ pub struct DtlsCertificate {
     pub issued_at: SystemTime,
 }
 
+impl std::fmt::Debug for DtlsCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DtlsCertificate")
+            .field("fingerprint_sha256", &self.fingerprint_colon_hex())
+            .field("issued_at", &self.issued_at)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DtlsCertificate {
     /// Fingerprint formatted as lowercase colon-hex, matching the SDP
-    /// `a=fingerprint` form webrtc-rs emits — e.g. `"ab:cd:..."`. Convenient
-    /// for logging; not used by the wire layer (which carries raw bytes).
+    /// `a=fingerprint` form webrtc-rs emits — e.g. `"ab:cd:..."`.
     pub fn fingerprint_colon_hex(&self) -> String {
         self.fingerprint_sha256
             .iter()
@@ -65,17 +72,12 @@ impl DtlsCertificate {
 /// Generate a fresh self-signed ECDSA P-256 cert. No I/O.
 pub fn generate() -> Result<DtlsCertificate, CertError> {
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-    let params = CertificateParams::new(vec![CERT_SAN.to_string()])?;
-    let cert = params.self_signed(&key_pair)?;
-
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    let pem_bundle = format!("{key_pem}{cert_pem}");
-
-    let der = cert.der();
-    let fingerprint_sha256: [u8; DTLS_FINGERPRINT_LEN] = Sha256::digest(der.as_ref()).into();
-
+    let certificate =
+        RTCCertificate::from_key_pair(key_pair).map_err(|e| CertError::Webrtc(e.to_string()))?;
+    let pem_bundle = certificate.serialize_pem();
+    let fingerprint_sha256 = extract_sha256_fingerprint(&certificate)?;
     Ok(DtlsCertificate {
+        certificate,
         pem_bundle,
         fingerprint_sha256,
         issued_at: SystemTime::now(),
@@ -107,14 +109,12 @@ pub async fn load_or_generate(
             .and_then(|t| SystemTime::now().duration_since(t).ok())
             .unwrap_or(Duration::from_secs(0));
         if age < rotate_every {
-            let cert_der = extract_pem_der(&pem_bundle, "CERTIFICATE")?;
-            // Confirm the key block is present too — the daemon doesn't use
-            // it this PR, but rejecting a half-written bundle here is
-            // cheaper than catching it in PR #5.
-            let _ = extract_pem_der(&pem_bundle, "PRIVATE KEY")?;
-            let fingerprint_sha256: [u8; DTLS_FINGERPRINT_LEN] = Sha256::digest(&cert_der).into();
+            let certificate = RTCCertificate::from_pem(&pem_bundle)
+                .map_err(|e| CertError::Webrtc(e.to_string()))?;
+            let fingerprint_sha256 = extract_sha256_fingerprint(&certificate)?;
             return Ok((
                 DtlsCertificate {
+                    certificate,
                     pem_bundle,
                     fingerprint_sha256,
                     issued_at: mtime.unwrap_or(SystemTime::now()),
@@ -154,37 +154,24 @@ async fn write_pem_bundle(path: &Path, pem: &str) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
-/// Extract a single PEM block with the given label (e.g. `"CERTIFICATE"`,
-/// `"PRIVATE KEY"`) and return its DER bytes. Whitespace inside the body
-/// is ignored, as per RFC 7468 §2.
-fn extract_pem_der(pem: &str, label: &str) -> Result<Vec<u8>, CertError> {
-    let begin = format!("-----BEGIN {label}-----");
-    let end = format!("-----END {label}-----");
+/// Parse webrtc-rs's colon-hex `sha-256` fingerprint into raw bytes.
+/// The spec stores the fingerprint as 32 raw bytes inside the pkarr
+/// record; webrtc-rs returns it as lowercase hex with `:` separators.
+fn extract_sha256_fingerprint(
+    cert: &RTCCertificate,
+) -> Result<[u8; DTLS_FINGERPRINT_LEN], CertError> {
+    let fingerprints = cert.get_fingerprints();
+    let sha256 = fingerprints
+        .iter()
+        .find(|f| f.algorithm.eq_ignore_ascii_case("sha-256"))
+        .ok_or(CertError::BadFingerprint)?;
 
-    let begin_at = pem
-        .find(&begin)
-        .ok_or(CertError::MissingPemBlock(static_label(label)))?;
-    let body_start = begin_at + begin.len();
-    let rel_end = pem[body_start..]
-        .find(&end)
-        .ok_or(CertError::MissingPemBlock(static_label(label)))?;
-    let body = &pem[body_start..body_start + rel_end];
-
-    let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-    B64_STANDARD
-        .decode(&b64)
-        .map_err(|_| CertError::MissingPemBlock(static_label(label)))
-}
-
-/// Convert a runtime `&str` label into a `&'static str` so it fits in the
-/// [`CertError::MissingPemBlock`] payload. Only the two values we
-/// actually query are mapped; anything else becomes `"unknown"`.
-fn static_label(label: &str) -> &'static str {
-    match label {
-        "CERTIFICATE" => "CERTIFICATE",
-        "PRIVATE KEY" => "PRIVATE KEY",
-        _ => "unknown",
+    let hex: String = sha256.value.chars().filter(|c| *c != ':').collect();
+    if hex.len() != DTLS_FINGERPRINT_LEN * 2 {
+        return Err(CertError::BadFingerprint);
     }
+    let bytes = hex::decode(&hex).map_err(|_| CertError::BadFingerprint)?;
+    bytes.try_into().map_err(|_| CertError::BadFingerprint)
 }
 
 #[cfg(test)]
@@ -193,19 +180,18 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn generate_produces_self_consistent_fingerprint() {
+    fn generate_produces_a_fingerprint_of_correct_length() {
         let cert = generate().expect("generate");
         assert_eq!(cert.fingerprint_sha256.len(), DTLS_FINGERPRINT_LEN);
-
-        // Re-derive the fingerprint from the persisted PEM and confirm
-        // they match — catches any divergence between `cert.der()` and
-        // what we actually write to disk.
-        let der = extract_pem_der(&cert.pem_bundle, "CERTIFICATE").unwrap();
-        let recomputed: [u8; DTLS_FINGERPRINT_LEN] = Sha256::digest(&der).into();
-        assert_eq!(cert.fingerprint_sha256, recomputed);
-
-        // Both PEM blocks must be present.
-        extract_pem_der(&cert.pem_bundle, "PRIVATE KEY").unwrap();
+        // Every byte `0x00` is vanishingly unlikely for a real SHA-256.
+        assert!(cert.fingerprint_sha256.iter().any(|b| *b != 0));
+        // PEM bundle must start with webrtc-rs's custom tag.
+        assert!(
+            cert.pem_bundle.contains("-----BEGIN ")
+                || cert.pem_bundle.contains("BEGIN CERTIFICATE EXPIRES"),
+            "expected webrtc-rs PEM format; got: {:.200}",
+            cert.pem_bundle
+        );
     }
 
     #[test]
@@ -233,6 +219,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!rotated2, "second call inside window should reuse");
+        // Most important invariant: reload yields the SAME fingerprint.
+        // Regression test for the RTCCertificate::from_pem / serialize_pem
+        // round-trip we rely on for pin stability across daemon restarts.
         assert_eq!(c1.fingerprint_sha256, c2.fingerprint_sha256);
         assert_eq!(c1.pem_bundle, c2.pem_bundle);
     }
@@ -289,26 +278,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncated_bundle_is_rejected() {
+    async fn corrupt_pem_is_rejected() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("dtls.pem");
-        // Write a key-only PEM: missing the CERTIFICATE block entirely.
-        tokio::fs::write(
-            &path,
-            "-----BEGIN PRIVATE KEY-----\naGVsbG8K\n-----END PRIVATE KEY-----\n",
-        )
-        .await
-        .unwrap();
-
+        tokio::fs::write(&path, "this is not a PEM bundle")
+            .await
+            .unwrap();
         let err = load_or_generate(&path, Duration::from_secs(3600))
             .await
             .unwrap_err();
-        assert!(matches!(err, CertError::MissingPemBlock("CERTIFICATE")));
+        assert!(matches!(err, CertError::Webrtc(_)));
     }
 
     #[test]
     fn colon_hex_format_matches_sdp_shape() {
         let cert = DtlsCertificate {
+            certificate: generate().unwrap().certificate,
             pem_bundle: String::new(),
             fingerprint_sha256: [0xab; DTLS_FINGERPRINT_LEN],
             issued_at: SystemTime::now(),

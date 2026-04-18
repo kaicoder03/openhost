@@ -28,6 +28,10 @@ pub enum DaemonError {
     #[error(transparent)]
     Publish(#[from] PublishError),
 
+    /// The WebRTC listener failed.
+    #[error(transparent)]
+    Listener(#[from] ListenerError),
+
     /// Low-level I/O failure not caught by a more specific variant.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -94,10 +98,14 @@ pub enum CertError {
     #[error("cert io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Persisted cert file did not contain both a PRIVATE KEY and a CERTIFICATE
-    /// PEM block.
-    #[error("cert file is missing a {0} PEM block")]
-    MissingPemBlock(&'static str),
+    /// `webrtc` rejected the PEM bundle or failed to wrap a `rcgen::KeyPair`.
+    #[error("webrtc cert error: {0}")]
+    Webrtc(String),
+
+    /// `RTCCertificate::get_fingerprints()` did not return a sha-256 entry,
+    /// or the entry wasn't 32 bytes after colon-hex decode.
+    #[error("DTLS cert sha-256 fingerprint is malformed or missing")]
+    BadFingerprint,
 }
 
 /// Publisher failures.
@@ -110,4 +118,41 @@ pub enum PublishError {
     /// The pkarr crate failed to build a `Client` from the configured relays.
     #[error("failed to build pkarr client: {0}")]
     ClientBuild(String),
+}
+
+/// WebRTC listener failures.
+#[derive(Debug, Error)]
+pub enum ListenerError {
+    /// `RTCCertificate::from_pem` rejected our persisted PEM bundle.
+    /// Indicates the PEM bundle was corrupted after `dtls_cert::load_or_generate`
+    /// validated it — very unlikely in practice.
+    #[error("failed to load DTLS certificate: {0}")]
+    CertLoad(String),
+
+    /// Inbound offer SDP wasn't parseable at the text layer. The spec
+    /// requires `a=setup:active` on client-side SDP; anything else is
+    /// rejected here without ever building a `RTCPeerConnection`.
+    #[error("offer SDP is malformed: {0}")]
+    OfferParse(&'static str),
+
+    /// Inbound offer asserted a DTLS role other than `setup:active`.
+    /// Per `spec/01-wire-format.md §3.1`, the client **MUST** assert
+    /// `a=setup:active` and receivers **MUST** reject mismatches.
+    #[error("inbound offer asserts a=setup:{found:?} but spec mandates a=setup:active")]
+    SetupRoleMismatch {
+        /// The value we saw on the offer (`passive`, `actpass`, etc.).
+        found: String,
+    },
+
+    /// Underlying `webrtc` crate error (SDP apply, ICE, DTLS handshake).
+    #[error("webrtc error: {0}")]
+    Webrtc(#[from] webrtc::Error),
+
+    /// `handle_offer` exceeded its timeout budget — usually a peer that
+    /// stopped trickling ICE candidates mid-handshake.
+    #[error("handle_offer timed out after {secs} s")]
+    Timeout {
+        /// Budget, in seconds.
+        secs: u64,
+    },
 }

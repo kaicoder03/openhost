@@ -24,9 +24,11 @@ pub mod config;
 pub mod dtls_cert;
 pub mod error;
 pub mod identity_store;
+pub mod listener;
 pub mod publish;
 pub mod signal;
 
 pub use app::{init_tracing, App};
 pub use config::Config;
 pub use error::{DaemonError, Result};
+pub use listener::PassivePeer;
