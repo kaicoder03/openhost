@@ -1,9 +1,16 @@
-//! Integration test: `Client::resolve_url` against a fake resolver that
-//! replays the canonical `spec/test-vectors/pkarr_packet.json` fixture.
+//! Integration tests for `Client::resolve_url` against the canonical
+//! `spec/test-vectors/pkarr_packet.json` fixture.
 //!
-//! This is the cross-implementation conformance gate for the client side:
-//! any `SignedPacket` produced by a spec-conformant publisher MUST be
-//! resolvable by this client.
+//! Two distinct checks:
+//!
+//! 1. **Byte-level conformance gate** — decode the fixture's
+//!    `packet_bytes_hex` through `Client` with the fixture's baked `ts`
+//!    injected via [`ClientBuilder::now_fn`]. If this test ever fails,
+//!    the client crate has drifted from the spec wire format.
+//! 2. **Resigned round-trip** — re-sign the fixture's record with a
+//!    fresh `ts = now()` and drive it through the client. Proves the
+//!    end-to-end sign → encode → decode → validate path works with the
+//!    system clock, independently of fixture freshness.
 
 use async_trait::async_trait;
 use openhost_client::Client;
@@ -17,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const VECTOR_PATH: &str = "../../spec/test-vectors/pkarr_packet.json";
 
-fn load_vector_packet() -> (SigningKey, SignedPacket) {
+fn load_vector_packet() -> (SigningKey, SignedPacket, u64) {
     let raw = fs::read_to_string(VECTOR_PATH).expect("read pkarr_packet.json");
     let v: Value = serde_json::from_str(&raw).unwrap();
     let vec = &v["vectors"][0];
@@ -35,7 +42,9 @@ fn load_vector_packet() -> (SigningKey, SignedPacket) {
     framed.extend_from_slice(&as_bytes);
 
     let packet = SignedPacket::deserialize(&framed).expect("fixture deserializes");
-    (sk, packet)
+    let fixture_ts = vec["record_ts"].as_u64().unwrap();
+
+    (sk, packet, fixture_ts)
 }
 
 struct FixtureResolve {
@@ -68,39 +77,62 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
+/// Byte-level conformance gate: feed the *exact fixture packet bytes* to
+/// `Client::resolve_url` with the fixture's baked `ts` injected as the
+/// clock. Verifies that the wire-format bytes defined in `pkarr_packet.json`
+/// decode through the client path without mutation.
 #[tokio::test(start_paused = true)]
-async fn client_resolves_reference_fixture() {
-    let (sk, packet) = load_vector_packet();
-
-    // The fixture's record.ts is baked into the vector; `Resolver` rejects
-    // records older than the 2-hour freshness window. To keep this test
-    // deterministic against the system clock, we check with the fixture's
-    // own ts rather than the system's ts. That means building the client
-    // via `build_with_resolve` and using a *custom* resolver that passes
-    // fixture_ts to verify — but our Client::resolve only uses the system
-    // clock. Workaround: rebuild the packet with a fresh ts drawn from
-    // now_ts() so the validator's freshness check passes. The outer
-    // pkarr timestamp is re-signed below.
-    //
-    // For a strict fixture-bytes cross-check, see
-    // `crates/openhost-pkarr/tests/round_trip.rs`.
-    let ts = now_ts();
-    let record = openhost_core::pkarr_record::OpenhostRecord {
-        ts,
-        ..decode_fixture_record(&packet)
-    };
-    let signed = openhost_core::pkarr_record::SignedRecord::sign(record, &sk).expect("resign");
-    let packet = openhost_pkarr::encode(&signed, &sk).expect("re-encode");
+async fn client_decodes_fixture_bytes_directly() {
+    let (sk, packet, fixture_ts) = load_vector_packet();
 
     let client = Client::builder()
         .grace_window(Duration::ZERO)
+        .now_fn(move || fixture_ts)
         .build_with_resolve(Arc::new(FixtureResolve::new(packet)));
+
+    let pk_zbase = sk.public_key().to_zbase32();
+    let record = client
+        .resolve_url(&format!("oh://{pk_zbase}/"), None)
+        .await
+        .expect("fixture bytes resolve through Client");
+
+    // Spot-check fields from the fixture so a regression in the decoder
+    // or the validator is immediately diagnosable.
+    assert_eq!(record.record.ts, fixture_ts);
+    assert_eq!(record.record.version, 1);
+    assert_eq!(record.record.roles, "server");
+    // The fixture carries one allow entry and one ICE blob — see
+    // spec/test-vectors/pkarr_record.json.
+    assert_eq!(record.record.allow.len(), 1);
+    assert_eq!(record.record.ice.len(), 1);
+}
+
+/// Round-trip the fixture's record through sign → encode → Client against
+/// a fresh `ts`. Exercises the full pipeline independently of fixture
+/// freshness; catches regressions in re-signing that the static-bytes
+/// test above would miss.
+#[tokio::test(start_paused = true)]
+async fn client_resolves_a_resigned_fixture_record() {
+    let (sk, packet, _fixture_ts) = load_vector_packet();
+
+    let ts = now_ts();
+    let fresh_record = openhost_core::pkarr_record::OpenhostRecord {
+        ts,
+        ..decode_fixture_record(&packet)
+    };
+    let signed =
+        openhost_core::pkarr_record::SignedRecord::sign(fresh_record, &sk).expect("resign");
+    let resigned_packet = openhost_pkarr::encode(&signed, &sk).expect("re-encode");
+
+    let client = Client::builder()
+        .grace_window(Duration::ZERO)
+        .build_with_resolve(Arc::new(FixtureResolve::new(resigned_packet)));
 
     let pk_zbase = sk.public_key().to_zbase32();
     let result = client
         .resolve_url(&format!("oh://{pk_zbase}/"), None)
         .await
-        .expect("resolves fixture");
+        .expect("resolves resigned record");
 
     assert_eq!(result.record.roles, "server");
     assert_eq!(result.record.ts, ts);
@@ -114,8 +146,6 @@ fn decode_fixture_record(packet: &SignedPacket) -> openhost_core::pkarr_record::
 
 #[tokio::test(start_paused = true)]
 async fn client_rejects_malformed_url() {
-    // Build the client with a fake that would succeed if asked — we just
-    // verify that URL parsing fails before any substrate is queried.
     let client = Client::builder()
         .grace_window(Duration::ZERO)
         .build_with_resolve(Arc::new(FixtureResolve::new(load_vector_packet().1)));
@@ -124,8 +154,10 @@ async fn client_rejects_malformed_url() {
         .resolve_url("not-a-real-url", None)
         .await
         .expect_err("malformed URL must fail");
+    // ClientError::UrlParse is `#[error(transparent)]` so the Display is
+    // the inner CoreError's message ("missing oh:// scheme" or similar).
     assert!(
-        format!("{err}").contains("invalid openhost URL"),
-        "unexpected error: {err}"
+        matches!(err, openhost_client::ClientError::UrlParse(_)),
+        "expected UrlParse variant, got: {err}"
     );
 }

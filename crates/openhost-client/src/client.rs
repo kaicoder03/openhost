@@ -11,19 +11,28 @@ use openhost_pkarr::{PkarrResolve, Resolve, Resolver, DEFAULT_RELAYS, GRACE_WIND
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Convenience: `SystemTime::now()` in seconds since the Unix epoch.
-fn now_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Clock closure. Returns the verifier's current Unix timestamp in
+/// seconds. Default is [`SystemTime::now()`]; tests override via
+/// [`ClientBuilder::now_fn`] so they can pin the 2-hour freshness window
+/// without waiting wall-clock time or mutating fixtures.
+pub type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+fn system_now_fn() -> NowFn {
+    Arc::new(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
 }
 
-/// Builder for [`Client`]. Configure relays + grace window before calling
-/// [`ClientBuilder::build`].
+/// Builder for [`Client`]. Configure relays + grace window + optional
+/// clock override before calling [`ClientBuilder::build`] or
+/// [`ClientBuilder::build_with_resolve`].
 pub struct ClientBuilder {
     relays: Vec<String>,
     grace: Duration,
+    now_fn: NowFn,
 }
 
 impl Default for ClientBuilder {
@@ -31,6 +40,7 @@ impl Default for ClientBuilder {
         Self {
             relays: Vec::new(),
             grace: GRACE_WINDOW,
+            now_fn: system_now_fn(),
         }
     }
 }
@@ -56,6 +66,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Override the clock closure. Production code never needs this.
+    ///
+    /// Tests use it to pass the fixture's baked `ts` (e.g. `1_700_000_000`)
+    /// so the resolver's 2-hour freshness check passes without wall-clock
+    /// dependency or fixture mutation. Replay / simulation callers
+    /// (debugging a record that was valid when captured) use it too.
+    pub fn now_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn() -> u64 + Send + Sync + 'static,
+    {
+        self.now_fn = Arc::new(f);
+        self
+    }
+
     /// Build a [`Client`] backed by a real `pkarr::Client`.
     pub fn build(self) -> Result<Client> {
         let relays: Vec<&str> = if self.relays.is_empty() {
@@ -75,6 +99,7 @@ impl ClientBuilder {
         let resolve: Arc<dyn Resolve> = Arc::new(PkarrResolve::new(Arc::new(client)));
         Ok(Client {
             resolver: Resolver::new(resolve).with_grace_window(self.grace),
+            now_fn: self.now_fn,
         })
     }
 
@@ -84,6 +109,7 @@ impl ClientBuilder {
     pub fn build_with_resolve(self, resolve: Arc<dyn Resolve>) -> Client {
         Client {
             resolver: Resolver::new(resolve).with_grace_window(self.grace),
+            now_fn: self.now_fn,
         }
     }
 }
@@ -91,29 +117,32 @@ impl ClientBuilder {
 /// Client for reading openhost host records.
 pub struct Client {
     resolver: Resolver,
+    now_fn: NowFn,
 }
 
 impl Client {
-    /// Start a new [`ClientBuilder`] with default relays + grace window.
+    /// Start a new [`ClientBuilder`] with default relays + grace window +
+    /// system clock.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }
 
-    /// Resolve the openhost record for `url.pubkey`. Uses the system clock
-    /// as `now_ts`; pass `cached_seq = None` on first lookup.
+    /// Resolve the openhost record for `url.pubkey`. Uses the clock
+    /// configured on the builder (default: `SystemTime::now()`).
     pub async fn resolve(
         &self,
         url: &OpenhostUrl,
         cached_seq: Option<u64>,
     ) -> Result<SignedRecord> {
+        let now_ts = (self.now_fn)();
         self.resolver
-            .resolve(&url.pubkey, now_ts(), cached_seq)
+            .resolve(&url.pubkey, now_ts, cached_seq)
             .await
             .map_err(Into::into)
     }
 
-    /// Parse `oh_url` and resolve it in one call. Returns [`ClientError::InvalidUrl`]
-    /// if the URL doesn't parse.
+    /// Parse `oh_url` and resolve it in one call. Returns
+    /// [`ClientError::UrlParse`] if the URL doesn't parse.
     pub async fn resolve_url(&self, oh_url: &str, cached_seq: Option<u64>) -> Result<SignedRecord> {
         let url = OpenhostUrl::parse(oh_url)?;
         self.resolve(&url, cached_seq).await
@@ -138,6 +167,10 @@ mod tests {
         0x7f, 0x60,
     ];
 
+    /// Fixed test timestamp — avoids any dependency on the wall clock
+    /// so tests are deterministic under `start_paused = true`.
+    const FIXED_TS: u64 = 1_700_000_000;
+
     fn sample_record(ts: u64) -> OpenhostRecord {
         let salt = [0x11u8; SALT_LEN];
         let hash = allowlist_hash(&salt, &[0xAA; 32]);
@@ -158,11 +191,26 @@ mod tests {
 
     struct FixedResolve {
         packet: Option<SignedPacket>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FixedResolve {
+        fn new(packet: Option<SignedPacket>) -> Self {
+            Self {
+                packet,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
     impl Resolve for FixedResolve {
         async fn resolve_most_recent(&self, _pk: &pkarr::PublicKey) -> Option<SignedPacket> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.packet
                 .as_ref()
                 .map(|p| SignedPacket::deserialize(&p.serialize()).unwrap())
@@ -177,19 +225,13 @@ mod tests {
         (sk, packet)
     }
 
-    /// `resolve()` uses the system clock, which will be far past any
-    /// deterministic `record.ts` we can bake into test data — so we build
-    /// against the fake resolver directly and pass `now_ts` explicitly
-    /// via the underlying `Resolver`.
     #[tokio::test(start_paused = true)]
     async fn resolve_url_happy_path() {
-        let ts = now_ts(); // make the fixture fresh relative to system clock
-        let (sk, packet) = packet_for(ts);
+        let (sk, packet) = packet_for(FIXED_TS);
         let client = Client::builder()
-            .grace_window(Duration::ZERO) // snappy test path
-            .build_with_resolve(Arc::new(FixedResolve {
-                packet: Some(packet),
-            }));
+            .grace_window(Duration::ZERO)
+            .now_fn(|| FIXED_TS)
+            .build_with_resolve(Arc::new(FixedResolve::new(Some(packet))));
 
         let pk_zbase = sk.public_key().to_zbase32();
         let record = client
@@ -199,16 +241,17 @@ mod tests {
 
         assert_eq!(record.record.roles, "server");
         assert_eq!(record.record.dtls_fp, [0x42; DTLS_FINGERPRINT_LEN]);
+        assert_eq!(record.record.ts, FIXED_TS);
     }
 
     #[tokio::test(start_paused = true)]
     async fn resolve_url_rejects_garbage() {
         let client = Client::builder()
             .grace_window(Duration::ZERO)
-            .build_with_resolve(Arc::new(FixedResolve { packet: None }));
+            .build_with_resolve(Arc::new(FixedResolve::new(None)));
 
         let err = client.resolve_url("not-an-oh-url", None).await.unwrap_err();
-        assert!(matches!(err, ClientError::InvalidUrl(_)));
+        assert!(matches!(err, ClientError::UrlParse(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -216,7 +259,7 @@ mod tests {
         let sk = SigningKey::from_bytes(&RFC_SEED);
         let client = Client::builder()
             .grace_window(Duration::ZERO)
-            .build_with_resolve(Arc::new(FixedResolve { packet: None }));
+            .build_with_resolve(Arc::new(FixedResolve::new(None)));
 
         let err = client
             .resolve_url(&format!("oh://{}/", sk.public_key().to_zbase32()), None)
@@ -239,13 +282,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn propagates_seq_regression_from_resolver() {
-        let ts = now_ts();
-        let (sk, packet) = packet_for(ts);
+        let (sk, packet) = packet_for(FIXED_TS);
         let client = Client::builder()
             .grace_window(Duration::ZERO)
-            .build_with_resolve(Arc::new(FixedResolve {
-                packet: Some(packet),
-            }));
+            .now_fn(|| FIXED_TS)
+            .build_with_resolve(Arc::new(FixedResolve::new(Some(packet))));
 
         // Caller has already seen a newer record — resolver must reject
         // this one on seq-regression grounds, and the error must propagate
@@ -253,7 +294,7 @@ mod tests {
         let err = client
             .resolve_url(
                 &format!("oh://{}/", sk.public_key().to_zbase32()),
-                Some(ts + 1),
+                Some(FIXED_TS + 1),
             )
             .await
             .unwrap_err();
@@ -261,5 +302,52 @@ mod tests {
             err,
             ClientError::Pkarr(openhost_pkarr::PkarrError::SeqRegression { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_window_zero_threads_through_to_resolver() {
+        // A Duration::ZERO grace window must cause the underlying
+        // Resolver to skip the second substrate race — observable by the
+        // fake's call_count remaining at 1 after a successful resolve.
+        let (sk, packet) = packet_for(FIXED_TS);
+        let fake = Arc::new(FixedResolve::new(Some(packet)));
+        let client = Client::builder()
+            .grace_window(Duration::ZERO)
+            .now_fn(|| FIXED_TS)
+            .build_with_resolve(fake.clone());
+
+        client
+            .resolve_url(&format!("oh://{}/", sk.public_key().to_zbase32()), None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(
+            fake.call_count(),
+            1,
+            "Duration::ZERO grace must skip the second resolve_most_recent call"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_grace_window_triggers_second_race() {
+        // Conversely, with the default GRACE_WINDOW the resolver must
+        // call the substrate twice. Guards against accidental regressions
+        // in the `Resolver::with_grace_window` default.
+        let (sk, packet) = packet_for(FIXED_TS);
+        let fake = Arc::new(FixedResolve::new(Some(packet)));
+        let client = Client::builder()
+            .now_fn(|| FIXED_TS)
+            .build_with_resolve(fake.clone());
+
+        client
+            .resolve_url(&format!("oh://{}/", sk.public_key().to_zbase32()), None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(
+            fake.call_count(),
+            2,
+            "default grace window must run the second substrate race"
+        );
     }
 }
