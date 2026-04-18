@@ -1414,7 +1414,18 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "openhost-client"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "hex",
  "openhost-core",
+ "openhost-pkarr",
+ "pkarr",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -11,5 +11,43 @@ readme.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# Debug CLI. Gated behind the `cli` feature so WASM / FFI consumers
+# don't pull clap / tracing-subscriber / serde_json transitively.
+[[bin]]
+name = "openhost-resolve"
+path = "src/bin/openhost-resolve.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+cli = ["clap", "tracing-subscriber", "serde_json", "hex"]
+# Opt-in suite that resolves a real host pubkey over public Pkarr
+# relays. NOT on CI — run manually before publishing.
+real-network = []
+
 [dependencies]
 openhost-core = { path = "../openhost-core" }
+openhost-pkarr = { path = "../openhost-pkarr" }
+
+# Runtime + async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Underlying pkarr client for the real Resolve impl
+pkarr = { workspace = true }
+
+# Optional — cli feature only
+clap = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+hex = { workspace = true }
+serde_json = { workspace = true }
