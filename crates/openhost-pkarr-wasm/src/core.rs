@@ -139,8 +139,18 @@ fn parse_salt(bytes: &[u8]) -> Result<[u8; SALT_LEN]> {
     <[u8; SALT_LEN]>::try_from(bytes).map_err(|_| Error::SaltLength)
 }
 
-fn parse_packet(bytes: &[u8]) -> Result<SignedPacket> {
-    SignedPacket::deserialize(bytes).map_err(|e| Error::Packet(e.to_string()))
+fn parse_packet(bytes: &[u8], signer_pk: &PublicKey) -> Result<SignedPacket> {
+    // Pkarr relay HTTP responses carry `signature(64) || seq(8) || v`.
+    // `SignedPacket::deserialize` expects the on-disk cache layout
+    // `last_seen(8) || pubkey(32) || signature(64) || seq(8) || v`, so
+    // we prepend a zero `last_seen` and the signer's pubkey here.
+    // Matches `SignedPacket::from_relay_payload` internally, which we
+    // can't call directly without re-boxing through `Bytes`.
+    let mut framed = Vec::with_capacity(8 + 32 + bytes.len());
+    framed.extend_from_slice(&[0u8; 8]);
+    framed.extend_from_slice(&signer_pk.to_bytes());
+    framed.extend_from_slice(bytes);
+    SignedPacket::deserialize(&framed).map_err(|e| Error::Packet(e.to_string()))
 }
 
 fn base64_url_nopad(bytes: &[u8]) -> String {
@@ -169,11 +179,8 @@ fn host_record_dto(pubkey_zbase32: &str, signed: &SignedRecord) -> HostRecord {
 /// [`decode_and_verify`] instead. See the wasm-bindgen wrapper at
 /// crate root for API documentation.
 pub fn parse_host_record(packet_bytes: &[u8], pubkey_zbase32: &str) -> Result<HostRecord> {
-    // Validate the pubkey up-front — a garbage pubkey here is the
-    // easiest bug to diagnose, so surface it before spending cycles
-    // on packet deserialization.
-    parse_pubkey(pubkey_zbase32)?;
-    let packet = parse_packet(packet_bytes)?;
+    let pubkey = parse_pubkey(pubkey_zbase32)?;
+    let packet = parse_packet(packet_bytes, &pubkey)?;
     let signed = openhost_pkarr::decode(&packet)?;
     Ok(host_record_dto(pubkey_zbase32, &signed))
 }
@@ -192,7 +199,7 @@ pub fn decode_and_verify(
     now_ts: u64,
 ) -> Result<HostRecord> {
     let pubkey = parse_pubkey(pubkey_zbase32)?;
-    let packet = parse_packet(packet_bytes)?;
+    let packet = parse_packet(packet_bytes, &pubkey)?;
     let signed = openhost_pkarr::decode(&packet)?;
     signed
         .verify(&pubkey, now_ts)
@@ -205,7 +212,7 @@ pub fn decode_and_verify(
 /// documentation.
 pub fn decode_offer(packet_bytes: &[u8], daemon_pk_zbase32: &str) -> Result<Option<Offer>> {
     let daemon_pk = parse_pubkey(daemon_pk_zbase32)?;
-    let packet = parse_packet(packet_bytes)?;
+    let packet = parse_packet(packet_bytes, &daemon_pk)?;
     let offer = openhost_pkarr::decode_offer_from_packet(&packet, &daemon_pk)?;
     Ok(offer.map(|o| Offer {
         sealed_base64url: base64_url_nopad(&o.sealed),
@@ -219,10 +226,12 @@ pub fn decode_answer_fragments(
     packet_bytes: &[u8],
     daemon_salt: &[u8],
     client_pk_zbase32: &str,
+    daemon_pk_zbase32: &str,
 ) -> Result<Option<Answer>> {
     let salt = parse_salt(daemon_salt)?;
     let client_pk = parse_pubkey(client_pk_zbase32)?;
-    let packet = parse_packet(packet_bytes)?;
+    let daemon_pk = parse_pubkey(daemon_pk_zbase32)?;
+    let packet = parse_packet(packet_bytes, &daemon_pk)?;
     let entry = openhost_pkarr::decode_answer_fragments_from_packet(&packet, &salt, &client_pk)?;
     Ok(entry.map(|e| Answer {
         client_hash_hex: hex::encode(e.client_hash),

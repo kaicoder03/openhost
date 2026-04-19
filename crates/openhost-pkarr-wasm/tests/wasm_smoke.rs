@@ -42,7 +42,7 @@ fn parse_host_record_returns_fields_matching_the_source() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
-    let bytes = packet.serialize();
+    let bytes = packet.to_relay_payload().to_vec();
 
     let pk_z = sk.public_key().to_zbase32();
     let dto = core::parse_host_record(&bytes, &pk_z).expect("decode succeeds");
@@ -62,7 +62,7 @@ fn parse_host_record_rejects_invalid_pubkey() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
-    let bytes = packet.serialize();
+    let bytes = packet.to_relay_payload().to_vec();
 
     let err = core::parse_host_record(&bytes, "not-a-real-pubkey").expect_err("must reject");
     let s = err.to_string();
@@ -77,7 +77,7 @@ fn decode_and_verify_accepts_good_signature() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
-    let bytes = packet.serialize();
+    let bytes = packet.to_relay_payload().to_vec();
 
     let pk_z = sk.public_key().to_zbase32();
     let dto = core::decode_and_verify(&bytes, &pk_z, ts).expect("verify succeeds");
@@ -90,7 +90,7 @@ fn decode_and_verify_rejects_wrong_pubkey_with_verify_failed() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
-    let bytes = packet.serialize();
+    let bytes = packet.to_relay_payload().to_vec();
 
     // Verify against a *different* pubkey — the inner Ed25519 sig is
     // over canonical bytes signed by `sk`, so the verify path must
@@ -99,9 +99,14 @@ fn decode_and_verify_rejects_wrong_pubkey_with_verify_failed() {
     let wrong_pk_z = other_sk.public_key().to_zbase32();
     let err = core::decode_and_verify(&bytes, &wrong_pk_z, ts)
         .expect_err("mismatched pubkey must fail verify");
+    // Post-PR-35 framing: a mismatched pubkey may surface as either
+    // `VerifyFailed` (inner Ed25519 sig mismatch) or a pkarr-layer
+    // decode failure (framed pubkey disagrees with record contents).
+    // Both are "decoder refused to trust this packet" — the semantic
+    // the test exists to protect.
     assert!(
-        matches!(err, core::Error::VerifyFailed(_)),
-        "expected VerifyFailed, got {err:?}",
+        matches!(err, core::Error::VerifyFailed(_) | core::Error::Pkarr(_)),
+        "expected VerifyFailed or Pkarr decode error, got {err:?}",
     );
 }
 
@@ -110,7 +115,7 @@ fn decode_and_verify_rejects_stale_record_with_verify_failed() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
-    let bytes = packet.serialize();
+    let bytes = packet.to_relay_payload().to_vec();
 
     let pk_z = sk.public_key().to_zbase32();
     // 3-hour skew pushes the record outside the spec's 2-hour
@@ -129,7 +134,7 @@ fn decode_offer_returns_none_when_no_offer_txt_is_published() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
-    let bytes = packet.serialize();
+    let bytes = packet.to_relay_payload().to_vec();
 
     let daemon_pk_z = sk.public_key().to_zbase32();
     let out = core::decode_offer(&bytes, &daemon_pk_z).expect("runs");
@@ -141,12 +146,16 @@ fn decode_answer_fragments_returns_none_when_no_fragments_are_published() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode_with_answers(&signed, &sk, &[]).unwrap();
-    let bytes = packet.serialize();
+    // Feed the WASM shim relay-payload bytes (sig+seq+v), matching what
+    // a relay HTTP response carries.
+    let bytes = packet.to_relay_payload().to_vec();
 
     let client_sk = SigningKey::from_bytes(&CLIENT_SEED);
     let salt = [0x22u8; SALT_LEN];
     let client_pk_z = client_sk.public_key().to_zbase32();
-    let out = core::decode_answer_fragments(&bytes, &salt, &client_pk_z).expect("runs");
+    let daemon_pk_z = sk.public_key().to_zbase32();
+    let out =
+        core::decode_answer_fragments(&bytes, &salt, &client_pk_z, &daemon_pk_z).expect("runs");
     assert!(out.is_none());
 }
 
@@ -180,10 +189,12 @@ fn decode_answer_fragments_reassembles_published_fragments() {
     let expected_hash_hex = hex::encode(entry.client_hash);
 
     let packet = encode_with_answers(&signed, &sk, std::slice::from_ref(&entry)).expect("encode");
-    let bytes = packet.serialize();
+    let bytes = packet.to_relay_payload().to_vec();
 
     let client_pk_z = client_pk.to_zbase32();
-    let out = core::decode_answer_fragments(&bytes, &salt, &client_pk_z).expect("runs");
+    let daemon_pk_z = sk.public_key().to_zbase32();
+    let out =
+        core::decode_answer_fragments(&bytes, &salt, &client_pk_z, &daemon_pk_z).expect("runs");
     let dto = out.unwrap_or_else(|| {
         panic!(
             "fragment set for client pubkey {client_pk_z} was absent on the wire; \
