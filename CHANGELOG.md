@@ -8,6 +8,26 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Changed (PR #25, partial close of residual BEP44 answer-size gap)
+
+- **`MAX_FRAGMENT_PAYLOAD_BYTES` bumped 180 → 500** and answer-fragment TXT records now serialise across multiple DNS character-strings per RFC 1035 §3.3.14 when the base64url value exceeds 255 bytes. Pre-PR-25 answers ≤ ~180 bytes seal-size needed 2-3 fragments with per-RR overhead tax; post-PR-25 answers ≤ ~490 bytes seal-size need a **single** fragment. Wire-compatible in both directions because `simple-dns`'s TXT decoder already concatenates every character-string in an RR's rdata before handing the string back.
+- New `build_multi_string_txt` helper centralises the character-string splitting logic; every TXT writer in `openhost-pkarr::offer` uses it now (both `_openhost` and `_answer-*` fragments), so a future main-record bloat past 255 base64 chars auto-upgrades to multi-string without separate plumbing.
+- Updated test vectors: `encode_evicts_oldest_when_overflow` now synthesises 450-byte `sealed` payloads directly (rather than relying on zlib-compressible SDPs) so the overflow path is exercised deterministically at MAX=500. `multi_fragment_answer_reassembles` tests with 1300-byte sealed payloads → 3 fragments.
+
+### Known limitation (carries into 0.3)
+
+**The gap is ~9 bytes away from fully closed for real webrtc-rs answers.** Concretely:
+
+- Sealed webrtc-rs answer (measured in the in-process e2e test): **493 bytes**.
+- Single fragment of 493 bytes → 498 bytes raw envelope → ~664 base64 chars → multi-string TXT rdata ~667 bytes → RR wire overhead ~47 bytes → **~714 bytes of answer RR**.
+- Main `_openhost` record baseline (measured): ~295 bytes on the wire.
+- Total: **~1009 bytes**, 9 over the 1000-byte BEP44 cap. The encoder still evicts.
+
+The `daemon_produces_sealed_answer_for_dialer_offer` end-to-end test now explicitly verifies this state (wire packet has NO answer fragments; expectation flips to `is_some()` when a follow-up PR closes the last 9 bytes). Closing candidates, in order of complexity:
+
+1. **Strip redundant `a=` lines** from the webrtc-rs answer SDP before sealing. Likely wins 20-40 bytes; the current sealed answer has some boilerplate the handshake doesn't need.
+2. **Trickle-ICE split**: skeleton answer (no candidates) in the main record, per-candidate records alongside. Structural, larger PR; matches how browsers trickle natively and buys arbitrary answer size.
+
 ### Added (PR #24, WebSocket allowlist policy layer)
 
 - **New `[forward.websockets]` config section** with `allowed_paths: Vec<String>`. Each entry is an exact path match against the request URI (query string stripped); a single-entry `"*"` wildcard is accepted for development. Omitting the section preserves v0.2 behaviour (every `Upgrade: websocket` rejected). A present-but-empty `allowed_paths` is rejected at `Config::validate` time.
