@@ -241,7 +241,13 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
     let app = App::build_with_transport_and_resolve(cfg, net.as_transport(), net.as_resolve())
         .await
         .expect("app builds");
-    app.listener().set_skip_ice_gather_for_tests(true);
+    // Pre-compact-blob, this test called
+    // `set_skip_ice_gather_for_tests(true)` to keep the answer small
+    // enough to fit the BEP44 cap. The compact blob closes that gap so
+    // we let the daemon wait for full ICE gather — which the CI macOS
+    // runners actually need, since their IPv6 resolver stalls long
+    // enough that a skip-gather answer has zero candidates, leaving
+    // the client with "no candidate pairs" and a guaranteed timeout.
     let daemon_pk = app.identity().public_key();
     let host_url: OpenhostUrl = format!("oh://{daemon_pk}/").parse().expect("url");
 
@@ -253,9 +259,14 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
         .transport(net.as_transport())
         .resolver(net.as_resolve())
         .config(DialerConfig {
-            dial_timeout: Duration::from_secs(5),
+            // Bumped 5 → 20s: with full ICE gather on both sides (no
+            // skip-gather shortcut), the STUN-binding round-trip plus
+            // host-candidate gather on slow CI runners occasionally
+            // needs 5-10s. 20s leaves headroom without inflating the
+            // local-run time materially (~3s typical).
+            dial_timeout: Duration::from_secs(20),
             answer_poll_interval: Duration::from_millis(250),
-            webrtc_connect_timeout: Duration::from_secs(10),
+            webrtc_connect_timeout: Duration::from_secs(15),
             binding_timeout: Duration::from_secs(10),
         })
         .build()
