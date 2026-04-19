@@ -24,11 +24,12 @@ rotate_secs = 86400
 # Home Assistant's default port.
 target = "http://127.0.0.1:8123"
 
-# HASS rejects requests whose `Host` header doesn't match one of the
-# entries in `http.use_x_forwarded_for` / `http.trusted_proxies`.
-# Pinning the forwarded Host to the upstream's authority sidesteps
-# that check entirely — HASS sees a request that looks like it came
-# from localhost, because on the daemon's side of the hop it did.
+# Pin the forwarded `Host` header to the upstream's authority.
+# HASS doesn't usually reject on Host mismatch, but some reverse-proxy
+# setups and custom integrations compare the incoming Host against
+# configured values — pinning sidesteps those edge cases entirely.
+# Drop this line if you have reason to preserve the client's
+# originating `Host` instead.
 host_override = "127.0.0.1:8123"
 
 max_body_bytes = 16777216   # 16 MiB

@@ -24,10 +24,16 @@ See [`spec/00-overview.md`](spec/00-overview.md) for the full protocol.
 Bring up a local HTTP service, expose it over openhost, dial it from a second machine:
 
 ```bash
-# Host machine: clone, build, run.
+# Host machine: clone, build, start an upstream, run.
 git clone https://github.com/kaicoder03/openhost.git && cd openhost
 cargo build --release -p openhost-daemon
 cargo build --release --features cli -p openhost-client
+
+mkdir -p ~/sites && echo '<h1>hello</h1>' > ~/sites/index.html
+# Any local HTTP server will do; these examples assume port 8080.
+python3 -m http.server 8080 --bind 127.0.0.1 --directory ~/sites &
+
+mkdir -p ~/.config/openhost
 cp examples/personal-site/daemon.toml ~/.config/openhost/daemon.toml
 ./target/release/openhostd run        # prints "openhostd: up pubkey=<zbase32>"
 

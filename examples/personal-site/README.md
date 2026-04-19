@@ -78,6 +78,6 @@ Once you've confirmed dialing works, tighten the daemon:
 
 ## Gotchas
 
-- **Range requests work.** Caddy honours `Range: bytes=…`, the openhost daemon forwards the header unchanged, the client sees a `206 Partial Content`. Large files stream in chunks without any special config.
+- **Range requests work, up to `max_body_bytes`.** Caddy honours `Range: bytes=…` and the openhost daemon forwards the header unchanged, so the client sees a clean `206 Partial Content`. However the daemon **buffers each response fully** before emitting it back over the data channel — if you're shipping files bigger than the default 16 MiB cap, bump `forward.max_body_bytes`. Streaming a 100 MiB file costs ~100 MiB of daemon memory for the duration of the request.
 - **CORS is your problem, not openhost's.** The daemon does not mangle `Access-Control-*` headers; if your site needs them, set them in Caddy.
 - **`Host` is rewritten.** The daemon's forwarder pins `Host` to the configured target's authority (`127.0.0.1:8080`). If your site uses Host-based virtual hosting locally, move that logic upstream of this forward target.
