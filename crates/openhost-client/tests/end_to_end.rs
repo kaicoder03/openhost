@@ -319,7 +319,7 @@ async fn dial_times_out_when_daemon_not_running() {
 
 async fn publish_fake_host_record(net: &MemoryPkarrNetwork, daemon_sk: &SigningKey) {
     use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
+        OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
     };
     use openhost_pkarr::codec::encode;
 
@@ -332,11 +332,6 @@ async fn publish_fake_host_record(net: &MemoryPkarrNetwork, daemon_sk: &SigningK
         dtls_fp: [0x42; DTLS_FINGERPRINT_LEN],
         roles: "server".to_string(),
         salt: [0x11; SALT_LEN],
-        allow: vec![],
-        ice: vec![IceBlob {
-            client_hash: vec![0x22; 16],
-            ciphertext: vec![0x33; 48],
-        }],
         disc: String::new(),
     };
     let signed = SignedRecord::sign(record, daemon_sk).unwrap();

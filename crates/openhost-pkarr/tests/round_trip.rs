@@ -11,7 +11,7 @@
 //! If any of the above breaks, the bridge has drifted from the spec.
 
 use openhost_core::identity::SigningKey;
-use openhost_core::pkarr_record::{IceBlob, OpenhostRecord, SignedRecord};
+use openhost_core::pkarr_record::{OpenhostRecord, SignedRecord};
 use openhost_pkarr::{codec, decode, encode};
 use pkarr::SignedPacket;
 use serde_json::Value;
@@ -36,36 +36,12 @@ fn reference_record() -> OpenhostRecord {
     let mut salt = [0u8; 32];
     salt.copy_from_slice(&hex::decode(r["salt_hex"].as_str().unwrap()).unwrap());
 
-    let allow: Vec<[u8; 16]> = r["allow_hex"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| {
-            let b = hex::decode(h.as_str().unwrap()).unwrap();
-            let mut a = [0u8; 16];
-            a.copy_from_slice(&b);
-            a
-        })
-        .collect();
-
-    let ice: Vec<IceBlob> = r["ice"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|blob| IceBlob {
-            client_hash: hex::decode(blob["client_hash_hex"].as_str().unwrap()).unwrap(),
-            ciphertext: hex::decode(blob["ciphertext_hex"].as_str().unwrap()).unwrap(),
-        })
-        .collect();
-
     OpenhostRecord {
         version: r["version"].as_u64().unwrap() as u8,
         ts: r["ts"].as_u64().unwrap(),
         dtls_fp,
         roles: r["roles"].as_str().unwrap().to_string(),
         salt,
-        allow,
-        ice,
         disc: r["disc"].as_str().unwrap().to_string(),
     }
 }

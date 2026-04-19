@@ -6,7 +6,11 @@ title: Wire Format
 
 **Status:** Draft (M0).
 
-This document specifies the openhost wire format: identity encoding, the Pkarr record schema, the connection-establishment sequence, and the HTTP-over-DataChannel framing. It is normative for v1 (`openhost1`).
+This document specifies the openhost wire format: identity encoding, the Pkarr record schema, the connection-establishment sequence, and the HTTP-over-DataChannel framing. It is normative for v2 (`openhost2`).
+
+**v1 → v2 schema change (PR #22):** the main `_openhost` record no longer carries `allow` or `ice` fields in its canonical signing bytes. The host's allowlist is now private state (enforced inside the daemon on the offer-poll path); per-client ICE ciphertext will be published as separate records when that path is wired up. The `version` byte in the canonical bytes distinguishes v1 (`0x01`) from v2 (`0x02`) records; decoders **MUST** reject records whose `version` does not match their own implementation.
+
+The 9-byte domain separator `"openhost1"` is retained unchanged in v2 — it acts as an eternal "this is an openhost record" marker rather than a schema selector, which is the `version` byte's job. Future schema bumps (v3, v4, …) will keep `"openhost1"` and advance the `version` byte instead of renaming the prefix, so a decoder that does not recognise the record schema can still confirm it IS an openhost record before rejecting.
 
 Conformance language follows [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) / [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174): **MUST**, **SHOULD**, **MAY** carry their standard meanings.
 
@@ -41,7 +45,9 @@ The packet **MUST** contain a single TXT resource record:
 |---|---|---|---|
 | `_openhost` | TXT | 300 | `base64url(signature \|\| canonical_bytes)` — the 64-byte Ed25519 signature over `canonical_bytes` concatenated with the canonical byte representation of an `OpenhostRecord` (see below). |
 
-`canonical_bytes` is the output of [`OpenhostRecord::canonical_signing_bytes`](../crates/openhost-core/src/pkarr_record/mod.rs), a deterministic, domain-separated encoding that carries every semantic field of the record — protocol version, Unix-seconds timestamp `ts`, DTLS fingerprint `dtls_fp`, declared `roles`, per-host allowlist `salt`, the `allow` list of 16-byte truncated HMAC entries, a per-paired-client `ice` list (each entry: 16-byte client hash + sealed-box ciphertext), and the informational `disc` hints string. Its exact layout is fixed in the openhost-core crate and reproduced verbatim in [`test-vectors/pkarr_record.json`](test-vectors/pkarr_record.json).
+`canonical_bytes` is the output of [`OpenhostRecord::canonical_signing_bytes`](../crates/openhost-core/src/pkarr_record/mod.rs), a deterministic, domain-separated encoding that carries every semantic field of the record — protocol version, Unix-seconds timestamp `ts`, DTLS fingerprint `dtls_fp`, declared `roles`, per-host allowlist `salt`, and the informational `disc` hints string. Its exact layout is fixed in the openhost-core crate and reproduced verbatim in [`test-vectors/pkarr_record.json`](test-vectors/pkarr_record.json).
+
+The v1 schema additionally carried an `allow` list of 16-byte truncated HMAC entries and a per-paired-client `ice` list immediately before `disc`. v2 removes both fields from the canonical bytes; the underlying facilities they represented now live elsewhere (see the bullet list below).
 
 The base64url encoding uses the RFC 4648 §5 URL-safe alphabet without padding. If the encoded string exceeds 255 bytes, it **MUST** be split across multiple DNS character strings within the same TXT RDATA (per RFC 1035 §3.3.14); decoders reconstruct the payload by concatenating the character strings in the order they appear.
 
@@ -55,10 +61,9 @@ Two signatures bind the record:
 - The encoded DNS packet (the BEP44 `v` value) **MUST** fit in 1000 bytes (the BEP44 mutable-item limit).
 - `ts` is the publication time in seconds since the Unix epoch. Verifiers **MUST** reject records where `|now - ts| > 7200` (two hours).
 - `dtls_fp` is the SHA-256 fingerprint of the daemon's DTLS certificate, 32 raw bytes inside `canonical_bytes`. The daemon **SHOULD** rotate this certificate daily or on restart.
-- Each `client_hash` is 16 bytes of HMAC-SHA256 keyed by the per-host `salt` applied to the client's 32-byte Ed25519 public key. Unpaired observers see only that ICE blobs exist, not which client they address.
-- Per-client ICE candidate ciphertext is a libsodium-compatible **sealed box** (`crypto_box_seal`): anonymous X25519 ephemeral sender to the recipient client's X25519 public key, with the XSalsa20-Poly1305 AEAD. The output is `ephemeral_pk || XSalsa20-Poly1305(shared_key, nonce = Blake2b-24(ephemeral_pk || recipient_pk), plaintext)`.
+- The host's allowlist (truncated HMAC-SHA256 of paired client pubkeys, keyed by `salt`) is **private state** in v2 — the daemon consults it on the offer-poll path (`is_client_allowed`) but does not publish it. Clients cannot preemptively verify pairing; they discover a mismatch by the absence of a returned answer record.
+- Per-client ICE ciphertext, when the feature ships, will be published as separate TXT records alongside the main `_openhost` entry (analogous to `_answer-<client-hash>-<idx>` fragments in §3.3). The sealed-box envelope is still a libsodium `crypto_box_seal` (anonymous X25519 ephemeral sender to the recipient client's X25519 public key, XSalsa20-Poly1305 AEAD); only its location in the packet changes.
 - The client's X25519 public key is derived from its Ed25519 identity via the Edwards-to-Montgomery conversion (libsodium's `crypto_sign_ed25519_pk_to_curve25519`), so clients and hosts maintain only one keypair.
-- The `allow` list is carried inside `canonical_bytes` and lets clients verify they are paired before attempting a connection; the daemon uses it for dedupe.
 - `disc` is informational; clients **MUST** try all substrates they know about regardless of the record's contents.
 
 Republish cadence, relay fan-out, and resolver race semantics are specified in [`03-pkarr-records.md`](03-pkarr-records.md).

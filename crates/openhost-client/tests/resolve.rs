@@ -97,14 +97,13 @@ async fn client_decodes_fixture_bytes_directly() {
         .expect("fixture bytes resolve through Client");
 
     // Spot-check fields from the fixture so a regression in the decoder
-    // or the validator is immediately diagnosable.
+    // or the validator is immediately diagnosable. The v2 record dropped
+    // `allow` and `ice` from the canonical bytes (PR #22) — those fields
+    // are no longer on the wire.
     assert_eq!(record.record.ts, fixture_ts);
-    assert_eq!(record.record.version, 1);
+    assert_eq!(record.record.version, 2);
     assert_eq!(record.record.roles, "server");
-    // The fixture carries one allow entry and one ICE blob — see
-    // spec/test-vectors/pkarr_record.json.
-    assert_eq!(record.record.allow.len(), 1);
-    assert_eq!(record.record.ice.len(), 1);
+    assert_eq!(record.record.disc, "dht=1; relay=pkarr.example");
 }
 
 /// Round-trip the fixture's record through sign → encode → Client against

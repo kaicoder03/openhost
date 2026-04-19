@@ -1,36 +1,36 @@
 {
   "description": "openhost-pkarr M2 bridge: SignedRecord <-> pkarr::SignedPacket round-trip. Every implementation MUST produce a packet that decodes back to the referenced SignedRecord from pkarr_record.json, and MUST accept the fixture bytes below as input.",
-  "version": "openhost1",
+  "version": "openhost2",
   "pkarr_crate_version": "5.0.4",
   "encoding_notes": [
     "All bytes are hex-encoded.",
-    "Signing key and OpenhostRecord are inherited from pkarr_record.json::reference_record_v1 — not duplicated here.",
-    "The `_openhost` TXT record value is base64url-encoded (no padding) bytes of (signature || canonical_signing_bytes). The signature is taken verbatim from pkarr_record.json::reference_record_v1.signature_hex. The canonical bytes equal pkarr_record.json::reference_record_v1.canonical_hex.",
-    "`packet_bytes_hex` is the output of `SignedPacket::as_bytes()` in the pkarr 5.x crate — i.e. `<32 public_key><64 signature><8 timestamp_micros_be><encoded_dns_packet>`. Total length 584 bytes for this vector.",
+    "Signing key and OpenhostRecord are inherited from pkarr_record.json::reference_record_v2 — not duplicated here.",
+    "The `_openhost` TXT record value is base64url-encoded (no padding) bytes of (signature || canonical_signing_bytes). The signature is taken verbatim from pkarr_record.json::reference_record_v2.signature_hex. The canonical bytes equal pkarr_record.json::reference_record_v2.canonical_hex.",
+    "`packet_bytes_hex` is the output of `SignedPacket::as_bytes()` in the pkarr 5.x crate — i.e. `<32 public_key><64 signature><8 timestamp_micros_be><encoded_dns_packet>`. Total length 434 bytes for this vector (v2 record dropped 150 bytes of on-wire v1 `allow` + `ice` material).",
     "The 8-byte timestamp is big-endian microseconds since the Unix epoch. For this vector: 1_700_000_000 * 1_000_000 = 1_700_000_000_000_000 = 0x060a24181e4000.",
     "Fixture bytes depend on the exact pkarr wire format (BEP44 signature over the bencoded DNS packet). Implementations MAY regenerate when bumping pkarr, but MUST document the pkarr version used."
   ],
   "vectors": [
     {
-      "name": "reference_packet_v1",
-      "input_vector_ref": "pkarr_record.json::reference_record_v1",
+      "name": "reference_packet_v2",
+      "input_vector_ref": "pkarr_record.json::reference_record_v2",
       "signing_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
       "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
       "record_ts": 1700000000,
       "pkarr_timestamp_micros": 1700000000000000,
       "openhost_txt_name": "_openhost",
       "openhost_txt_ttl": 300,
-      "openhost_blob_len": 294,
-      "openhost_blob_layout": "first 64 bytes = Ed25519 signature (pkarr_record.json::reference_record_v1.signature_hex); remaining 230 bytes = canonical_signing_bytes (pkarr_record.json::reference_record_v1.canonical_hex)",
-      "bep44_outer_signature_hex": "7d8fff2a48157d10d2ed16ca48b7d5f18e132cc9c5b0b0e0cd880f5354bebf7c4ffe786a3c58cd775b658c278ad4c7a3e6367cff23a5a9a637bd6b34843f620f",
-      "packet_bytes_len": 584,
-      "packet_bytes_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a7d8fff2a48157d10d2ed16ca48b7d5f18e132cc9c5b0b0e0cd880f5354bebf7c4ffe786a3c58cd775b658c278ad4c7a3e6367cff23a5a9a637bd6b34843f620f00060a24181e4000000080000000000100000000095f6f70656e686f7374343437706a6f79636e7372666d78696b6d39356a6831337938386538716e687a75356b756e676a707879657067743761386b72707900001000010000012c018afe65364f69637743705f615941796f6245524a324565354d6e36793156356a71643567426c656b68443975464a456d514c6146355141723153495634696c4a6969554333496d34525732787741675a6f663667754643514676634756756147397a64444542414141414147565438514243516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a4351675a7a5a584a325a58495245524552455245524552455245524552455245524552455245524552455245524552455245524552455141427a7a5a4a464d515a636151585558656135423852527741427a7a5a4a464d515a63615158555865613542385252778a414141456a75377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753775377537753441476d526f644430784f7942795a57786865543177613246796369356c654746746347786c"
+      "openhost_blob_len": 182,
+      "openhost_blob_layout": "first 64 bytes = Ed25519 signature (pkarr_record.json::reference_record_v2.signature_hex); remaining 118 bytes = canonical_signing_bytes (pkarr_record.json::reference_record_v2.canonical_hex)",
+      "bep44_outer_signature_hex": "5d6445016302dc413904ba3591782153d19d99512eb8c6ef15bfefc509e2d92cabe0e0f4159a350d7746bcabc4dea07ddda85be8e847e586966e8f1b60244408",
+      "packet_bytes_len": 434,
+      "packet_bytes_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a5d6445016302dc413904ba3591782153d19d99512eb8c6ef15bfefc509e2d92cabe0e0f4159a350d7746bcabc4dea07ddda85be8e847e586966e8f1b6024440800060a24181e4000000080000000000100000000095f6f70656e686f7374343437706a6f79636e7372666d78696b6d39356a6831337938386538716e687a75356b756e676a707879657067743761386b72707900001000010000012c00f4f33948575a656c77626962595a57755849793630564c7a6b3456616e686342703257317937326b3045746a52396d376b45682d70726f6a75314b53305353594c30746961564e7851455a574f644a50554a556d414a44514676634756756147397a64444543414141414147565438514243516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a43516b4a4351675a7a5a584a325a58495245524552455245524552455245524552455245524552455245524552455245524552455245524552455141615a4768305054453749484a6c624746355058427259584a794c6d563459573177624755"
     }
   ],
   "negative": [
     {
       "name": "packet_too_large",
-      "tweak": "Encode a record whose `ice` vector is padded (e.g. 30 blobs, 200-byte ciphertexts each) so the encoded DNS packet exceeds 1000 bytes.",
+      "tweak": "Append synthetic `_answer-*` fragment TXTs to the packet until the bencoded total exceeds 1000 bytes. The v2 main record is only ~180 bytes on the wire, so overflowing via the main record alone requires pathological `disc` padding near the MAX_DISC_LEN cap plus many fragment TXTs; exercised in openhost-pkarr::offer::tests::encode_evicts_oldest_when_overflow.",
       "expect": "Encoder returns PacketTooLarge (or the upstream pkarr build error for the same condition)."
     },
     {
