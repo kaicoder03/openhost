@@ -49,7 +49,22 @@ All three should print the same version, matching the release tag.
 
 ### Homebrew
 
-Coming soon — the tap is blocked on the first automated release firing. Track `kaicoder03/homebrew-openhost` for progress.
+macOS (Apple Silicon + Intel) and Linux x86_64 can install via Homebrew once the tap repo is live:
+
+```bash
+brew tap kaicoder03/openhost
+brew install openhost
+```
+
+The formula ships the three binaries (`openhostd`, `openhost-dial`, `openhost-resolve`) only; follow [Running as a service](#running-as-a-service) above for `launchd` / `systemd` setup.
+
+The tap repo at `kaicoder03/homebrew-openhost` is a companion to the main repo; it's created + populated by a maintainer on the first v0.3.0+ release. If the `brew tap` above fails with a 404, the tap is not yet live — install directly from the formula in the main repo instead:
+
+```bash
+brew install --HEAD https://raw.githubusercontent.com/kaicoder03/openhost/main/distribution/homebrew/openhost.rb
+```
+
+See [`distribution/homebrew/README.md`](https://github.com/kaicoder03/openhost/blob/main/distribution/homebrew/README.md) for the formula source, the pre-tap testing procedure, and the maintainer's tap-setup checklist.
 
 ## Build from source
 
