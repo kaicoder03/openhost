@@ -244,10 +244,18 @@ impl Dialer {
         // Stage 3: seal + publish the offer.
         self.publish_offer(&daemon_pk, &offer_sdp).await?;
 
-        // Stage 4: poll for the daemon's answer.
+        // Stage 4: poll for the daemon's answer. The host's DTLS
+        // fingerprint (already verified under the outer BEP44 signature
+        // on `signed`) is threaded through so the v2 compact-blob
+        // branch can reconstruct a complete SDP locally.
         let offer_hash = hash_offer_sdp(&offer_sdp);
         let answer_sdp = self
-            .poll_answer(&daemon_pk, &daemon_salt, &offer_hash)
+            .poll_answer(
+                &daemon_pk,
+                &daemon_salt,
+                &offer_hash,
+                &signed.record.dtls_fp,
+            )
             .await?;
 
         // Stage 5: apply the answer + wait for webrtc Connected + DC open.
@@ -412,14 +420,18 @@ impl Dialer {
     }
 
     /// Poll the host's pkarr zone for the `_answer-<client-hash>` TXT
-    /// and return the unsealed answer SDP. Cross-checks the inner
+    /// and return a complete answer SDP. Cross-checks the inner
     /// `daemon_pk` and `offer_sdp_hash` against what the client
-    /// expects.
+    /// expects. For v2 (compact blob) answers, reconstructs the SDP
+    /// from the blob + the host's DTLS fingerprint (which was pinned
+    /// under the BEP44 signature on the main `_openhost` record). For
+    /// legacy v1 answers, returns the embedded SDP string verbatim.
     pub async fn poll_answer(
         &self,
         daemon_pk: &PublicKey,
         daemon_salt: &[u8; openhost_core::pkarr_record::SALT_LEN],
         expected_offer_hash: &[u8; 32],
+        host_dtls_fp: &[u8; openhost_pkarr::DTLS_FP_LEN],
     ) -> Result<String> {
         let budget = self.config.dial_timeout; // enforced by outer timeout
         let deadline = Instant::now() + budget;
@@ -448,7 +460,13 @@ impl Dialer {
                                 "offer_sdp_hash mismatches the offer we published",
                             ));
                         }
-                        return Ok(opened.answer_sdp);
+                        let sdp = match opened.answer {
+                            openhost_pkarr::AnswerPayload::V2Blob(blob) => {
+                                openhost_pkarr::answer_blob_to_sdp(&blob, host_dtls_fp)
+                            }
+                            openhost_pkarr::AnswerPayload::V1Sdp(s) => s,
+                        };
+                        return Ok(sdp);
                     }
                     Ok(None) => {
                         // Main record is present but no `_answer.*`

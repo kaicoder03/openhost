@@ -71,6 +71,10 @@ pub enum Error {
     /// The wire framing codec rejected the caller's bytes.
     #[error("frame codec: {0}")]
     Frame(String),
+    /// Hex decoding of a fixed-size input (e.g. the host's DTLS
+    /// fingerprint) failed.
+    #[error("hex decode failed: {0}")]
+    Hex(String),
 }
 
 /// Result alias over [`Error`].
@@ -315,9 +319,27 @@ pub fn seal_offer(
     Ok(record.sealed)
 }
 
-/// Open an answer record with the client's 32-byte Ed25519 secret key.
-/// Mirrors `AnswerEntry::open` on the CLI path.
-pub fn open_answer(client_sk_bytes: &[u8], sealed_base64url: &str) -> Result<OpenedAnswer> {
+/// Open an answer record with the client's 32-byte Ed25519 secret key
+/// and return a complete SDP string ready for
+/// `RTCPeerConnection.setRemoteDescription`. Transparently handles
+/// both v1 (full SDP embedded) and v2 (compact blob) answer shapes:
+///
+/// - v2 blob → reconstructs a minimal SDP locally using
+///   [`openhost_pkarr::answer_blob_to_sdp`] with `host_dtls_fp_hex` as
+///   the fingerprint (browser callers already have this from the
+///   resolved pkarr `_openhost` record).
+/// - v1 SDP → passes through unchanged; `host_dtls_fp_hex` is ignored.
+///
+/// `host_dtls_fp_hex` MUST be the lowercase-hex encoding of the host's
+/// 32-byte SHA-256 DTLS certificate fingerprint, without separators
+/// (e.g. `"aabb..."`, 64 chars). The `:`-separated colon-hex form the
+/// pkarr record uses can be stripped on the JS side with
+/// `.replace(/:/g, "").toLowerCase()`.
+pub fn open_answer(
+    client_sk_bytes: &[u8],
+    sealed_base64url: &str,
+    host_dtls_fp_hex: &str,
+) -> Result<OpenedAnswer> {
     let sk_arr: [u8; SIGNING_KEY_LEN] = parse_array(client_sk_bytes, "client_sk")?;
     let client_sk = SigningKey::from_bytes(&sk_arr);
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -333,11 +355,26 @@ pub fn open_answer(client_sk_bytes: &[u8], sealed_base64url: &str) -> Result<Ope
     let plain = entry
         .open(&client_sk)
         .map_err(|e| Error::SealedBoxOpen(e.to_string()))?;
+    let answer_sdp = match plain.answer {
+        openhost_pkarr::AnswerPayload::V2Blob(blob) => {
+            let fp = parse_dtls_fp_hex(host_dtls_fp_hex)?;
+            openhost_pkarr::answer_blob_to_sdp(&blob, &fp)
+        }
+        openhost_pkarr::AnswerPayload::V1Sdp(s) => s,
+    };
     Ok(OpenedAnswer {
         daemon_pk_zbase32: plain.daemon_pk.to_zbase32(),
         offer_sdp_hash_hex: hex::encode(plain.offer_sdp_hash),
-        answer_sdp: plain.answer_sdp,
+        answer_sdp,
     })
+}
+
+/// Parse a lowercase-hex-encoded DTLS fingerprint (64 chars) into its
+/// 32-byte array. Tolerates upper-case as well. Reject everything else
+/// so a mis-formatted string can't silently seed a bad fingerprint.
+fn parse_dtls_fp_hex(s: &str) -> Result<[u8; openhost_pkarr::DTLS_FP_LEN]> {
+    let raw = hex::decode(s).map_err(|e| Error::Hex(e.to_string()))?;
+    parse_array::<{ openhost_pkarr::DTLS_FP_LEN }>(&raw, "host_dtls_fp")
 }
 
 /// Compute the 32-byte AUTH bytes for a browser (CertFp) dial.

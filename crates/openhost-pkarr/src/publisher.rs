@@ -728,7 +728,10 @@ mod tests {
 
     #[tokio::test]
     async fn publish_once_folds_in_answer_entries() {
-        use crate::offer::{hash_offer_sdp, AnswerEntry, AnswerPlaintext};
+        use crate::offer::{
+            hash_offer_sdp, AnswerBlob, AnswerEntry, AnswerPayload, AnswerPlaintext, BlobCandidate,
+            CandidateType, SetupRole,
+        };
         use openhost_core::pkarr_record::SALT_LEN;
         use rand::rngs::StdRng;
         use rand::SeedableRng;
@@ -741,11 +744,20 @@ mod tests {
         let client_sk = SigningKey::from_bytes(&[0x77u8; 32]);
         let client_pk = client_sk.public_key();
         let salt = [0x11u8; SALT_LEN];
-        let answer_sdp = "v=0\r\na=setup:passive\r\n";
+        let blob = AnswerBlob {
+            ice_ufrag: "abcd".to_string(),
+            ice_pwd: "0123456789abcdefghij!@".to_string(),
+            setup: SetupRole::Passive,
+            candidates: vec![BlobCandidate {
+                typ: CandidateType::Srflx,
+                ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+                port: 51_820,
+            }],
+        };
         let plaintext = AnswerPlaintext {
             daemon_pk,
             offer_sdp_hash: hash_offer_sdp("v=0\r\na=setup:active\r\n"),
-            answer_sdp: answer_sdp.to_string(),
+            answer: AnswerPayload::V2Blob(blob.clone()),
         };
         let mut rng = StdRng::from_seed([0x42; 32]);
         let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, 42).unwrap();
@@ -764,7 +776,10 @@ mod tests {
             .unwrap()
             .expect("answer fragments present");
         let opened = decoded.open(&client_sk).unwrap();
-        assert_eq!(opened.answer_sdp, answer_sdp);
+        match opened.answer {
+            AnswerPayload::V2Blob(got) => assert_eq!(got, blob),
+            AnswerPayload::V1Sdp(_) => panic!("expected V2Blob"),
+        }
     }
 
     #[tokio::test]

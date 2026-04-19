@@ -159,10 +159,20 @@ fn decode_answer_fragments_reassembles_published_fragments() {
     let client_pk = client_sk.public_key();
     let salt = [0x22u8; SALT_LEN];
 
+    let blob = openhost_pkarr::AnswerBlob {
+        ice_ufrag: "abcd".to_string(),
+        ice_pwd: "0123456789abcdefghij!@".to_string(),
+        setup: openhost_pkarr::SetupRole::Passive,
+        candidates: vec![openhost_pkarr::BlobCandidate {
+            typ: openhost_pkarr::CandidateType::Srflx,
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+            port: 51_820,
+        }],
+    };
     let plaintext = AnswerPlaintext {
         daemon_pk: sk.public_key(),
         offer_sdp_hash: openhost_pkarr::hash_offer_sdp("v=0\r\n"),
-        answer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
+        answer: openhost_pkarr::AnswerPayload::V2Blob(blob.clone()),
     };
     let mut rng = rand::rngs::OsRng;
     let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, ts).unwrap();
@@ -200,7 +210,10 @@ fn decode_answer_fragments_reassembles_published_fragments() {
         created_at: entry.created_at,
     };
     let opened = rebuilt.open(&client_sk).expect("sealed bytes open");
-    assert_eq!(opened.answer_sdp, plaintext.answer_sdp);
+    match opened.answer {
+        openhost_pkarr::AnswerPayload::V2Blob(got) => assert_eq!(got, blob),
+        openhost_pkarr::AnswerPayload::V1Sdp(s) => panic!("expected V2Blob, got V1 SDP: {s}"),
+    }
 }
 
 // ============================================================================
@@ -250,18 +263,30 @@ fn seal_offer_rejects_unknown_binding_mode() {
 }
 
 #[test]
-fn open_answer_roundtrips_via_client_sk() {
-    use openhost_pkarr::AnswerEntry;
-    use openhost_pkarr::AnswerPlaintext;
+fn open_answer_roundtrips_v2_blob_via_client_sk() {
+    use openhost_pkarr::{
+        AnswerBlob, AnswerEntry, AnswerPayload, AnswerPlaintext, BlobCandidate, CandidateType,
+        SetupRole,
+    };
 
     let daemon_sk = SigningKey::from_bytes(&SEED);
     let client_sk = SigningKey::from_bytes(&CLIENT_SEED);
     let client_pk = client_sk.public_key();
     let salt = [0x22u8; SALT_LEN];
+    let blob = AnswerBlob {
+        ice_ufrag: "abcd".to_string(),
+        ice_pwd: "0123456789abcdefghij!@".to_string(),
+        setup: SetupRole::Passive,
+        candidates: vec![BlobCandidate {
+            typ: CandidateType::Srflx,
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+            port: 51_820,
+        }],
+    };
     let plaintext = AnswerPlaintext {
         daemon_pk: daemon_sk.public_key(),
         offer_sdp_hash: openhost_pkarr::hash_offer_sdp("v=0"),
-        answer_sdp: "v=0\r\na=setup:passive\r\n".to_string(),
+        answer: AnswerPayload::V2Blob(blob.clone()),
     };
     let mut rng = rand::rngs::OsRng;
     let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, now_ts()).expect("seal");
@@ -270,8 +295,21 @@ fn open_answer_roundtrips_via_client_sk() {
     use base64::Engine;
     let sealed_b64 = URL_SAFE_NO_PAD.encode(&entry.sealed);
 
-    let opened = core::open_answer(&client_sk.to_bytes(), &sealed_b64).expect("open");
-    assert_eq!(opened.answer_sdp, plaintext.answer_sdp);
+    let dtls_fp = [0xAAu8; openhost_pkarr::DTLS_FP_LEN];
+    let dtls_fp_hex = hex::encode(dtls_fp);
+    let opened = core::open_answer(&client_sk.to_bytes(), &sealed_b64, &dtls_fp_hex).expect("open");
+
+    // The reconstructed SDP must contain the blob's ufrag, pwd,
+    // setup role, candidate, and the fingerprint we passed in.
+    assert!(opened.answer_sdp.contains("a=ice-ufrag:abcd"));
+    assert!(opened
+        .answer_sdp
+        .contains("a=ice-pwd:0123456789abcdefghij!@"));
+    assert!(opened.answer_sdp.contains("a=setup:passive"));
+    assert!(opened.answer_sdp.contains("203.0.113.7 51820"));
+    assert!(opened
+        .answer_sdp
+        .contains(&openhost_pkarr::answer_blob_to_sdp(&blob, &dtls_fp)[..]));
     assert_eq!(
         opened.daemon_pk_zbase32,
         daemon_sk.public_key().to_zbase32()

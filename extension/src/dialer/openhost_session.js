@@ -190,8 +190,12 @@ export async function dialOhUrl(ohUrl, opts = {}) {
   const packet = build_offer_packet(clientSeed, daemonPkZ, sealed, BigInt(Math.floor(Date.now() / 1000)));
   await publishOfferPacket(clientPkZ, packet);
 
-  // 5. Poll answer fragments on the daemon's zone.
+  // 5. Poll answer fragments on the daemon's zone. The host's DTLS
+  // fingerprint was already verified under the BEP44 signature during
+  // step 1; threading it here lets the v2 compact-blob branch
+  // reconstruct the full SDP locally.
   const answerSdp = await pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed,
+                                       hostDtlsFpHex: hostRecord.dtls_fingerprint_hex,
                                        timeoutMs: opts.answerTimeoutMs ?? 30_000 });
 
   // 6. Apply answer + wait for DTLS Connected.
@@ -302,14 +306,14 @@ async function publishOfferPacket(clientPkZ, packetBytes) {
   throw new Error(`all relays rejected offer publish: ${lastErr?.message ?? "unknown"}`);
 }
 
-async function pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed, timeoutMs }) {
+async function pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed, hostDtlsFpHex, timeoutMs }) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const packet = await fetchHostPacket(daemonPkZ);
       const ans = decode_answer_fragments(packet, daemonSalt, clientPkZ);
       if (ans) {
-        const opened = open_answer(clientSeed, ans.sealed_base64url);
+        const opened = open_answer(clientSeed, ans.sealed_base64url, hostDtlsFpHex);
         if (opened.daemon_pk_zbase32 !== daemonPkZ) {
           throw new Error("answer's inner daemon_pk does not match the packet signer");
         }

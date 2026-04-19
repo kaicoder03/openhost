@@ -207,11 +207,18 @@ async fn daemon_polls_scripted_offer_and_publishes_answer() -> DaemonResult<()> 
         opened.offer_sdp_hash,
         openhost_pkarr::hash_offer_sdp(&offer_sdp)
     );
-    assert!(
-        opened.answer_sdp.contains("a=setup:passive"),
-        "answer SDP must assert a=setup:passive; got: {}",
-        opened.answer_sdp
-    );
+    match &opened.answer {
+        openhost_pkarr::AnswerPayload::V2Blob(blob) => {
+            assert_eq!(
+                blob.setup,
+                openhost_pkarr::SetupRole::Passive,
+                "daemon answer blob must assert passive setup role"
+            );
+        }
+        openhost_pkarr::AnswerPayload::V1Sdp(s) => {
+            panic!("daemon must emit v2 compact blobs, got v1 SDP: {s}")
+        }
+    }
     // Belt-and-braces: at least ONE publish was captured. That publish
     // may or may not carry the answer TXT (see the eviction note above),
     // but the publisher trigger must have fired.

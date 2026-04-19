@@ -95,6 +95,10 @@ The channel-binding HMAC (attack 7.1 above) feeds HKDF-SHA256 with a session-spe
 
 libp2p's browser WebRTC transport (shipped in production across IPFS + Filecoin) uses an analogous cert-fingerprint binding in place of RFC 5705 for the same reason. openhost's CertFp variant is the same design pattern.
 
+### 4.4 Answer blob fingerprint locality
+
+The v2 answer body (`openhost-answer-inner2`, see `01-wire-format.md §3.3`) does **NOT** carry a duplicate copy of the host's DTLS certificate fingerprint. The fingerprint is carried exactly once, in the `dtls_fp` field of the host's main `_openhost` record, where it is pinned under the outer BEP44 signature. Clients reconstruct a complete answer SDP locally by combining the compact blob with that already-verified fingerprint. An adversary who forged a matching fingerprint would have already broken the host's Ed25519 identity key — the integrity surface of the one-per-host fingerprint is unchanged relative to the legacy v1 answer body.
+
 ## 5. Security response
 
 See [`../SECURITY.md`](../SECURITY.md) for the reporting process and response-time commitments.
