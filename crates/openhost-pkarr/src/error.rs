@@ -83,6 +83,10 @@ pub enum PkarrError {
 
     /// An upstream pkarr publish failed (relays + DHT all reported errors or
     /// a compare-and-swap conflict rejected the write).
+    ///
+    /// Only surfaces under the `full` feature — the `resolver-only` build has
+    /// no publisher and therefore cannot produce this variant.
+    #[cfg(feature = "full")]
     #[error("pkarr publish error: {0}")]
     Publish(#[from] pkarr::errors::PublishError),
 

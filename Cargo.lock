@@ -2129,6 +2129,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "openhost-pkarr-wasm"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.2.17",
+ "hex",
+ "js-sys",
+ "openhost-core",
+ "openhost-pkarr",
+ "pkarr",
+ "rand 0.8.6",
+ "serde",
+ "serde-wasm-bindgen",
+ "thiserror 2.0.18",
+ "tokio",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2939,6 +2959,17 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
 ]
 
 [[package]]
