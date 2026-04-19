@@ -8,6 +8,23 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Changed (PR #22, shrink main `_openhost` record)
+
+- **Wire-format break**: `PROTOCOL_VERSION` bumped `1` → `2`. v2 records drop the `allow` and `ice` fields from `OpenhostRecord::canonical_signing_bytes`. v1 and v2 records are mutually unreadable; the `version` byte is the discriminator (decoders **MUST** reject a mismatched version).
+- `IceBlob` struct deleted entirely. The daemon had no writer for it in production; the exploration confirmed it was always `Vec::new()`. Per-client ICE ciphertext will live in separate TXT records when that feature lands (see updated `spec/01-wire-format.md §2`).
+- The host's allowlist stays in `SharedState::allow` (consulted by `is_client_allowed` on every inbound offer) but is **no longer published**. Operators that scraped the published `allow` list for diagnostic purposes should instead inspect the daemon's pairing TOML directly (`~/.config/openhost/allow.toml` by default).
+- `openhost-resolve --json` schema drops the `allow_hex` and `ice` keys. Any script that consumed them needs updating; the remaining keys (`version`, `ts`, `dtls_fp_hex`, `roles`, `salt_hex`, `disc`, `signature_hex`) are unchanged.
+- Reference test vectors regenerated: `spec/test-vectors/pkarr_record.json` carries a new canonical length (118 bytes, was 230) + new signature; `spec/test-vectors/pkarr_packet.json` carries a new BEP44 outer signature + packet bytes (packet shrank from 584 to 434 bytes on the wire — a 26% reduction before fragment fanout).
+
+### Added (PR #22)
+
+- New `pkarr_record::tests::v2_main_record_base64_fits_under_ceiling` pins the base64url length of a realistic v2 main record below 260 chars. The v2 shape measures ~243 chars; any future field addition that quietly regrows the record can't silently recreate the pre-PR-22 BEP44 overflow.
+- `spec/01-wire-format.md §2` rewritten: v2 canonical bytes listed, v1 migration path described, allowlist-is-private-state constraint added, ICE-ciphertext-as-separate-records planned path documented.
+
+### Known limitations (carries into 0.3)
+
+- **Residual BEP44 gap on real webrtc-rs answers remains open.** PR #22 freed ~112 bytes from the main record, but the `daemon_produces_sealed_answer_for_dialer_offer` end-to-end test still asserts `PollAnswerTimeout` because real webrtc-rs answer SDPs (~450 bytes sealed → 3 fragments at 180 bytes each) still exceed the residual BEP44 budget after fragmentation overhead. Further fixes — likely either larger `MAX_FRAGMENT_PAYLOAD_BYTES` with DNS multi-string handling, or shrinking the answer SDP itself — are separate follow-ups.
+
 ## [0.2.0] - 2026-04-18
 
 Phase 1 + Phase 2 of the post-v0.1 roadmap, shipped as seven focused PRs (#14 – #20). Closes all three v0.1 known limitations (answer-record overflow, missing client CLI, SIGHUP-only pairing reload) and lands the operator-facing docs needed to actually test the release: install + quickstart + troubleshoot guides on the site, worked `examples/` for static sites + Jellyfin + Home Assistant, a README Quickstart, and a root-level `CONTRIBUTING.md`. Also a breaking wire-format change in `_answer-<client-hash>` records — see `### Changed` below.

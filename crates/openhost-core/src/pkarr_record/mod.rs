@@ -15,8 +15,10 @@ use crate::{Error, Result};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
-/// openhost protocol version carried in the record. Incremented on breaking changes.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// openhost protocol version carried in the record. Incremented on breaking
+/// changes. v2 (PR #22) drops the `allow` and `ice` fields from the canonical
+/// bytes; v2 records are a hard break from v1.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Maximum permitted age of a signed record in seconds. Verifiers reject records
 /// whose internal timestamp is further from "now" than this window.
@@ -25,11 +27,15 @@ pub const MAX_RECORD_AGE_SECS: u64 = 7200;
 /// Length of the per-host salt used to key the allowlist HMAC.
 pub const SALT_LEN: usize = 32;
 
-/// Length of one entry in the `allow` list (truncated HMAC-SHA256).
-pub const ALLOW_ENTRY_LEN: usize = 16;
-
-/// Length of one `clienthash` that prefixes a per-client ICE blob.
+/// Length of a client-identifying truncated HMAC-SHA256 used by the offer
+/// poller (per-client record naming) and the in-process allowlist check.
 pub const CLIENT_HASH_LEN: usize = 16;
+
+/// Legacy alias — the v1 record carried a published `allow` field whose
+/// entries were this length. v2 drops the field from the wire; the
+/// constant is retained because other crates still use it for internal
+/// SharedState hashes.
+pub const ALLOW_ENTRY_LEN: usize = CLIENT_HASH_LEN;
 
 /// The sha256-fingerprint of a DTLS certificate, 32 bytes.
 pub const DTLS_FINGERPRINT_LEN: usize = 32;
@@ -37,22 +43,16 @@ pub const DTLS_FINGERPRINT_LEN: usize = 32;
 /// Maximum length of the `disc` substrate-hints string (informational).
 pub const MAX_DISC_LEN: usize = 256;
 
-/// Per-client ICE candidate blob: a client-hash selector and the sealed-box
-/// ciphertext addressed to that client's X25519 public key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IceBlob {
-    /// 16-byte truncated HMAC-SHA256 of the client public key keyed by the host's salt.
-    #[serde(with = "serde_bytes")]
-    pub client_hash: Vec<u8>,
-    /// Sealed-box ciphertext — the ICE candidates, encrypted to the client's X25519 key.
-    #[serde(with = "serde_bytes")]
-    pub ciphertext: Vec<u8>,
-}
-
-/// The semantic openhost record published by a host.
+/// The semantic openhost record published by a host (v2 schema).
+///
+/// PR #22 removed the v1 `allow` and `ice` fields. The host's allow list
+/// is now strictly private state: the daemon checks it internally on the
+/// offer-poll path and does not publish it. ICE blobs were unused in
+/// production; the field is gone along with the `IceBlob` type that
+/// carried them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenhostRecord {
-    /// Protocol version. Must equal [`PROTOCOL_VERSION`] for a v1 record.
+    /// Protocol version. Must equal [`PROTOCOL_VERSION`] for a v2 record.
     pub version: u8,
     /// Unix timestamp (seconds) at which the host published this record.
     pub ts: u64,
@@ -62,10 +62,6 @@ pub struct OpenhostRecord {
     pub roles: String,
     /// Per-host random salt used to key the allowlist HMAC.
     pub salt: [u8; SALT_LEN],
-    /// Paired clients, identified by truncated HMAC of their public keys.
-    pub allow: Vec<[u8; ALLOW_ENTRY_LEN]>,
-    /// ICE candidate blobs, one per paired client.
-    pub ice: Vec<IceBlob>,
     /// Substrate discovery hints (informational). UTF-8, up to [`MAX_DISC_LEN`] bytes.
     pub disc: String,
 }
@@ -96,46 +92,27 @@ impl OpenhostRecord {
         if self.disc.len() > MAX_DISC_LEN {
             return Err(Error::InvalidRecord("disc hints exceed maximum length"));
         }
-        if self.allow.len() > u16::MAX as usize {
-            return Err(Error::InvalidRecord("allow list exceeds 65535 entries"));
-        }
-        if self.ice.len() > u16::MAX as usize {
-            return Err(Error::InvalidRecord("ice list exceeds 65535 entries"));
-        }
-        for blob in &self.ice {
-            if blob.client_hash.len() != CLIENT_HASH_LEN {
-                return Err(Error::InvalidRecord("ice.client_hash is not 16 bytes"));
-            }
-            if blob.ciphertext.is_empty() {
-                return Err(Error::InvalidRecord("ice.ciphertext is empty"));
-            }
-            if blob.ciphertext.len() > 0xFFFF_FFFF {
-                return Err(Error::InvalidRecord("ice.ciphertext exceeds 2^32 bytes"));
-            }
-        }
         Ok(())
     }
 
     /// Produce the canonical byte representation used for signing and verification.
     ///
-    /// The encoding is explicit and stable:
+    /// The v2 encoding is explicit and stable:
     ///
     /// ```text
-    /// canonical = 0x01 (version tag; bumped on protocol change)
-    ///          || "openhost1"              (9 ASCII bytes, domain separator)
-    ///          || version (1 byte, equals PROTOCOL_VERSION)
+    /// canonical = 0x01                        (legacy encoding tag; unchanged)
+    ///          || "openhost1"                 (9 ASCII bytes, legacy domain separator)
+    ///          || version (1 byte, equals PROTOCOL_VERSION = 2)
     ///          || ts (8 bytes, u64 big-endian)
     ///          || dtls_fp (32 bytes)
     ///          || roles_len (1 byte)    || roles_bytes
     ///          || salt (32 bytes)
-    ///          || allow_count (2 bytes BE) || 16-byte entries
-    ///          || ice_count (2 bytes BE)
-    ///          || for each ice blob:
-    ///              || client_hash (16 bytes)
-    ///              || ciphertext_len (4 bytes BE)
-    ///              || ciphertext
     ///          || disc_len (2 bytes BE) || disc_bytes
     /// ```
+    ///
+    /// The v1 schema inserted `allow_count || allow_entries || ice_count || ice_blobs`
+    /// between `salt` and `disc`. v2 drops those fields entirely; the `version`
+    /// byte is the sole discriminator for readers.
     ///
     /// Returns `Err` only when the record fails `validate(now_ts=self.ts)` — i.e.
     /// when the record is ill-formed. Otherwise the returned buffer is deterministic.
@@ -143,7 +120,7 @@ impl OpenhostRecord {
         self.validate(self.ts)?;
 
         let mut out = Vec::new();
-        out.push(0x01); // encoding-format version tag
+        out.push(0x01); // encoding-format version tag (legacy; unchanged)
         out.extend_from_slice(b"openhost1");
         out.push(self.version);
         out.extend_from_slice(&self.ts.to_be_bytes());
@@ -154,21 +131,6 @@ impl OpenhostRecord {
         out.extend_from_slice(roles_bytes);
 
         out.extend_from_slice(&self.salt);
-
-        let allow_count = u16::try_from(self.allow.len()).expect("validated <= u16::MAX");
-        out.extend_from_slice(&allow_count.to_be_bytes());
-        for entry in &self.allow {
-            out.extend_from_slice(entry);
-        }
-
-        let ice_count = u16::try_from(self.ice.len()).expect("validated <= u16::MAX");
-        out.extend_from_slice(&ice_count.to_be_bytes());
-        for blob in &self.ice {
-            out.extend_from_slice(&blob.client_hash);
-            let ct_len = u32::try_from(blob.ciphertext.len()).expect("validated <= u32::MAX");
-            out.extend_from_slice(&ct_len.to_be_bytes());
-            out.extend_from_slice(&blob.ciphertext);
-        }
 
         let disc_bytes = self.disc.as_bytes();
         let disc_len = u16::try_from(disc_bytes.len()).expect("validated <= MAX_DISC_LEN");
@@ -223,19 +185,16 @@ mod tests {
 
     fn sample_record(ts: u64) -> OpenhostRecord {
         let salt = [0x11u8; SALT_LEN];
-        let client_pk = [0xAAu8; 32];
-        let hash = allowlist_hash(&salt, &client_pk);
+        // Exercise `allowlist_hash` via an import (the helper is no longer
+        // used inside OpenhostRecord, but downstream crates still rely on
+        // it; keep the link loud so removals elsewhere show up here).
+        let _ = allowlist_hash(&salt, &[0xAAu8; 32]);
         OpenhostRecord {
             version: PROTOCOL_VERSION,
             ts,
             dtls_fp: [0x42u8; DTLS_FINGERPRINT_LEN],
             roles: "server".to_string(),
             salt,
-            allow: vec![hash],
-            ice: vec![IceBlob {
-                client_hash: hash.to_vec(),
-                ciphertext: vec![0xEE; 72],
-            }],
             disc: "dht=1; relay=pkarr.example".to_string(),
         }
     }
@@ -317,13 +276,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_bad_ice_blob() {
-        let mut r = sample_record(1_700_000_000);
-        r.ice[0].client_hash = vec![1, 2, 3]; // not 16 bytes
-        assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
-    }
-
-    #[test]
     fn canonical_bytes_change_with_any_field() {
         let base = sample_record(1_700_000_000)
             .canonical_signing_bytes()
@@ -346,11 +298,36 @@ mod tests {
         assert_ne!(r.canonical_signing_bytes().unwrap(), base);
 
         let mut r = sample_record(1_700_000_000);
-        r.ice[0].ciphertext[0] ^= 0x01;
-        assert_ne!(r.canonical_signing_bytes().unwrap(), base);
-
-        let mut r = sample_record(1_700_000_000);
         r.disc.push_str(" extra");
         assert_ne!(r.canonical_signing_bytes().unwrap(), base);
+    }
+
+    /// Measure the wire size of a v2 main record after base64url wrapping
+    /// (the outer BEP44 `v` is `base64url(signature || canonical)`). With
+    /// the v1 allow+ice fields dropped, a realistic record should encode
+    /// under 220 base64 chars; this asserts a generous ceiling so a future
+    /// field addition that quietly bloats the record can't silently
+    /// recreate the pre-PR-22 BEP44 overflow regression.
+    #[test]
+    fn v2_main_record_base64_fits_under_ceiling() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let signed = SignedRecord::sign(sample_record(1_700_000_000), &sk).unwrap();
+        let canonical = signed.record.canonical_signing_bytes().unwrap();
+        let mut blob = Vec::with_capacity(64 + canonical.len());
+        blob.extend_from_slice(&signed.signature.to_bytes());
+        blob.extend_from_slice(&canonical);
+        let b64 = URL_SAFE_NO_PAD.encode(&blob);
+        // Realistic v2 record with a non-empty `disc` measures ~243
+        // chars (v1 with 1 allow + 1 ice blob was ~392). Ceiling at
+        // 260 leaves a little slack for disc tweaks while still
+        // catching a regression that re-bloats the record.
+        assert!(
+            b64.len() < 260,
+            "v2 main record base64 is {} chars; keep under 260 so fragmented answers fit the BEP44 budget",
+            b64.len(),
+        );
     }
 }

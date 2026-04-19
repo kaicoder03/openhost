@@ -1,9 +1,12 @@
 //! Consume `spec/test-vectors/pkarr_record.json` and verify canonical bytes and
 //! the signature match the implementation bit-for-bit.
+//!
+//! The v2 schema drops `allow` and `ice` from the record; this test
+//! enforces the new canonical layout.
 
 use ed25519_dalek::Signature;
 use openhost_core::identity::{PublicKey, SigningKey};
-use openhost_core::pkarr_record::{IceBlob, OpenhostRecord, SignedRecord};
+use openhost_core::pkarr_record::{OpenhostRecord, SignedRecord};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -29,25 +32,12 @@ struct RecordFields {
     dtls_fp_hex: String,
     roles: String,
     salt_hex: String,
-    allow_hex: Vec<String>,
-    ice: Vec<IceFields>,
     disc: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct IceFields {
-    client_hash_hex: String,
-    ciphertext_hex: String,
 }
 
 fn decode_hex32(s: &str) -> [u8; 32] {
     let v = hex::decode(s).expect("hex");
     v.as_slice().try_into().expect("32 bytes")
-}
-
-fn decode_hex16(s: &str) -> [u8; 16] {
-    let v = hex::decode(s).expect("hex");
-    v.as_slice().try_into().expect("16 bytes")
 }
 
 fn build_record(r: &RecordFields) -> OpenhostRecord {
@@ -57,15 +47,6 @@ fn build_record(r: &RecordFields) -> OpenhostRecord {
         dtls_fp: decode_hex32(&r.dtls_fp_hex),
         roles: r.roles.clone(),
         salt: decode_hex32(&r.salt_hex),
-        allow: r.allow_hex.iter().map(|s| decode_hex16(s)).collect(),
-        ice: r
-            .ice
-            .iter()
-            .map(|i| IceBlob {
-                client_hash: hex::decode(&i.client_hash_hex).expect("hex"),
-                ciphertext: hex::decode(&i.ciphertext_hex).expect("hex"),
-            })
-            .collect(),
         disc: r.disc.clone(),
     }
 }
@@ -94,8 +75,9 @@ fn canonical_bytes_and_signature_match() {
         assert_eq!(
             canonical.len(),
             v.canonical_len,
-            "{}: canonical_len",
+            "{}: canonical_len (got {:?})",
             v.name,
+            hex::encode(&canonical),
         );
         assert_eq!(
             hex::encode(&canonical),

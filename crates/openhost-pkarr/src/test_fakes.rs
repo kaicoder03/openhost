@@ -123,7 +123,7 @@ mod tests {
     use crate::codec::encode;
     use openhost_core::identity::SigningKey;
     use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
+        OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
     };
 
     const SEED: [u8; 32] = [0x42u8; 32];
@@ -136,11 +136,6 @@ mod tests {
             dtls_fp: [0x11; DTLS_FINGERPRINT_LEN],
             roles: "server".to_string(),
             salt: [0x22; SALT_LEN],
-            allow: vec![],
-            ice: vec![IceBlob {
-                client_hash: vec![0x33; 16],
-                ciphertext: vec![0x44; 48],
-            }],
             disc: String::new(),
         };
         let signed = SignedRecord::sign(record, &sk).unwrap();

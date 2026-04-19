@@ -143,18 +143,6 @@ fn print_human(oh_url: &str, signed: &SignedRecord) {
     println!("dtls_fp:   {}", hex::encode(record.dtls_fp));
     println!("roles:     {}", record.roles);
     println!("salt:      {}", hex::encode(record.salt));
-    println!("allow:     {} entries", record.allow.len());
-    for (i, entry) in record.allow.iter().enumerate() {
-        println!("  [{i}] {}", hex::encode(entry));
-    }
-    println!("ice:       {} blob(s)", record.ice.len());
-    for (i, blob) in record.ice.iter().enumerate() {
-        println!(
-            "  [{i}] client_hash={} ciphertext={} bytes",
-            hex::encode(&blob.client_hash),
-            blob.ciphertext.len()
-        );
-    }
     println!(
         "disc:      {}",
         if record.disc.is_empty() {
@@ -171,7 +159,8 @@ fn print_human(oh_url: &str, signed: &SignedRecord) {
 
 /// Serialize a [`SignedRecord`] into the JSON shape `--json` emits.
 /// Extracted so the schema can be unit-tested without spawning a
-/// subprocess.
+/// subprocess. v2 records dropped `allow_hex` and `ice` keys (PR #22);
+/// scripts that consumed them need updating.
 fn record_to_json(signed: &SignedRecord) -> JsonValue {
     let r = &signed.record;
     json!({
@@ -180,12 +169,6 @@ fn record_to_json(signed: &SignedRecord) -> JsonValue {
         "dtls_fp_hex": hex::encode(r.dtls_fp),
         "roles": r.roles,
         "salt_hex": hex::encode(r.salt),
-        "allow_hex": r.allow.iter().map(hex::encode).collect::<Vec<_>>(),
-        "ice": r.ice.iter().map(|b| json!({
-            "client_hash_hex": hex::encode(&b.client_hash),
-            "ciphertext_len": b.ciphertext.len(),
-            "ciphertext_hex": hex::encode(&b.ciphertext),
-        })).collect::<Vec<_>>(),
         "disc": r.disc,
         "signature_hex": hex::encode(signed.signature.to_bytes()),
     })
@@ -194,10 +177,9 @@ fn record_to_json(signed: &SignedRecord) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openhost_core::crypto::allowlist_hash;
     use openhost_core::identity::SigningKey;
     use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
+        OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
     };
 
     const RFC_SEED: [u8; 32] = [
@@ -208,19 +190,12 @@ mod tests {
 
     fn sample_signed() -> SignedRecord {
         let sk = SigningKey::from_bytes(&RFC_SEED);
-        let salt = [0x11u8; SALT_LEN];
-        let hash = allowlist_hash(&salt, &[0xAA; 32]);
         let record = OpenhostRecord {
             version: PROTOCOL_VERSION,
             ts: 1_700_000_000,
             dtls_fp: [0x42u8; DTLS_FINGERPRINT_LEN],
             roles: "server".to_string(),
-            salt,
-            allow: vec![hash],
-            ice: vec![IceBlob {
-                client_hash: hash.to_vec(),
-                ciphertext: vec![0xEE; 72],
-            }],
+            salt: [0x11u8; SALT_LEN],
             disc: "dht=1".to_string(),
         };
         SignedRecord::sign(record, &sk).expect("sign")
@@ -230,8 +205,9 @@ mod tests {
     fn json_output_has_stable_keys_and_shape() {
         // Every field name + type below is part of the CLI's public
         // contract — piping `--json` into downstream scripts breaks if
-        // these change silently. Treat a failing assertion as "the CLI
-        // is about to ship a breaking change; bump docs / callers".
+        // these change silently. The v2 shape (PR #22) dropped the
+        // `allow_hex` and `ice` keys; any script that consumed them
+        // needs updating.
         let value = record_to_json(&sample_signed());
         let obj = value.as_object().expect("top-level is an object");
 
@@ -241,32 +217,26 @@ mod tests {
             "dtls_fp_hex",
             "roles",
             "salt_hex",
-            "allow_hex",
-            "ice",
             "disc",
             "signature_hex",
         ] {
             assert!(obj.contains_key(*key), "missing top-level key {key:?}");
         }
 
-        assert_eq!(obj["version"], 1);
+        assert!(
+            !obj.contains_key("allow_hex"),
+            "v2 CLI output must not carry allow_hex",
+        );
+        assert!(
+            !obj.contains_key("ice"),
+            "v2 CLI output must not carry an `ice` array",
+        );
+
+        assert_eq!(obj["version"], 2);
         assert_eq!(obj["ts"], 1_700_000_000);
         assert_eq!(obj["roles"], "server");
         assert_eq!(obj["disc"], "dht=1");
         assert_eq!(obj["dtls_fp_hex"].as_str().unwrap().len(), 64); // 32 bytes hex
-
-        let allow = obj["allow_hex"].as_array().expect("allow is an array");
-        assert_eq!(allow.len(), 1);
-        assert_eq!(allow[0].as_str().unwrap().len(), 32); // 16 bytes hex
-
-        let ice = obj["ice"].as_array().expect("ice is an array");
-        assert_eq!(ice.len(), 1);
-        let blob = &ice[0];
-        for k in &["client_hash_hex", "ciphertext_len", "ciphertext_hex"] {
-            assert!(blob.get(*k).is_some(), "ice blob missing {k:?}");
-        }
-        assert_eq!(blob["ciphertext_len"], 72);
-
         assert_eq!(obj["signature_hex"].as_str().unwrap().len(), 128); // 64 bytes hex
     }
 

@@ -19,7 +19,7 @@ use hkdf::Hkdf;
 use openhost_core::crypto::allowlist_hash;
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::pkarr_record::{
-    IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
+    OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
 };
 use openhost_pkarr::{
     AnswerEntry, AnswerSource, PkarrResolve, PkarrTransport, Publisher, PublisherHandle,
@@ -52,8 +52,10 @@ const ALLOW_SALT_HKDF_SALT: &[u8] = b"openhost-allow-salt-v1";
 pub struct SharedState {
     dtls_fp: RwLock<[u8; DTLS_FINGERPRINT_LEN]>,
     salt: [u8; SALT_LEN],
+    /// In-process allow list. Consulted on every inbound offer via
+    /// [`is_client_allowed`]; never published on the wire in v2+ of
+    /// the record schema. See spec `01-wire-format.md §2`.
     allow: RwLock<Vec<[u8; 16]>>,
-    ice: RwLock<Vec<IceBlob>>,
     roles: String,
     /// Per-client answer records queued for publication. Keyed by
     /// `client_hash` (HMAC of `client_pk` under the daemon's salt) so a
@@ -80,7 +82,6 @@ impl SharedState {
             dtls_fp: RwLock::new(dtls_fp),
             salt,
             allow: RwLock::new(Vec::new()),
-            ice: RwLock::new(Vec::new()),
             roles: "server".to_string(),
             answers: RwLock::new(HashMap::new()),
         }
@@ -173,13 +174,11 @@ impl SharedState {
         before != guard.len()
     }
 
-    /// Snapshot of the current ICE blob set.
-    pub fn ice(&self) -> Vec<IceBlob> {
-        self.ice.read().expect("ice lock poisoned").clone()
-    }
-
     /// Build a fresh [`OpenhostRecord`] with `ts` set to **now**. This is
-    /// what the publisher calls on every tick.
+    /// what the publisher calls on every tick. The in-process `allow`
+    /// list is deliberately NOT copied into the record — v2+ of the
+    /// schema keeps the allow list private so the main record stays
+    /// small and more answer fragments fit the BEP44 packet budget.
     pub fn snapshot_record(&self) -> OpenhostRecord {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -191,8 +190,6 @@ impl SharedState {
             dtls_fp: self.dtls_fp(),
             roles: self.roles.clone(),
             salt: self.salt,
-            allow: self.allow(),
-            ice: self.ice(),
             disc: String::new(),
         }
     }
@@ -396,8 +393,11 @@ mod tests {
         service.shutdown().await;
     }
 
+    /// Snapshot of a freshly-built `SharedState` publishes the expected
+    /// v2 record shape: right version, roles, and no `allow`/`ice` —
+    /// both dropped from the main record in PR #22.
     #[tokio::test]
-    async fn allow_and_ice_default_to_empty() {
+    async fn snapshot_record_produces_v2_shape() {
         let transport = Arc::new(FakeTransport::default());
         let sk = Arc::new(SigningKey::from_bytes(&RFC_SEED));
         let state = Arc::new(SharedState::new(&sk, [0x42; DTLS_FINGERPRINT_LEN]));
@@ -406,8 +406,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let record = state.snapshot_record();
-        assert!(record.allow.is_empty());
-        assert!(record.ice.is_empty());
         assert_eq!(record.roles, "server");
         assert_eq!(record.version, PROTOCOL_VERSION);
 

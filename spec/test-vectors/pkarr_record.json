@@ -1,43 +1,36 @@
 {
-  "description": "openhost signed-record test vectors. Every implementation MUST pass all of these to claim v1 conformance.",
-  "version": "openhost1",
+  "description": "openhost signed-record test vectors. Every implementation MUST pass all of these to claim v2 conformance.",
+  "version": "openhost2",
   "encoding_notes": [
     "All byte strings are hex-encoded.",
     "canonical_hex is the output of OpenhostRecord::canonical_signing_bytes — the byte string the Ed25519 signature covers.",
-    "The same canonical encoding is used by every implementation; the DNS-packet translation performed by openhost-pkarr at M2 is a separate, reversible step."
+    "The v2 schema (PR #22) removes the `allow` and `ice` fields the v1 canonical bytes carried; the main record now only covers version, ts, dtls_fp, roles, salt, and disc.",
+    "The DNS-packet translation performed by openhost-pkarr is a separate, reversible step on top of this canonical form."
   ],
   "constants": {
-    "PROTOCOL_VERSION": 1,
+    "PROTOCOL_VERSION": 2,
     "MAX_RECORD_AGE_SECS": 7200,
     "SALT_LEN": 32,
-    "ALLOW_ENTRY_LEN": 16,
     "CLIENT_HASH_LEN": 16,
     "DTLS_FINGERPRINT_LEN": 32,
     "MAX_DISC_LEN": 256
   },
   "vectors": [
     {
-      "name": "reference_record_v1",
+      "name": "reference_record_v2",
       "signing_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
       "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
       "record": {
-        "version": 1,
+        "version": 2,
         "ts": 1700000000,
         "dtls_fp_hex": "4242424242424242424242424242424242424242424242424242424242424242",
         "roles": "server",
         "salt_hex": "1111111111111111111111111111111111111111111111111111111111111111",
-        "allow_hex": ["cf364914c41971a41751779ae41f1147"],
-        "ice": [
-          {
-            "client_hash_hex": "cf364914c41971a41751779ae41f1147",
-            "ciphertext_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-          }
-        ],
         "disc": "dht=1; relay=pkarr.example"
       },
-      "canonical_len": 230,
-      "canonical_hex": "016f70656e686f73743101000000006553f10042424242424242424242424242424242424242424242424242424242424242420673657276657211111111111111111111111111111111111111111111111111111111111111110001cf364914c41971a41751779ae41f11470001cf364914c41971a41751779ae41f114700000048eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee001a6468743d313b2072656c61793d706b6172722e6578616d706c65",
-      "signature_hex": "7ba3a27300a9fda600ca86c4449d847b9327eb2d55e63a9de600657a4843f6e14912640b685e5002bd52215e229498a2502dc89b8456db1c00819a1fea0b8509"
+      "canonical_len": 118,
+      "canonical_hex": "016f70656e686f73743102000000006553f1004242424242424242424242424242424242424242424242424242424242424242067365727665721111111111111111111111111111111111111111111111111111111111111111001a6468743d313b2072656c61793d706b6172722e6578616d706c65",
+      "signature_hex": "f475997a5c1b89b6195ae5c8cbad152f393855a9e1701a765b5cbbda4d04b6347d9bb90487ea6ba23bb5292d124982f4b6269537140465639d24f5095260090d"
     }
   ],
   "negative_validation": [

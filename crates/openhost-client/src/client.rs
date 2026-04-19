@@ -153,10 +153,9 @@ impl Client {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use openhost_core::crypto::allowlist_hash;
     use openhost_core::identity::SigningKey;
     use openhost_core::pkarr_record::{
-        IceBlob, OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
+        OpenhostRecord, DTLS_FINGERPRINT_LEN, PROTOCOL_VERSION, SALT_LEN,
     };
     use openhost_pkarr::encode;
     use pkarr::SignedPacket;
@@ -172,19 +171,12 @@ mod tests {
     const FIXED_TS: u64 = 1_700_000_000;
 
     fn sample_record(ts: u64) -> OpenhostRecord {
-        let salt = [0x11u8; SALT_LEN];
-        let hash = allowlist_hash(&salt, &[0xAA; 32]);
         OpenhostRecord {
             version: PROTOCOL_VERSION,
             ts,
             dtls_fp: [0x42u8; DTLS_FINGERPRINT_LEN],
             roles: "server".to_string(),
-            salt,
-            allow: vec![hash],
-            ice: vec![IceBlob {
-                client_hash: hash.to_vec(),
-                ciphertext: vec![0xEE; 72],
-            }],
+            salt: [0x11u8; SALT_LEN],
             disc: String::new(),
         }
     }
