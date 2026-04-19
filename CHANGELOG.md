@@ -8,6 +8,14 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #28, browser-extension scaffold)
+
+- **New `extension/` directory layout** — subsequent PRs now have a place to land real browser code. Contents: `src/background.js` (MV3 service-worker stub), `wasm/` (empty; `wasm-pack` output goes here starting in PR #28.2), `public/` (empty; icons + popup HTML land in PR #28.5), `scripts/` (empty; WASM builder + manifest linter + store-artifact packager land in later PRs).
+- **`extension/manifest.json`** — minimum-permissions MV3 manifest (`permissions: []`, `host_permissions: []`), a `background.service_worker` pointer, and an `action.default_title`. Each future PR that adds a permission must justify it in its description per `spec/04-security.md` §7.4.
+- **`extension/package.json`** — `private: true`, dual-licensed, placeholder `lint` / `build` scripts that echo a note pointing at the PR where the real tooling lands. No dependencies, no build tool.
+- **`extension/README.md`** — architecture diagram (browser ↔ WASM openhost-client ↔ WebRTC ↔ daemon), forward-looking PR sequence (#28 scaffold → #28.2 Pkarr WASM → #28.3 client WASM → #28.4 `oh://` URL handler → #28.5 popup UI → #28.6+ Firefox/store submission), per-subdirectory rationale, and the security posture the extension inherits from the security spec (no content scripts, no broad host permissions, no cookies/tabs/history access, strict CSP, no remote code).
+- **`README.md`** — repo-layout row for `extension/` now points at the new extension README.
+
 ### Added (PR #27, Homebrew tap infrastructure)
 
 - **New `distribution/homebrew/openhost.rb`** — Homebrew formula that installs the three openhost binaries (`openhostd`, `openhost-dial`, `openhost-resolve`) on macOS (Apple Silicon + Intel) and Linux x86_64. Uses `on_macos` / `on_linux` + `on_arm` / `on_intel` blocks to pick the matching GitHub Releases tarball produced by `.github/workflows/release.yml`. `test do` block asserts `#{bin}/openhostd --version`, `#{bin}/openhost-dial --version`, and `#{bin}/openhost-resolve --version` each emit the expected version string. Each platform's `sha256` is a 64-zero placeholder documented as TBD — a maintainer fills them in against the first tagged v0.3.0+ release using `shasum -a 256` on each downloaded archive (procedure in the companion README).
