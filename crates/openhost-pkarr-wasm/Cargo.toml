@@ -40,6 +40,9 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 ed25519-dalek = { workspace = true }
+# Phase 6.1: build_offer_packet signs a `SignedPacket` for the Pkarr
+# relay PUT. `signed_packet + keys` pulls the sync-only types.
+pkarr = { workspace = true, default-features = false, features = ["signed_packet", "keys"] }
 
 # The `rand_core` → `getrandom` chain in `openhost-core` fails to
 # compile for wasm32 unless `getrandom` is built with `features =

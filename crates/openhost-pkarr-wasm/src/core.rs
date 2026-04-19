@@ -428,3 +428,59 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<DecodedFrame>> {
 // parse_array via the N generic).
 #[allow(dead_code)]
 const _: usize = PUBLIC_KEY_LEN;
+
+/// Derive the client's zbase32 Ed25519 pubkey from its 32-byte seed.
+/// The browser extension stores the seed in IndexedDB; JS needs the
+/// pubkey string to address offer records + parse hostRecord
+/// self-check fields without re-implementing Ed25519 scalarmult.
+pub fn client_pubkey_from_seed(seed_bytes: &[u8]) -> Result<String> {
+    let seed: [u8; SIGNING_KEY_LEN] = parse_array(seed_bytes, "client_seed")?;
+    Ok(SigningKey::from_bytes(&seed).public_key().to_zbase32())
+}
+
+/// Assemble a Pkarr `SignedPacket` carrying one `_offer-<host-hash>`
+/// TXT entry, signed by the client's identity key. Returns the raw
+/// wire bytes ready for an HTTP PUT to a Pkarr relay
+/// (`PUT https://<relay>/<client-pk-zbase32>`).
+///
+/// Mirrors `openhost_client::Dialer::publish_offer` byte-for-byte
+/// (see `crates/openhost-client/src/dialer.rs:338-372`) minus the
+/// monotonic-seq bump — callers pass `now_ts` explicitly so a JS
+/// dialer can bump past its own last publish on retry.
+pub fn build_offer_packet(
+    client_sk_bytes: &[u8],
+    daemon_pk_zbase32: &str,
+    sealed_offer: &[u8],
+    now_ts: u64,
+) -> Result<Vec<u8>> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use pkarr::dns::rdata::TXT;
+    use pkarr::dns::Name;
+    use pkarr::{Keypair, SignedPacket, Timestamp};
+
+    let seed: [u8; SIGNING_KEY_LEN] = parse_array(client_sk_bytes, "client_sk")?;
+    let daemon_pk = parse_pubkey(daemon_pk_zbase32)?;
+
+    let txt_value = URL_SAFE_NO_PAD.encode(sealed_offer);
+    let label = openhost_pkarr::host_hash_label(&daemon_pk);
+    let name = format!("{}{label}", openhost_pkarr::OFFER_TXT_PREFIX);
+
+    let keypair = Keypair::from_secret_key(&seed);
+    let ts_micros = now_ts
+        .checked_mul(1_000_000)
+        .ok_or_else(|| Error::VerifyFailed("ts overflow".to_string()))?;
+
+    let packet = SignedPacket::builder()
+        .txt(
+            Name::new_unchecked(&name),
+            TXT::try_from(txt_value.as_str())
+                .map_err(|e| Error::VerifyFailed(format!("txt build: {e}")))?,
+            openhost_pkarr::OFFER_TXT_TTL,
+        )
+        .timestamp(Timestamp::from(ts_micros))
+        .sign(&keypair)
+        .map_err(|e| Error::VerifyFailed(format!("sign: {e}")))?;
+
+    Ok(packet.serialize())
+}

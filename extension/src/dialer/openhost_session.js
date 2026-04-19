@@ -1,32 +1,24 @@
-// Browser-side OpenhostSession skeleton (PR #28.3 Phase 6).
+// Browser-side OpenhostSession (PR #28.3 Phase 6 + 6.1).
 //
-// Owns an RTCPeerConnection and drives the dial handshake by calling
-// into `openhost-pkarr-wasm` for sealing / cert-fp binding / frame
-// codec. JS never touches the client Ed25519 secret directly; it
-// lives in IndexedDB and is passed as raw bytes into WASM only.
+// Owns an RTCPeerConnection and drives the full dial handshake by
+// calling into `openhost-pkarr-wasm` for sealing / cert-fp binding /
+// frame codec / pkarr packet signing. JS never touches the client
+// Ed25519 secret directly; it lives in IndexedDB and is passed as
+// raw bytes into WASM only.
 //
-// ## Status — what ships in PR #28.3
-//
-// This file establishes the class shape + wires the resolver (PR
-// #28.2) + the WASM primitives (Phase 4) into a single entry point
-// `dialOhUrl(ohUrl)`. The actual publish-offer step is deferred to
-// **PR #28.3.1** because it requires two things not available yet:
-//
-//   1. A WASM-exported `client_pubkey_from_seed(seed) -> zbase32` so
-//      JS can compute its own identity pubkey without re-implementing
-//      Ed25519 point multiplication in JS. Cheap follow-up.
-//   2. A WASM-exported `build_offer_packet(client_sk, daemon_pk, sealed)
-//      -> Uint8Array` that returns the serialized pkarr `SignedPacket`
-//      bytes ready for a Pkarr relay PUT. Today the relay API expects
-//      a full BEP44 mutable-item body (Ed25519 signature + DNS wire
-//      format). Shipping it as WASM reuses the existing
-//      `openhost_pkarr::encode_with_answers` path with no client-side
-//      wire-format duplication.
-//
-// Both gaps are small, scoped follow-ups on the same branch. The
-// rest of the extension (URL handler, viewer, manifest, service
-// worker) is wired up in this PR so the review surface stays
-// digestible.
+// End-to-end flow:
+//   1. Resolve host packet (fetch from a Pkarr relay, WASM-verify).
+//   2. Load or create a per-install client seed (IndexedDB).
+//   3. Build RTCPeerConnection + data channel, create offer SDP.
+//   4. WASM `seal_offer` → `build_offer_packet` (Ed25519-signed
+//      BEP44 body) → HTTP PUT to a Pkarr relay.
+//   5. Poll host zone for `_answer-<client-hash>-*` fragments; WASM
+//      `decode_answer_fragments` + `open_answer`.
+//   6. Apply answer SDP; await DTLS `connected` + DC `open`.
+//   7. Channel binding: AUTH_NONCE → compute cert-fp binding →
+//      sign_auth_client → send AUTH_CLIENT → verify AUTH_HOST.
+//   8. Return a live OpenhostSession; caller issues HTTP via
+//      session.request("GET", "/path").
 
 import init, {
   decode_and_verify,
@@ -37,6 +29,8 @@ import init, {
   sign_auth_client,
   verify_auth_host,
   encode_frame,
+  client_pubkey_from_seed,
+  build_offer_packet,
 } from "../../wasm/pkg/openhost_pkarr.js";
 import { FrameReader } from "../session/frame_reader.js";
 
@@ -154,30 +148,162 @@ export class OpenhostSession {
   }
 }
 
-// Full dial. **Not runnable end-to-end in PR #28.3** — see the status
-// block at the top of this file for the Phase 6.1 gap.
-export async function dialOhUrl(ohUrl) {
+// Full dial: resolve → seal + publish offer → poll answer → WebRTC
+// connect → cert-fp binding handshake → return a live session.
+export async function dialOhUrl(ohUrl, opts = {}) {
   await ensureWasmInit();
   const { daemonPkZ, path } = parseOhUrl(ohUrl);
-  const nowTs = BigInt(Math.floor(Date.now() / 1000));
+  const nowTsBig = BigInt(Math.floor(Date.now() / 1000));
 
-  // 1. Resolve + verify host record via the PR #28.2 WASM path.
+  // 1. Resolve + verify host record.
   const hostPacket = await fetchHostPacket(daemonPkZ);
-  const hostRecord = decode_and_verify(hostPacket, daemonPkZ, nowTs);
+  const hostRecord = decode_and_verify(hostPacket, daemonPkZ, nowTsBig);
+  const daemonSalt = hexToBytes(hostRecord.salt_hex);
 
   // 2. Client identity.
   const clientSeed = await loadOrCreateClientSeed();
+  const clientPkZ = client_pubkey_from_seed(clientSeed);
 
-  // 3-12: handshake wiring. Marked as a deliberate throw until the
-  // publish bridge (WASM `build_offer_packet` + `client_pubkey_from_seed`)
-  // lands in PR #28.3.1. The resolver probe in
-  // `extension/src/dev/resolver-probe.js` still exercises the
-  // already-shipped WASM surface end-to-end.
-  throw new Error(
-    `openhost extension: dial pipeline wired up through WASM seal/binding/framing, ` +
-    `but the Pkarr publish bridge is pending PR #28.3.1 (need WASM ` +
-    `build_offer_packet + client_pubkey_from_seed). Target: ${daemonPkZ}${path}. ` +
-    `Host fingerprint: ${hostRecord.dtls_fingerprint_hex}. ` +
-    `Client seed is persisted in IndexedDB (32 bytes).`
-  );
+  // 3. Build RTCPeerConnection + data channel.
+  const pc = new RTCPeerConnection({ iceServers: STUN });
+  const dc = pc.createDataChannel("openhost", { ordered: true });
+  const reader = new FrameReader();
+  dc.binaryType = "arraybuffer";
+  dc.onmessage = e => reader.push(e.data);
+  dc.onerror = e => reader.fail(new Error(`DC error: ${e}`));
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIceComplete(pc);
+  const offerSdp = pc.localDescription.sdp;
+
+  // 4. Seal + publish offer.
+  const sealed = seal_offer(daemonPkZ, clientPkZ, offerSdp, BINDING_MODE_CERT_FP);
+  const packet = build_offer_packet(clientSeed, daemonPkZ, sealed, BigInt(Math.floor(Date.now() / 1000)));
+  await publishOfferPacket(clientPkZ, packet);
+
+  // 5. Poll answer fragments on the daemon's zone.
+  const answerSdp = await pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed,
+                                       timeoutMs: opts.answerTimeoutMs ?? 30_000 });
+
+  // 6. Apply answer + wait for DTLS Connected.
+  await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+  await waitForPcConnected(pc, opts.connectTimeoutMs ?? 10_000);
+  await waitForDcOpen(dc, opts.connectTimeoutMs ?? 10_000);
+
+  // 7. Channel-binding handshake.
+  const nonceFrame = await reader.next(opts.bindingTimeoutMs ?? 10_000);
+  if (nonceFrame.frame_type !== FRAME.AUTH_NONCE) {
+    throw new Error(`expected AUTH_NONCE, got 0x${nonceFrame.frame_type.toString(16)}`);
+  }
+  const nonce = new Uint8Array(nonceFrame.payload);
+  const certDer = await readRemoteCertDer(pc);
+  const authBytes = compute_cert_fp_binding(certDer, daemonPkZ, clientPkZ, nonce);
+  const authClientPayload = sign_auth_client(clientSeed, authBytes);
+  dc.send(encode_frame(FRAME.AUTH_CLIENT, Array.from(authClientPayload)));
+
+  const hostFrame = await reader.next(opts.bindingTimeoutMs ?? 10_000);
+  if (hostFrame.frame_type !== FRAME.AUTH_HOST) {
+    throw new Error(`expected AUTH_HOST, got 0x${hostFrame.frame_type.toString(16)}`);
+  }
+  const ok = verify_auth_host(daemonPkZ, authBytes, new Uint8Array(hostFrame.payload));
+  if (!ok) {
+    pc.close();
+    throw new Error("AUTH_HOST signature did not verify — aborting session");
+  }
+
+  return new OpenhostSession({ pc, dc, reader, hostRecord, clientPkZ, daemonPkZ });
+}
+
+// ---- helpers ----
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+function waitForIceComplete(pc) {
+  return new Promise(res => {
+    if (pc.iceGatheringState === "complete") return res();
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        res();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+function waitForPcConnected(pc, timeoutMs) {
+  return new Promise((res, rej) => {
+    if (pc.connectionState === "connected") return res();
+    const timer = setTimeout(() => rej(new Error(`PC connect timeout (${timeoutMs}ms)`)), timeoutMs);
+    const check = () => {
+      if (pc.connectionState === "connected") { clearTimeout(timer); res(); }
+      else if (["failed","closed","disconnected"].includes(pc.connectionState)) {
+        clearTimeout(timer); rej(new Error(`PC state: ${pc.connectionState}`));
+      }
+    };
+    pc.addEventListener("connectionstatechange", check);
+  });
+}
+
+function waitForDcOpen(dc, timeoutMs) {
+  return new Promise((res, rej) => {
+    if (dc.readyState === "open") return res();
+    const timer = setTimeout(() => rej(new Error(`DC open timeout (${timeoutMs}ms)`)), timeoutMs);
+    dc.addEventListener("open", () => { clearTimeout(timer); res(); }, { once: true });
+    dc.addEventListener("error", e => { clearTimeout(timer); rej(new Error(`DC error: ${e}`)); }, { once: true });
+  });
+}
+
+async function readRemoteCertDer(pc) {
+  // RTCDtlsTransport.getRemoteCertificates() returns an ArrayBuffer[]
+  // (Chromium). Only the first cert is the peer's leaf.
+  const transport = pc.sctp?.transport;
+  if (!transport || typeof transport.getRemoteCertificates !== "function") {
+    throw new Error("RTCDtlsTransport.getRemoteCertificates() unavailable");
+  }
+  const certs = transport.getRemoteCertificates();
+  if (!certs || certs.length === 0) throw new Error("remote DTLS cert not available yet");
+  return new Uint8Array(certs[0]);
+}
+
+async function publishOfferPacket(clientPkZ, packetBytes) {
+  let lastErr;
+  for (const r of RELAYS) {
+    try {
+      const resp = await fetch(`${r}/${clientPkZ}`, {
+        method: "PUT", body: packetBytes,
+        headers: { "Content-Type": "application/pkarr.org.relays.v1+octet" },
+      });
+      if (resp.ok) return;
+      lastErr = new Error(`${r} → ${resp.status}`);
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error(`all relays rejected offer publish: ${lastErr?.message ?? "unknown"}`);
+}
+
+async function pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed, timeoutMs }) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const packet = await fetchHostPacket(daemonPkZ);
+      const ans = decode_answer_fragments(packet, daemonSalt, clientPkZ);
+      if (ans) {
+        const opened = open_answer(clientSeed, ans.sealed_base64url);
+        if (opened.daemon_pk_zbase32 !== daemonPkZ) {
+          throw new Error("answer's inner daemon_pk does not match the packet signer");
+        }
+        return opened.answer_sdp;
+      }
+    } catch (e) {
+      // Keep polling on transient decode / relay errors.
+      if (e?.message && /verify|disagree|malformed|mismatch/i.test(e.message)) throw e;
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`answer poll timed out after ${timeoutMs}ms`);
 }

@@ -213,3 +213,22 @@ pub fn decode_frame(buf: &[u8]) -> Result<JsValue, JsError> {
     let out = core::decode_frame(buf).map_err(|e| to_js_err(&e))?;
     to_js(&out)
 }
+
+/// Derive the client's zbase32 Ed25519 pubkey from its 32-byte seed.
+#[wasm_bindgen]
+pub fn client_pubkey_from_seed(seed_bytes: &[u8]) -> Result<String, JsError> {
+    core::client_pubkey_from_seed(seed_bytes).map_err(|e| to_js_err(&e))
+}
+
+/// Assemble a serialized Pkarr `SignedPacket` carrying the client's
+/// offer TXT, ready for `PUT https://<relay>/<client-pk-zbase32>`.
+#[wasm_bindgen]
+pub fn build_offer_packet(
+    client_sk_bytes: &[u8],
+    daemon_pk_zbase32: &str,
+    sealed_offer: &[u8],
+    now_ts: u64,
+) -> Result<Vec<u8>, JsError> {
+    core::build_offer_packet(client_sk_bytes, daemon_pk_zbase32, sealed_offer, now_ts)
+        .map_err(|e| to_js_err(&e))
+}
