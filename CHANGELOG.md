@@ -8,6 +8,10 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-18
+
+Phase 1 + Phase 2 of the post-v0.1 roadmap, shipped as seven focused PRs (#14 – #20). Closes all three v0.1 known limitations (answer-record overflow, missing client CLI, SIGHUP-only pairing reload) and lands the operator-facing docs needed to actually test the release: install + quickstart + troubleshoot guides on the site, worked `examples/` for static sites + Jellyfin + Home Assistant, a README Quickstart, and a root-level `CONTRIBUTING.md`. Also a breaking wire-format change in `_answer-<client-hash>` records — see `### Changed` below.
+
 ### Added (PR #20, CONTRIBUTING.md)
 
 - **New root-level `CONTRIBUTING.md`.** Covers: what contributions are welcome and what needs discussion first; dev setup (Rust 1.90 toolchain, pnpm for site); the three test commands we gate on (`cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all --check`) plus the opt-in `--features real-network` suite; the five-step plan → implement → self-review → fix-all → merge PR cadence; how to propose a spec change (issue first for non-trivial changes, `spec/**` is markdown-linted); a concrete "filing good bug reports" checklist (`openhost-resolve --json`, debug-level daemon log, client stderr) linking the bug-report issue template; and a security-report pointer at GitHub Private Security Advisories.
@@ -233,4 +237,6 @@ The first tagged release. Daemon + client + pkarr integration + WebRTC + channel
 - `spec/01-wire-format.md §2`: the four-row textual Pkarr record table is replaced with a single opaque TXT record at `_openhost` carrying `base64url(signature || canonical_signing_bytes)`. Semantic fields are carried inside `canonical_signing_bytes` as defined by `openhost-core::pkarr_record`.
 - Workspace dependencies bumped to match the adapter: `pkarr = "5"` (was `"3"`), `mainline = "6"` (was `"4"`).
 
-[Unreleased]: https://github.com/kaicoder03/openhost/commits/main
+[Unreleased]: https://github.com/kaicoder03/openhost/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kaicoder03/openhost/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/kaicoder03/openhost/releases/tag/v0.1.0
