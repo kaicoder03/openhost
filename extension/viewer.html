@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>openhost</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; max-width: 48rem; color: #222; }
+    header { display: flex; align-items: baseline; gap: 0.75rem; border-bottom: 1px solid #ddd; padding-bottom: 0.75rem; margin-bottom: 1rem; }
+    h1 { margin: 0; font-size: 1.1rem; color: #666; font-weight: 600; }
+    code { font-size: 0.85rem; color: #0055aa; }
+    #status { padding: 1rem; background: #f5f5f5; border-radius: 6px; font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; white-space: pre-wrap; }
+    #content { margin-top: 1rem; }
+    #content video, #content audio, #content img { max-width: 100%; }
+    .error { color: #b00; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>openhost</h1><code id="target"></code>
+  </header>
+  <div id="status">Initializing…</div>
+  <div id="content"></div>
+  <script type="module" src="./src/viewer.js"></script>
+</body>
+</html>
