@@ -37,35 +37,29 @@ pub(crate) fn install_crypto_provider_once() {
 pub(crate) fn build_client_api() -> Arc<API> {
     install_crypto_provider_once();
     let mut engine = SettingEngine::default();
-    // Drop IPv6 link-local (fe80::/10) candidates from ICE gathering.
-    // They're scope-restricted (can't be reached by a remote peer)
-    // and add ~60-100 bytes of SDP per-candidate — pushing the
-    // sealed offer over BEP44's 1000-byte `v` cap on machines with
-    // many interfaces.
-    // IPv4-only for now. Multiple public IPv6 candidates can push
-    // the sealed offer past BEP44's 1000-byte `v` cap on modern
-    // dual-stack hosts. IPv4 with STUN srflx reaches the same peers
-    // in practice. Revisit when the offer encoder switches to multi-
-    // record fragmentation.
+    // IP filter applied to every ICE candidate webrtc-rs gathers.
+    // Rejects:
     //
-    // Also reject Docker Desktop's macOS virtual bridges:
-    //   - `bridge100` at 192.168.64.0/24 (default)
-    //   - `bridge101` at 192.168.65.0/24 (Docker Desktop 4.30+)
-    // These are Mac-local interfaces; a remote peer can't reach them.
-    // Gathering them yields "phantom" candidates that ICE burns
-    // connectivity-check time on before giving up. Filter excludes
-    // the specific Docker Desktop ranges rather than a broad RFC 1918
-    // sweep — a real LAN peer on 192.168.64.x would want to keep
-    // those candidates.
+    //   1. **All IPv6.** Multi-family candidate sets push the sealed
+    //      offer past BEP44's 1000-byte `v` cap on dual-stack hosts;
+    //      IPv4 with STUN srflx reaches the same peers in practice.
+    //      Covers both link-local (`fe80::/10`, unbind-able without
+    //      scope id) and public IPv6 host candidates. Revisit when
+    //      the offer encoder gains more fragmentation headroom.
+    //
+    //   2. **Docker Desktop macOS virtual bridges.**
+    //      - `bridge100` at `192.168.64.0/24` (Docker Desktop default)
+    //      - `bridge101` at `192.168.65.0/24` (Docker Desktop 4.30+)
+    //      These are Mac-local interfaces unreachable by a remote
+    //      peer; gathering them produces "phantom" candidates that
+    //      ICE burns connectivity-check time on before giving up.
+    //
+    // Narrow ranges (not a broad RFC 1918 sweep): a real LAN peer
+    // legitimately on `192.168.64.x` would want those candidates
+    // kept, so we filter the exact Docker Desktop bridge subnets
+    // rather than carpet-bombing RFC 1918.
     engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| match ip {
-        std::net::IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            // Exclude Docker Desktop macOS virtual bridges.
-            if octets[0] == 192 && octets[1] == 168 && (octets[2] == 64 || octets[2] == 65) {
-                return false;
-            }
-            true
-        }
+        std::net::IpAddr::V4(v4) => !is_docker_desktop_bridge_v4(&v4),
         std::net::IpAddr::V6(_) => false,
     }));
     // Disable mDNS gathering (`<uuid>.local` candidates). The raw IP
@@ -76,6 +70,44 @@ pub(crate) fn build_client_api() -> Arc<API> {
     // would fail to resolve cross-host anyway.
     engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
     Arc::new(APIBuilder::new().with_setting_engine(engine).build())
+}
+
+/// Extracted for unit-test coverage. `true` if `ip` falls inside
+/// either of Docker Desktop's macOS virtual-bridge subnets.
+fn is_docker_desktop_bridge_v4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 192 && o[1] == 168 && (o[2] == 64 || o[2] == 65)
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::is_docker_desktop_bridge_v4;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn docker_desktop_ranges_excluded() {
+        assert!(is_docker_desktop_bridge_v4(&Ipv4Addr::new(192, 168, 64, 1)));
+        assert!(is_docker_desktop_bridge_v4(&Ipv4Addr::new(
+            192, 168, 64, 255
+        )));
+        assert!(is_docker_desktop_bridge_v4(&Ipv4Addr::new(192, 168, 65, 5)));
+    }
+
+    #[test]
+    fn real_lan_ranges_preserved() {
+        // A home router on 192.168.1.x should NOT be excluded.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(
+            192, 168, 1, 154
+        )));
+        // 192.168.66.x is not a Docker Desktop default — keep.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(
+            192, 168, 66, 7
+        )));
+        // 10/8 private unaffected.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(10, 0, 0, 1)));
+        // Public unaffected.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(8, 8, 8, 8)));
+    }
 }
 
 /// Install an `on_peer_connection_state_change` handler that forwards
