@@ -339,6 +339,28 @@ When forwarding a request to the loopback HTTP service, the daemon **MUST**:
 - Set the `Host` header to the value configured for the target service.
 - Reject requests whose framing violates the ABNF above (respond with a 0xF0 ERROR frame and tear down the channel).
 
+### 4.2 WebSocket tunnel (policy layer)
+
+Daemons **MAY** be configured to tunnel RFC 6455 WebSocket upgrades for a finite set of upstream paths. The policy surface is the `[forward.websockets]` TOML section:
+
+```toml
+[forward.websockets]
+# Exact path matches (byte-identical before any query string) OR the
+# single-entry wildcard "*". Omitting this section entirely disables
+# WebSocket tunneling — the forwarder rejects every `Upgrade: websocket`
+# request, preserving the pre-v0.2 behaviour.
+allowed_paths = ["/api/websocket", "/live"]
+```
+
+Conformance requirements for the daemon:
+
+- If no `[forward.websockets]` section is configured, **any** `Upgrade: websocket` request **MUST** be rejected at the forwarder boundary (the daemon replies with an application-layer 502 surfaced through the openhost frame codec).
+- If a section is configured but `allowed_paths` is empty, the daemon **MUST** reject the configuration at load time.
+- If a request's path (stripped of its query string) is not on `allowed_paths`, the request **MUST** be rejected exactly as above.
+- The wildcard `"*"` matches every path; operators **SHOULD** enumerate paths explicitly in production.
+
+The **tunnel implementation itself** — the bidirectional byte proxy between the openhost data channel and the upstream TCP socket after a successful 101 response — is the next line item in [`ROADMAP.md`](../ROADMAP.md) post-v0.3. Daemon versions that implement the policy layer but not the tunnel **MUST** distinguish the two cases in diagnostics: a request with a correctly-configured allowlist entry that would have been tunneled surfaces as a "pending" error, so operators can stop checking their config and wait for the tunnel-capable release. The `0x20 WS_UPGRADE` and `0x21 WS_FRAME` frame types above are reserved for the tunnel implementation and **MUST NOT** appear on the wire from policy-only daemons.
+
 ## 5. Error handling
 
 A recipient that cannot decode a frame, or that receives a frame type it does not implement, **MUST** send a 0xF0 ERROR frame with a short diagnostic string and then tear down the data channel.

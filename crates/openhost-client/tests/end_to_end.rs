@@ -99,6 +99,7 @@ fn daemon_config(tmp: &TempDir, watched: Vec<String>, upstream_port: Option<u16>
             target: Some(format!("http://127.0.0.1:{p}")),
             host_override: None,
             max_body_bytes: 1024 * 1024,
+            websockets: None,
         }),
         log: LogConfig::default(),
         pairing: Default::default(),

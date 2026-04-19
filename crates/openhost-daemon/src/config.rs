@@ -203,6 +203,52 @@ pub struct ForwardConfig {
     /// [`DEFAULT_MAX_BODY_BYTES`] (16 MiB).
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+
+    /// WebSocket tunneling policy (spec §4.2, PR #24). Absent means
+    /// every `Upgrade: websocket` request is rejected — the current
+    /// v0.2 behaviour. Setting a non-empty [`WebSocketConfig::allowed_paths`]
+    /// signals intent to allow WebSocket upgrades for those paths; the
+    /// actual bidirectional tunnel lands in a follow-up PR, at which
+    /// point this same config becomes live without any schema change.
+    #[serde(default)]
+    pub websockets: Option<WebSocketConfig>,
+}
+
+/// Per-path WebSocket tunnel allowlist (spec §4.2).
+///
+/// The allowlist is matched against the HTTP request path (the part
+/// before `?`). A single entry of `"*"` matches every path and is
+/// intended for development — production deployments should enumerate
+/// paths explicitly. An empty `allowed_paths` vector is a configuration
+/// error (rejected by [`Config::validate`]); omit the whole
+/// `[forward.websockets]` section to disable tunnels entirely.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct WebSocketConfig {
+    /// Exact path match list (optionally containing the wildcard `"*"`).
+    /// Paths are compared byte-for-byte against the request's URI-path
+    /// component; query strings are stripped before comparison.
+    pub allowed_paths: Vec<String>,
+}
+
+impl WebSocketConfig {
+    /// Whether `request_path` is allowed to upgrade to WebSocket.
+    /// `request_path` may include a query string (`?…`); only the path
+    /// component is matched.
+    ///
+    /// Matching is strict byte equality after query-string stripping:
+    /// `/foo` and `/foo/` are distinct entries. WebSocket endpoints
+    /// conventionally have no trailing slash, so operators list them
+    /// in canonical form. If a future upstream requires prefix or
+    /// glob matching, this is the place to add it — no wire-format
+    /// implications.
+    #[must_use]
+    pub fn is_allowed(&self, request_path: &str) -> bool {
+        let path = request_path.split('?').next().unwrap_or(request_path);
+        self.allowed_paths
+            .iter()
+            .any(|pat| pat == "*" || pat == path)
+    }
 }
 
 /// Default value for [`ForwardConfig::max_body_bytes`]. Chosen to match
@@ -305,6 +351,16 @@ impl Config {
             }
             if forward.max_body_bytes == 0 {
                 return Err(ConfigError::Invalid("forward.max_body_bytes must be > 0").into());
+            }
+            if let Some(ws) = &forward.websockets {
+                if ws.allowed_paths.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "forward.websockets.allowed_paths must have at least one entry \
+                         (use [\"*\"] to allow any path, or remove the [forward.websockets] \
+                         section entirely to disable WebSocket tunneling)",
+                    )
+                    .into());
+                }
             }
         }
         Ok(())
