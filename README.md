@@ -56,6 +56,8 @@ The full walkthrough — including how to pair a persistent client identity and 
 
 ## Building from source
 
+Pre-built binaries for Linux / macOS / Windows are published on every tagged release at [github.com/kaicoder03/openhost/releases](https://github.com/kaicoder03/openhost/releases/latest). Build from source only if you need a pre-release build or your platform isn't on the list.
+
 ```bash
 # Rust workspace (toolchain is pinned via rust-toolchain.toml — rustup fetches it automatically)
 cargo check --workspace
