@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "openhost",
+  "version": "0.0.1",
+  "description": "Your home server. Reachable. Nothing else in between. Resolve oh://<pubkey>/ URLs over end-to-end encrypted WebRTC.",
+  "permissions": [],
+  "host_permissions": [],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "openhost"
+  }
+}

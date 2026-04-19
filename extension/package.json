@@ -1,0 +1,11 @@
+{
+  "name": "openhost-extension",
+  "version": "0.0.1",
+  "private": true,
+  "license": "(Apache-2.0 OR MIT)",
+  "description": "Browser extension that resolves oh://<pubkey>/ URLs over openhost WebRTC data channels.",
+  "scripts": {
+    "lint": "echo \"openhost-extension: lint is a placeholder in PR #28; real manifest + JS lint lands in PR #28.4\"",
+    "build": "echo \"openhost-extension: build is a placeholder in PR #28; wasm-pack driver lands in PR #28.2\""
+  }
+}

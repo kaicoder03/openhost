@@ -50,7 +50,7 @@ The full walkthrough — including how to pair a persistent client identity and 
 | `crates/` | Rust workspace: daemon, client library, FFI surface |
 | `spec/` | Protocol specification (canonical markdown) |
 | `site/` | Public website + docs (Astro + Starlight + Tailwind) |
-| `extension/` | Browser extension (M5+) |
+| `extension/` | Browser extension — scaffolding landed PR #28; see `extension/README.md` for the roadmap |
 | `apple/` | iOS and macOS apps (M6/M7) |
 | `examples/` | Worked walkthroughs: `personal-site/`, `jellyfin/`, `home-assistant/`, plus a generic `daemon.toml` template |
 
