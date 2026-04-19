@@ -57,9 +57,10 @@ pub use error::{PkarrError, Result};
 pub use offer::{
     answer_txt_chunk_name, answer_txt_name, client_hash_label, decode_answer_fragments_from_packet,
     decode_offer_from_packet, encode_with_answers, hash_offer_sdp, host_hash, host_hash_label,
-    offer_txt_name, AnswerEntry, AnswerPlaintext, OfferPlaintext, OfferRecord, ANSWER_TXT_PREFIX,
-    CLIENT_HASH_LEN, HOST_HASH_LEN, MAX_FRAGMENT_PAYLOAD_BYTES, MAX_FRAGMENT_TOTAL,
-    OFFER_SDP_HASH_LEN, OFFER_TXT_PREFIX, OFFER_TXT_TTL,
+    offer_txt_name, AnswerEntry, AnswerPlaintext, BindingMode, OfferPlaintext, OfferRecord,
+    ANSWER_TXT_PREFIX, CLIENT_HASH_LEN, HOST_HASH_LEN, MAX_FRAGMENT_PAYLOAD_BYTES,
+    MAX_FRAGMENT_TOTAL, OFFER_INNER_DOMAIN_V1, OFFER_INNER_DOMAIN_V2, OFFER_SDP_HASH_LEN,
+    OFFER_TXT_PREFIX, OFFER_TXT_TTL,
 };
 pub use pkarr::SignedPacket;
 #[cfg(feature = "full")]

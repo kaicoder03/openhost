@@ -69,12 +69,31 @@ openhost uses only well-audited, standard primitives:
 |---|---|---|
 | Identity signatures | Ed25519 (RFC 8032, strict verification) | `ed25519-dalek` v2 |
 | Sealed-box encryption (per-client ICE blobs) | libsodium `crypto_box_seal` (X25519 + XSalsa20-Poly1305) | `crypto_box` with `seal` feature |
-| Channel binding | HKDF-SHA256 over TLS exporter (RFC 5705) | `hkdf`, `sha2` |
+| Channel binding (CLI peers) | HKDF-SHA256 over RFC 5705 DTLS exporter | `hkdf`, `sha2` |
+| Channel binding (browser peers, PR #28.3+) | HKDF-SHA256 over SHA-256(remote DTLS cert DER) | `hkdf`, `sha2` |
 | HMAC for allowlist hashing | HMAC-SHA256 | `hmac`, `sha2` |
 | Transport encryption | DTLS 1.3 | provided by the WebRTC implementation |
 | Public key display | z-base-32 | `zbase32` |
 
 No custom cryptography is defined anywhere in the openhost protocol. Any apparent departure from these primitives is a bug.
+
+### 4.1 Channel-binding modes
+
+The channel-binding HMAC (attack 7.1 above) feeds HKDF-SHA256 with a session-specific secret plus both peer pubkeys plus a per-session nonce. Two modes are defined; the client selects one via the `binding_mode` byte on the v2 offer plaintext (see `spec/01-wire-format.md §3.3`).
+
+**`Exporter` (0x01, CLI default).** The session secret is the first 32 bytes of the RFC 5705 DTLS exporter output with label `"EXPORTER-openhost-auth-v1"` and an empty context. This is the original CLI-to-CLI path and provides the strongest UKS (RFC 8844) defense because it binds over session-unique secret bits that an attacker cannot extract without breaking the DTLS key exchange.
+
+**`CertFp` (0x02, browser-mandatory).** The session secret is SHA-256 over the DER encoding of the host's DTLS certificate (the one whose fingerprint is pinned in the Pkarr `_openhost` record). Browser WebRTC implementations do NOT expose `RTCDtlsTransport.exportKeyingMaterial` today; `getRemoteCertificates()` is the only published hook into the DTLS session. Substituting SHA-256(cert DER) for the exporter bytes preserves the UKS defense in openhost's specific threat model because **the cert fingerprint is already pinned by the host's Ed25519 signature on the Pkarr record** — an attacker who could present a matching fingerprint has already broken the host's identity key, which is the attack the fingerprint pin was built to defend against.
+
+**Negotiation rules.**
+
+1. CLI clients MUST advertise `Exporter`. A CLI MUST reject an answer that references `CertFp` (the client's binding-mode byte in the offer plaintext is authoritative for its own path; a daemon should never downgrade the client).
+2. Browser clients MUST advertise `CertFp`. Browsers have no mechanism to compute the `Exporter` variant.
+3. Daemons MUST support both modes by default. Operators who want a CLI-only deployment can set `[dtls] allowed_binding_modes = ["exporter"]` in the daemon config.
+4. Daemons MUST compute the HMAC with whichever mode the client advertised. A daemon that speaks CertFp to a client that advertised Exporter (or vice versa) is a protocol error — the channel binding would not match and the session tears down.
+5. Pre-PR-28.3 offers (v1 offer bodies, no `binding_mode` byte) decode as `Exporter` for backwards compatibility.
+
+libp2p's browser WebRTC transport (shipped in production across IPFS + Filecoin) uses an analogous cert-fingerprint binding in place of RFC 5705 for the same reason. openhost's CertFp variant is the same design pattern.
 
 ## 5. Security response
 

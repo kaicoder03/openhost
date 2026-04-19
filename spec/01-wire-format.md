@@ -194,11 +194,38 @@ offer_plaintext = compression_tag || body
              oversized inputs.
       Other values MUST be rejected as malformed.
 
-  body =  "openhost-offer-inner1"  (21 bytes)
-       || client_pk                 (32 bytes)
-       || sdp_len                   (u32 big-endian)
-       || offer_sdp_utf8            (sdp_len bytes)
+  body =
+    // Choose ONE of the two shapes below based on the leading domain
+    // separator. v2 (PR #28.3+) adds a trailing `binding_mode` byte
+    // so clients can advertise browser-only channel binding.
+
+    v1 legacy shape (pre-PR-28.3; still accepted on decode):
+         "openhost-offer-inner1"      (21 bytes)
+       || client_pk                   (32 bytes)
+       || sdp_len                     (u32 big-endian)
+       || offer_sdp_utf8              (sdp_len bytes)
+
+    v2 shape (PR #28.3+; all new encoders MUST emit this form):
+         "openhost-offer-inner2"      (21 bytes)
+       || client_pk                   (32 bytes)
+       || sdp_len                     (u32 big-endian)
+       || offer_sdp_utf8              (sdp_len bytes)
+       || binding_mode                (u8; see §7.6 for semantics)
 ```
+
+**Binding mode byte** (v2 only). One of:
+
+- `0x01 = Exporter` — client will drive channel binding via the RFC
+  5705 DTLS exporter. The original CLI-to-CLI path.
+- `0x02 = CertFp` — client will drive channel binding via SHA-256
+  over the host's DTLS certificate DER. Mandatory when the client is a
+  browser (browsers do not expose the RFC 5705 exporter on
+  `RTCDtlsTransport`). See `spec/04-security.md §7.6`.
+- Other values MUST be rejected as malformed.
+
+v1 bodies carry no explicit binding byte and decode as if
+`binding_mode = 0x01 Exporter`. This preserves the pre-PR-28.3
+CLI-to-CLI semantics verbatim.
 
 v0.1+ encoders **MUST** emit `compression_tag = 0x02`. v0.1+ decoders
 **MUST** accept both `0x01` and `0x02` for backward compatibility

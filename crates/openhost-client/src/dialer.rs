@@ -318,9 +318,18 @@ impl Dialer {
     /// the client's own Ed25519 pubkey carrying the `_offer-<host-hash>`
     /// TXT.
     pub async fn publish_offer(&mut self, daemon_pk: &PublicKey, offer_sdp: &str) -> Result<()> {
+        // CLI always advertises `Exporter`. A CLI that accepted
+        // `CertFp` from a browser-speaking daemon would silently
+        // downgrade its channel binding to the public-cert form; CLI
+        // code paths use `webrtc-rs` with RFC 5705 exporter support
+        // natively, so there's no reason to ever accept the downgrade.
+        // PR #28.3's CLI downgrade-rejection (see
+        // `crates/openhost-client/src/binding.rs`) enforces this on
+        // the answer-parse side.
         let plaintext = OfferPlaintext {
             client_pk: self.identity.public_key(),
             offer_sdp: offer_sdp.to_string(),
+            binding_mode: openhost_pkarr::BindingMode::Exporter,
         };
         let mut rng = rand::rngs::OsRng;
         let offer = OfferRecord::seal(&mut rng, daemon_pk, &plaintext)
