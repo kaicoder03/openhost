@@ -129,9 +129,15 @@ pub fn decode_answer_fragments(
     packet_bytes: &[u8],
     daemon_salt: &[u8],
     client_pk_zbase32: &str,
+    daemon_pk_zbase32: &str,
 ) -> Result<JsValue, JsError> {
-    let out = core::decode_answer_fragments(packet_bytes, daemon_salt, client_pk_zbase32)
-        .map_err(|e| to_js_err(&e))?;
+    let out = core::decode_answer_fragments(
+        packet_bytes,
+        daemon_salt,
+        client_pk_zbase32,
+        daemon_pk_zbase32,
+    )
+    .map_err(|e| to_js_err(&e))?;
     to_js(&out)
 }
 

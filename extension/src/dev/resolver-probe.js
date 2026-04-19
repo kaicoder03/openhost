@@ -98,6 +98,7 @@ export async function runResolverProbe(pubkeyZbase32, opts = {}) {
         bytes,
         opts.daemonSalt,
         opts.clientPubkey,
+        pubkey,
       );
       console.log("[probe] decode_answer_fragments:", ans);
     } catch (e) {

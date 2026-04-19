@@ -171,6 +171,9 @@ export async function dialOhUrl(ohUrl, opts = {}) {
   // 2. Client identity.
   const clientSeed = await loadOrCreateClientSeed();
   const clientPkZ = client_pubkey_from_seed(clientSeed);
+  // Dev diagnostic: surface the per-install client pubkey so operators
+  // of a host daemon can add it to their `watched_clients` allowlist.
+  console.log("openhost dialer: client_pubkey_zbase32 =", clientPkZ);
 
   // 3. Build RTCPeerConnection + data channel.
   const pc = new RTCPeerConnection({ iceServers: STUN });
@@ -311,7 +314,7 @@ async function pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed, hostDt
   while (Date.now() < deadline) {
     try {
       const packet = await fetchHostPacket(daemonPkZ);
-      const ans = decode_answer_fragments(packet, daemonSalt, clientPkZ);
+      const ans = decode_answer_fragments(packet, daemonSalt, clientPkZ, daemonPkZ);
       if (ans) {
         const opened = open_answer(clientSeed, ans.sealed_base64url, hostDtlsFpHex);
         if (opened.daemon_pk_zbase32 !== daemonPkZ) {
