@@ -202,3 +202,157 @@ fn decode_answer_fragments_reassembles_published_fragments() {
     let opened = rebuilt.open(&client_sk).expect("sealed bytes open");
     assert_eq!(opened.answer_sdp, plaintext.answer_sdp);
 }
+
+// ============================================================================
+// Phase 4 browser-primitive smoke tests (PR #28.3)
+// ============================================================================
+
+#[test]
+fn seal_offer_roundtrips_via_daemon_open() {
+    use openhost_pkarr::offer::OfferRecord;
+
+    let daemon_sk = SigningKey::from_bytes(&SEED);
+    let daemon_pk_z = daemon_sk.public_key().to_zbase32();
+    let client_sk = SigningKey::from_bytes(&CLIENT_SEED);
+    let client_pk_z = client_sk.public_key().to_zbase32();
+
+    let sealed = core::seal_offer(
+        &daemon_pk_z,
+        &client_pk_z,
+        "v=0\r\na=setup:active\r\n",
+        0x02,
+    )
+    .expect("seal ok");
+
+    // Daemon-side open path: rebuild an OfferRecord from the sealed
+    // bytes and invoke AnswerPlaintext-style open through the CLI's
+    // existing unseal surface.
+    let record = OfferRecord { sealed };
+    let plain = record.open(&daemon_sk).expect("daemon opens sealed offer");
+    assert_eq!(
+        plain.client_pk.to_bytes(),
+        client_sk.public_key().to_bytes()
+    );
+    assert_eq!(plain.offer_sdp, "v=0\r\na=setup:active\r\n");
+    assert_eq!(plain.binding_mode, openhost_pkarr::BindingMode::CertFp);
+}
+
+#[test]
+fn seal_offer_rejects_unknown_binding_mode() {
+    let daemon_pk_z = SigningKey::from_bytes(&SEED).public_key().to_zbase32();
+    let client_pk_z = SigningKey::from_bytes(&CLIENT_SEED)
+        .public_key()
+        .to_zbase32();
+    assert!(matches!(
+        core::seal_offer(&daemon_pk_z, &client_pk_z, "v=0\r\n", 0xFF),
+        Err(core::Error::Pkarr(_))
+    ));
+}
+
+#[test]
+fn open_answer_roundtrips_via_client_sk() {
+    use openhost_pkarr::AnswerEntry;
+    use openhost_pkarr::AnswerPlaintext;
+
+    let daemon_sk = SigningKey::from_bytes(&SEED);
+    let client_sk = SigningKey::from_bytes(&CLIENT_SEED);
+    let client_pk = client_sk.public_key();
+    let salt = [0x22u8; SALT_LEN];
+    let plaintext = AnswerPlaintext {
+        daemon_pk: daemon_sk.public_key(),
+        offer_sdp_hash: openhost_pkarr::hash_offer_sdp("v=0"),
+        answer_sdp: "v=0\r\na=setup:passive\r\n".to_string(),
+    };
+    let mut rng = rand::rngs::OsRng;
+    let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, now_ts()).expect("seal");
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let sealed_b64 = URL_SAFE_NO_PAD.encode(&entry.sealed);
+
+    let opened = core::open_answer(&client_sk.to_bytes(), &sealed_b64).expect("open");
+    assert_eq!(opened.answer_sdp, plaintext.answer_sdp);
+    assert_eq!(
+        opened.daemon_pk_zbase32,
+        daemon_sk.public_key().to_zbase32()
+    );
+}
+
+#[test]
+fn cert_fp_binding_matches_sha256_hkdf_daemon_path() {
+    use openhost_core::crypto::auth_bytes_bound;
+
+    let host_sk = SigningKey::from_bytes(&SEED);
+    let host_pk = host_sk.public_key();
+    let client_sk = SigningKey::from_bytes(&CLIENT_SEED);
+    let client_pk = client_sk.public_key();
+    let cert_der = b"-----FAKE-DTLS-CERT-DER-BYTES-----";
+    let nonce = [0x77u8; 32];
+
+    let wasm_auth = core::compute_cert_fp_binding(
+        cert_der,
+        &host_pk.to_zbase32(),
+        &client_pk.to_zbase32(),
+        &nonce,
+    )
+    .expect("compute");
+
+    // Reproduce the daemon's derive_binding_secret(CertFp) path by
+    // hand: SHA-256(DER) → HKDF-SHA256 with the standard bound
+    // context → 32 auth bytes.
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(cert_der);
+    let secret: [u8; 32] = h.finalize().into();
+    let expect =
+        auth_bytes_bound(&secret, &host_pk.to_bytes(), &client_pk.to_bytes(), &nonce).unwrap();
+    assert_eq!(wasm_auth, expect);
+}
+
+#[test]
+fn sign_auth_client_and_verify_auth_host_roundtrip() {
+    let host_sk = SigningKey::from_bytes(&SEED);
+    let client_sk = SigningKey::from_bytes(&CLIENT_SEED);
+
+    let auth_bytes = [0x42u8; 32];
+    // Sign AUTH_CLIENT (browser path).
+    let payload = core::sign_auth_client(&client_sk.to_bytes(), &auth_bytes).expect("sign");
+    assert_eq!(payload.len(), 32 + 64);
+    assert_eq!(&payload[..32], &client_sk.public_key().to_bytes()[..]);
+
+    // Server signs AUTH_HOST with its own key; client verifies.
+    let host_sig = host_sk.sign(&auth_bytes).to_bytes();
+    let ok = core::verify_auth_host(&host_sk.public_key().to_zbase32(), &auth_bytes, &host_sig)
+        .expect("verify runs");
+    assert!(ok, "valid AUTH_HOST sig must verify");
+
+    // Flip a bit → fails.
+    let mut tampered = host_sig;
+    tampered[0] ^= 0x01;
+    let bad =
+        core::verify_auth_host(&host_sk.public_key().to_zbase32(), &auth_bytes, &tampered).unwrap();
+    assert!(!bad, "tampered signature must fail verify");
+}
+
+#[test]
+fn encode_decode_frame_roundtrip_and_partial_buffer_is_none() {
+    // Happy path: REQUEST_HEAD with a small payload.
+    let req_head_type = 0x01u8;
+    let payload = b"GET / HTTP/1.1\r\nHost: openhost\r\n\r\n".to_vec();
+    let bytes = core::encode_frame(req_head_type, payload.clone()).expect("encode");
+    // Header = 1 + 4 bytes.
+    assert_eq!(bytes.len(), 5 + payload.len());
+
+    let decoded = core::decode_frame(&bytes).expect("decode").expect("some");
+    assert_eq!(decoded.frame_type, req_head_type);
+    assert_eq!(decoded.payload, payload);
+    assert_eq!(decoded.consumed, bytes.len());
+
+    // Partial header (< 5 bytes) → None.
+    let partial = core::decode_frame(&bytes[..3]).expect("decode partial");
+    assert!(partial.is_none());
+
+    // Unknown frame type → Err.
+    let err = core::encode_frame(0xEE, vec![]).expect_err("unknown type rejected");
+    assert!(matches!(err, core::Error::Frame(_)));
+}

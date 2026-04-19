@@ -6,10 +6,22 @@
 //! [`crate`] root wraps each of these with a `JsValue` translation
 //! step.
 
-use openhost_core::identity::PublicKey;
+use openhost_core::channel_binding_wire::{
+    AUTH_CLIENT_PAYLOAD_LEN, AUTH_NONCE_LEN, EXPORTER_SECRET_LEN,
+};
+/// Ed25519 signature byte length. Not exported by `channel_binding_wire`
+/// today; pinned here because the browser AUTH_CLIENT + AUTH_HOST
+/// payloads both carry one of these.
+const SIGNATURE_LEN: usize = 64;
+use openhost_core::crypto::auth_bytes_bound;
+use openhost_core::identity::{PublicKey, SigningKey, PUBLIC_KEY_LEN, SIGNING_KEY_LEN};
 use openhost_core::pkarr_record::{SignedRecord, SALT_LEN};
-use openhost_pkarr::SignedPacket;
+use openhost_core::wire::{Frame, FrameType};
+use openhost_pkarr::offer::OfferRecord;
+use openhost_pkarr::{AnswerEntry, BindingMode, OfferPlaintext, SignedPacket};
+use rand::rngs::OsRng;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Errors produced by the core tier. The `#[wasm_bindgen]` layer
@@ -38,6 +50,27 @@ pub enum Error {
     /// structural invariant failed.
     #[error("record verify failed: {0}")]
     VerifyFailed(String),
+    /// Input byte slice was the wrong length for a fixed-size array
+    /// parameter (client SK, nonce, etc.).
+    #[error("expected {expected} bytes for {field}, got {got}")]
+    WrongLength {
+        /// Short name identifying the parameter.
+        field: &'static str,
+        /// Byte count required.
+        expected: usize,
+        /// Byte count provided.
+        got: usize,
+    },
+    /// Sealed-box open failed (wrong private key or tampered
+    /// ciphertext).
+    #[error("sealed-box open failed: {0}")]
+    SealedBoxOpen(String),
+    /// Base64url-nopad decode failed on the caller's sealed input.
+    #[error("base64url decode failed: {0}")]
+    Base64(#[from] base64::DecodeError),
+    /// The wire framing codec rejected the caller's bytes.
+    #[error("frame codec: {0}")]
+    Frame(String),
 }
 
 /// Result alias over [`Error`].
@@ -193,3 +226,205 @@ pub fn decode_answer_fragments(
         created_at: e.created_at,
     }))
 }
+
+// ============================================================================
+// Phase 4: browser-dialer primitives (PR #28.3)
+// ============================================================================
+//
+// The browser extension's JS orchestrator owns the RTCPeerConnection.
+// Everything below is the crypto + wire-codec surface the orchestrator
+// calls via wasm-bindgen during a dial:
+//
+//   1. `seal_offer`           — seal the client's offer SDP to the host.
+//   2. (publish via relay)    — JS PUTs the sealed bytes to a Pkarr relay.
+//   3. (poll + decode_answer) — JS calls `decode_answer_fragments` +
+//                               `open_answer` to recover the answer SDP.
+//   4. (apply answer)         — JS drives setRemoteDescription.
+//   5. `compute_cert_fp_binding` + `sign_auth_client` — build the
+//      AUTH_CLIENT payload once DTLS is up.
+//   6. `verify_auth_host`     — validate the daemon's AUTH_HOST reply.
+//   7. `encode_frame` / `decode_frame` — HTTP-over-DataChannel I/O.
+
+/// Decrypted answer plaintext returned to JS. Matches the wire form
+/// from `spec/01-wire-format.md §3.3`.
+#[derive(Debug, Serialize)]
+pub struct OpenedAnswer {
+    /// The responding daemon's Ed25519 pubkey, zbase32. Cross-check
+    /// against the Pkarr signer before trusting the answer.
+    pub daemon_pk_zbase32: String,
+    /// SHA-256 of the UTF-8 offer SDP this answer is bound to, hex.
+    pub offer_sdp_hash_hex: String,
+    /// The daemon's SDP answer text.
+    pub answer_sdp: String,
+}
+
+/// Decoded wire frame returned to JS.
+#[derive(Debug, Serialize)]
+pub struct DecodedFrame {
+    /// Raw frame-type byte (see `spec/01-wire-format.md §4`).
+    pub frame_type: u8,
+    /// Frame payload.
+    pub payload: Vec<u8>,
+    /// Total bytes consumed from the buffer for this frame (header +
+    /// payload). Callers shift their read buffer forward by this count.
+    pub consumed: usize,
+}
+
+fn parse_binding_mode(b: u8) -> Result<BindingMode> {
+    BindingMode::try_from_u8(b).map_err(Error::Pkarr)
+}
+
+fn parse_array<const N: usize>(bytes: &[u8], field: &'static str) -> Result<[u8; N]> {
+    <[u8; N]>::try_from(bytes).map_err(|_| Error::WrongLength {
+        field,
+        expected: N,
+        got: bytes.len(),
+    })
+}
+
+fn sha256_32(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Seal an [`OpenhostPlaintext`-equivalent] client offer to the daemon.
+/// JS hands the returned `Vec<u8>` to a Pkarr relay PUT as the sealed
+/// offer record TXT value (after base64url-nopad encoding, which lives
+/// on the JS side to keep the WASM boundary byte-level).
+///
+/// `binding_mode_u8` MUST be `0x02 CertFp` for browser calls; `0x01
+/// Exporter` is permitted for host-target tests but never emitted by a
+/// production browser build.
+pub fn seal_offer(
+    daemon_pk_zbase32: &str,
+    client_pk_zbase32: &str,
+    offer_sdp: &str,
+    binding_mode_u8: u8,
+) -> Result<Vec<u8>> {
+    let daemon_pk = parse_pubkey(daemon_pk_zbase32)?;
+    let client_pk = parse_pubkey(client_pk_zbase32)?;
+    let binding_mode = parse_binding_mode(binding_mode_u8)?;
+    let plaintext = OfferPlaintext {
+        client_pk,
+        offer_sdp: offer_sdp.to_string(),
+        binding_mode,
+    };
+    let mut rng = OsRng;
+    let record = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext)?;
+    Ok(record.sealed)
+}
+
+/// Open an answer record with the client's 32-byte Ed25519 secret key.
+/// Mirrors `AnswerEntry::open` on the CLI path.
+pub fn open_answer(client_sk_bytes: &[u8], sealed_base64url: &str) -> Result<OpenedAnswer> {
+    let sk_arr: [u8; SIGNING_KEY_LEN] = parse_array(client_sk_bytes, "client_sk")?;
+    let client_sk = SigningKey::from_bytes(&sk_arr);
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let sealed = URL_SAFE_NO_PAD.decode(sealed_base64url.as_bytes())?;
+    // AnswerEntry only needs `sealed` for open(); client_hash +
+    // created_at are ignored, so we synthesize placeholders.
+    let entry = AnswerEntry {
+        client_hash: [0u8; openhost_pkarr::CLIENT_HASH_LEN],
+        sealed,
+        created_at: 0,
+    };
+    let plain = entry
+        .open(&client_sk)
+        .map_err(|e| Error::SealedBoxOpen(e.to_string()))?;
+    Ok(OpenedAnswer {
+        daemon_pk_zbase32: plain.daemon_pk.to_zbase32(),
+        offer_sdp_hash_hex: hex::encode(plain.offer_sdp_hash),
+        answer_sdp: plain.answer_sdp,
+    })
+}
+
+/// Compute the 32-byte AUTH bytes for a browser (CertFp) dial.
+///
+/// The input `cert_der` is the DER-encoded DTLS certificate the browser
+/// reads from `RTCDtlsTransport.getRemoteCertificates()[0]`. The output
+/// feeds the AUTH_CLIENT signature (via [`sign_auth_client`]) and the
+/// AUTH_HOST verify (via [`verify_auth_host`]), matching the daemon's
+/// Phase 2 `derive_binding_secret(CertFp)` path byte-for-byte.
+pub fn compute_cert_fp_binding(
+    cert_der: &[u8],
+    host_pk_zbase32: &str,
+    client_pk_zbase32: &str,
+    nonce_bytes: &[u8],
+) -> Result<[u8; 32]> {
+    let host_pk = parse_pubkey(host_pk_zbase32)?;
+    let client_pk = parse_pubkey(client_pk_zbase32)?;
+    let nonce: [u8; AUTH_NONCE_LEN] = parse_array(nonce_bytes, "nonce")?;
+    if cert_der.is_empty() {
+        return Err(Error::VerifyFailed(
+            "remote DTLS certificate DER is empty".to_string(),
+        ));
+    }
+    let secret = sha256_32(cert_der);
+    debug_assert_eq!(secret.len(), EXPORTER_SECRET_LEN);
+    let auth = auth_bytes_bound(&secret, &host_pk.to_bytes(), &client_pk.to_bytes(), &nonce)
+        .map_err(|e| Error::VerifyFailed(e.to_string()))?;
+    Ok(auth)
+}
+
+/// Produce the 96-byte AUTH_CLIENT payload (32B client_pk ||
+/// 64B Ed25519 signature over `auth_bytes`).
+pub fn sign_auth_client(client_sk_bytes: &[u8], auth_bytes: &[u8]) -> Result<Vec<u8>> {
+    let sk_arr: [u8; SIGNING_KEY_LEN] = parse_array(client_sk_bytes, "client_sk")?;
+    let client_sk = SigningKey::from_bytes(&sk_arr);
+    // auth_bytes is always 32 bytes (AUTH_BYTES_LEN). Enforce up-front
+    // so mis-sized inputs surface as WrongLength instead of a cryptic
+    // downstream verify failure.
+    let _: [u8; 32] = parse_array(auth_bytes, "auth_bytes")?;
+    let sig = client_sk.sign(auth_bytes);
+    let mut out = Vec::with_capacity(AUTH_CLIENT_PAYLOAD_LEN);
+    out.extend_from_slice(&client_sk.public_key().to_bytes());
+    out.extend_from_slice(&sig.to_bytes());
+    Ok(out)
+}
+
+/// Verify the 64-byte AUTH_HOST signature against `auth_bytes` under
+/// `host_pk`. Returns `Ok(true)` on good signature, `Ok(false)` on
+/// bad. Malformed lengths surface as [`Error::WrongLength`].
+pub fn verify_auth_host(
+    host_pk_zbase32: &str,
+    auth_bytes: &[u8],
+    signature_64b: &[u8],
+) -> Result<bool> {
+    let host_pk = parse_pubkey(host_pk_zbase32)?;
+    let _: [u8; 32] = parse_array(auth_bytes, "auth_bytes")?;
+    let sig_arr: [u8; SIGNATURE_LEN] = parse_array(signature_64b, "signature")?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    Ok(host_pk.as_dalek().verify_strict(auth_bytes, &sig).is_ok())
+}
+
+/// Encode a wire frame to bytes ready to ship over the data channel.
+/// The frame-type byte matches `spec/01-wire-format.md §4`.
+pub fn encode_frame(frame_type_u8: u8, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let frame_type = FrameType::from_u8(frame_type_u8)
+        .map_err(|e| Error::Frame(format!("unknown frame type 0x{frame_type_u8:02x}: {e}")))?;
+    let frame = Frame::new(frame_type, payload).map_err(|e| Error::Frame(e.to_string()))?;
+    Ok(frame.encode_to_vec())
+}
+
+/// Try to decode one frame from the front of `buf`. Returns `None`
+/// (as an untyped option → JS `null`) if `buf` is incomplete; a
+/// [`DecodedFrame`] otherwise with `consumed` bytes from the front.
+pub fn decode_frame(buf: &[u8]) -> Result<Option<DecodedFrame>> {
+    match Frame::try_decode(buf) {
+        Ok(None) => Ok(None),
+        Ok(Some((frame, consumed))) => Ok(Some(DecodedFrame {
+            frame_type: frame.frame_type.as_u8(),
+            payload: frame.payload,
+            consumed,
+        })),
+        Err(e) => Err(Error::Frame(e.to_string())),
+    }
+}
+
+// Silence the "unused" warnings for constants we only reach through
+// conditional paths (eg. PUBLIC_KEY_LEN is only consumed inside
+// parse_array via the N generic).
+#[allow(dead_code)]
+const _: usize = PUBLIC_KEY_LEN;

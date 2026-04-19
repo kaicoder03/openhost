@@ -134,3 +134,82 @@ pub fn decode_answer_fragments(
         .map_err(|e| to_js_err(&e))?;
     to_js(&out)
 }
+
+// ============================================================================
+// Phase 4: browser-dialer primitives (PR #28.3)
+// ============================================================================
+
+/// Seal a client offer plaintext to the daemon's X25519 pubkey.
+/// Returns the raw sealed bytes; JS base64url-encodes them for the
+/// Pkarr relay PUT.
+///
+/// `binding_mode_u8` MUST be `0x02` (CertFp) for browser calls.
+#[wasm_bindgen]
+pub fn seal_offer(
+    daemon_pk_zbase32: &str,
+    client_pk_zbase32: &str,
+    offer_sdp: &str,
+    binding_mode_u8: u8,
+) -> Result<Vec<u8>, JsError> {
+    core::seal_offer(
+        daemon_pk_zbase32,
+        client_pk_zbase32,
+        offer_sdp,
+        binding_mode_u8,
+    )
+    .map_err(|e| to_js_err(&e))
+}
+
+/// Open an answer ciphertext with the client's 32-byte secret key.
+/// Returns an [`OpenedAnswer`][core::OpenedAnswer]-shaped JS object.
+#[wasm_bindgen]
+pub fn open_answer(client_sk_bytes: &[u8], sealed_base64url: &str) -> Result<JsValue, JsError> {
+    let out = core::open_answer(client_sk_bytes, sealed_base64url).map_err(|e| to_js_err(&e))?;
+    to_js(&out)
+}
+
+/// Compute 32 AUTH bytes for a browser dial's CertFp channel binding.
+/// Feeds [`sign_auth_client`] + [`verify_auth_host`].
+#[wasm_bindgen]
+pub fn compute_cert_fp_binding(
+    cert_der: &[u8],
+    host_pk_zbase32: &str,
+    client_pk_zbase32: &str,
+    nonce_bytes: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    core::compute_cert_fp_binding(cert_der, host_pk_zbase32, client_pk_zbase32, nonce_bytes)
+        .map(|arr| arr.to_vec())
+        .map_err(|e| to_js_err(&e))
+}
+
+/// Produce the AUTH_CLIENT payload (96 bytes: 32B client_pk ||
+/// 64B Ed25519 sig over `auth_bytes`).
+#[wasm_bindgen]
+pub fn sign_auth_client(client_sk_bytes: &[u8], auth_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+    core::sign_auth_client(client_sk_bytes, auth_bytes).map_err(|e| to_js_err(&e))
+}
+
+/// Verify the daemon's AUTH_HOST 64-byte signature against
+/// `auth_bytes` under `host_pk`. Returns a `bool`.
+#[wasm_bindgen]
+pub fn verify_auth_host(
+    host_pk_zbase32: &str,
+    auth_bytes: &[u8],
+    signature_64b: &[u8],
+) -> Result<bool, JsError> {
+    core::verify_auth_host(host_pk_zbase32, auth_bytes, signature_64b).map_err(|e| to_js_err(&e))
+}
+
+/// Encode one wire frame for the data channel.
+#[wasm_bindgen]
+pub fn encode_frame(frame_type_u8: u8, payload: Vec<u8>) -> Result<Vec<u8>, JsError> {
+    core::encode_frame(frame_type_u8, payload).map_err(|e| to_js_err(&e))
+}
+
+/// Try to decode one frame from the front of `buf`. Returns JS `null`
+/// on incomplete buffer; a `DecodedFrame` object otherwise.
+#[wasm_bindgen]
+pub fn decode_frame(buf: &[u8]) -> Result<JsValue, JsError> {
+    let out = core::decode_frame(buf).map_err(|e| to_js_err(&e))?;
+    to_js(&out)
+}
