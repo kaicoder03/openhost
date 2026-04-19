@@ -1,0 +1,63 @@
+[Unit]
+Description=openhost daemon
+Documentation=https://kaicoder03.github.io/openhost/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openhost
+Group=openhost
+WorkingDirectory=/var/lib/openhost
+Environment=OPENHOST_CONFIG=/etc/openhost/daemon.toml
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/openhostd run
+
+# Restart policy: restart on failure (panic, sigkill, non-zero exit),
+# but back off aggressively so a crashloop can't hammer public Pkarr
+# relays from a misconfigured host.
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=3
+StartLimitIntervalSec=60s
+
+# Resource ceilings. The daemon is small — ~15 MB resident in practice —
+# but it buffers full HTTP responses, so MemoryHigh accommodates a few
+# concurrent forwards. Raise if you expose a service that streams
+# larger bodies.
+MemoryHigh=128M
+MemoryMax=256M
+TasksMax=64
+
+# Security hardening. Each of these restricts kernel surface openhostd
+# has no reason to touch. Leave in place unless a change breaks
+# functionality (in which case, prefer a tighter override to disabling
+# the whole directive).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# State + config paths the daemon legitimately reads and writes.
+ReadWritePaths=/var/lib/openhost
+ReadOnlyPaths=/etc/openhost
+
+# Network: the daemon needs the public internet (Pkarr relays, DHT,
+# and WebRTC peers). If you route via a restrictive firewall, allow
+# outbound UDP on ephemeral ports + HTTPS to the pkarr relay list
+# published in your daemon.toml.
+IPAddressAllow=any
+
+[Install]
+WantedBy=multi-user.target

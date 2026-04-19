@@ -8,6 +8,22 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #23, distributable binaries)
+
+- **New `.github/workflows/release.yml`** — fires on `v*` tag push (or `workflow_dispatch` for backfills). Builds `openhostd`, `openhost-dial`, `openhost-resolve` on native GitHub runners for Linux x86_64, macOS aarch64, macOS x86_64, and Windows x86_64; strips, packs (`.tar.gz` / `.zip`), and uploads to the matching GitHub release via `softprops/action-gh-release`. Release body is sliced out of the matching `## [X.Y.Z]` section of `CHANGELOG.md` by a small awk filter; `fail_on_unmatched_files: true` guards against a silent no-op on a misconfigured glob.
+- **New `distribution/`** tree with operator-ready service-manager files:
+  - `distribution/systemd/openhostd.service` — Linux systemd unit with resource ceilings (`MemoryMax=256M`, `TasksMax=64`), sandboxing (`ProtectSystem=strict`, `PrivateTmp=true`, `NoNewPrivileges=true`, `MemoryDenyWriteExecute=true`, and friends), and backoff that caps crashloops before they hammer public Pkarr relays.
+  - `distribution/launchd/com.openhost.openhostd.plist` — macOS launchd plist with user-agent and system-daemon install modes; documented in comments, including the `UserName` block to uncomment for the system install.
+  - `distribution/README.md` — install commands + uninstall commands for both platforms, plus a security-posture note (the daemon runs unprivileged by default; don't grant more).
+- **Site install guide reshuffle** — `guides/install.md` now leads with a "Pre-built binaries" section and a platform-archive table; "Build from source" moves to a fallback section. README's "Building from source" gains a one-line pointer at the releases page.
+
+### Out of scope for PR #23
+
+- Homebrew tap — requires a separate `homebrew-openhost` repo + formula with pinned SHA256s against a real release artifact. Easier to land once the workflow has run once and produced verifiable checksums.
+- macOS notarization / Windows code signing — requires paid developer certs; follow-up.
+- ARM Linux (aarch64-unknown-linux-gnu) — cross-compile requires extra toolchain setup, and native ARM GitHub runners are paid. Start with x86_64 Linux; revisit if users ask.
+- musl builds for Alpine Linux — follow-up once there's demand.
+
 ### Changed (PR #22, shrink main `_openhost` record)
 
 - **Wire-format break**: `PROTOCOL_VERSION` bumped `1` → `2`. v2 records drop the `allow` and `ice` fields from `OpenhostRecord::canonical_signing_bytes`. v1 and v2 records are mutually unreadable; the `version` byte is the discriminator (decoders **MUST** reject a mismatched version).

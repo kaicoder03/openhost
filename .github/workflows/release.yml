@@ -1,0 +1,188 @@
+name: Release
+
+# Fires when a `v*` tag is pushed (the standard trigger) or manually via
+# the Actions tab (`workflow_dispatch`). The latter is useful for
+# backfilling binaries onto an already-tagged release, e.g. v0.2.0 which
+# was tagged before this workflow existed.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build binaries for (e.g. v0.2.0)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Independent per-platform failures are diagnosable on their own;
+      # no reason to cancel a working Linux build because macOS hit an
+      # SDK quirk.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - name: macos-x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Check out ${{ github.event.inputs.tag || github.ref }}
+        uses: actions/checkout@v4
+        with:
+          # workflow_dispatch passes the tag via input; the tag-push
+          # trigger leaves inputs.tag empty and uses the default ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust target ${{ matrix.target }}
+        # Toolchain version is pinned via rust-toolchain.toml; rustup
+        # resolves it automatically on first cargo invocation. We only
+        # need to add the cross-target triple on macOS x86_64 (the
+        # arm64 runner builds arm64 natively).
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build daemon
+        run: cargo build --release --target ${{ matrix.target }} -p openhost-daemon
+
+      - name: Build client + cli
+        run: cargo build --release --target ${{ matrix.target }} --features cli -p openhost-client
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_ext=""
+          if [[ "${{ matrix.runner }}" == windows-* ]]; then
+            bin_ext=".exe"
+          fi
+          stage="openhost-${{ matrix.name }}"
+          mkdir -p "$stage"
+          for bin in openhostd openhost-dial openhost-resolve; do
+            src="target/${{ matrix.target }}/release/${bin}${bin_ext}"
+            test -f "$src" || { echo "missing: $src"; exit 1; }
+            cp "$src" "$stage/"
+          done
+          cp CHANGELOG.md LICENSE-APACHE LICENSE-MIT README.md "$stage/"
+          cp -r examples distribution "$stage/" 2>/dev/null || true
+          echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
+
+      - name: Strip binaries (Unix)
+        if: matrix.runner != 'windows-latest'
+        run: |
+          for bin in openhostd openhost-dial openhost-resolve; do
+            strip "$STAGE_DIR/$bin" || true
+          done
+
+      - name: Pack ${{ matrix.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            # GitHub runners ship 7z by default on windows-latest.
+            7z a "${STAGE_DIR}.zip" "$STAGE_DIR" > /dev/null
+          else
+            tar czf "${STAGE_DIR}.tar.gz" "$STAGE_DIR"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: openhost-${{ matrix.name }}.${{ matrix.archive }}
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # workflow_dispatch runs always fire the build step; we only
+    # publish on tag push OR explicit dispatch. The condition keeps a
+    # future scheduled re-run (if someone adds one) from nuking the
+    # release body.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - name: Check out for CHANGELOG slicing
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${tag#v}"
+          # Slice out the section between `## [X.Y.Z]` and the next
+          # `## [` header. Uses literal-prefix comparison (index with
+          # offset 1) rather than regex — `[` in awk's `~` operator
+          # is a character class, not a literal, which silently
+          # emptied the output on every release.
+          awk -v hdr="## [$version]" '
+            index($0, hdr) == 1 && !flag { flag = 1; print; next }
+            flag && index($0, "## [") == 1 { exit }
+            flag { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "WARN: no CHANGELOG section matched '## [$version]' — release body will be empty" >&2
+          fi
+          echo "--- release-notes.md:"
+          cat release-notes.md || true
+
+      - name: Publish or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body_path: release-notes.md
+          # `fail_on_unmatched_files` guards against the glob matching
+          # zero artifacts (a silent no-op would be worse than a loud
+          # failure at release time).
+          fail_on_unmatched_files: true
+          files: artifacts/**/openhost-*.*

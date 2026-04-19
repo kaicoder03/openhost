@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  openhost launchd property list.
+
+  User-agent install (recommended for a personal home server):
+    ~/Library/LaunchAgents/com.openhost.openhostd.plist
+
+  System-daemon install (all users, loaded at boot):
+    /Library/LaunchDaemons/com.openhost.openhostd.plist
+    Also uncomment the <key>UserName</key> block below and set it to
+    the unprivileged user that should run the daemon.
+
+  See distribution/README.md for full install and uninstall commands.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openhost.openhostd</string>
+
+  <!-- Restart on boot (or at login for a user agent) and whenever the
+       daemon exits uncleanly. KeepAlive's dict form restricts the
+       restart to crash and network-state conditions — a manual
+       `launchctl unload` does not get fought back, and the daemon
+       doesn't respawn uselessly when no network is up. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+    <key>NetworkState</key>
+    <true/>
+  </dict>
+
+  <!-- Where the daemon finds its config and where it writes state.
+       Edit to taste; `~` does NOT expand inside a plist, so you need
+       absolute paths. The defaults match the install instructions
+       in distribution/README.md. -->
+  <key>WorkingDirectory</key>
+  <string>/usr/local/var/openhost</string>
+
+  <!-- Logs. The daemon writes tracing output to stderr by default; we
+       redirect both streams here so the operator has one place to
+       look. Rotate with newsyslog(8) if they grow. -->
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/openhost/openhostd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/openhost/openhostd.err</string>
+
+  <!-- Uncomment and set for a system-daemon install. Leaving this out
+       means launchd runs the process as the user that `launchctl
+       load`ed the plist — fine for a user agent. -->
+  <!--
+  <key>UserName</key>
+  <string>openhost</string>
+  <key>GroupName</key>
+  <string>openhost</string>
+  -->
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OPENHOST_CONFIG</key>
+    <string>/usr/local/etc/openhost/daemon.toml</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/openhostd</string>
+    <string>run</string>
+  </array>
+
+  <!-- Back-off on crashloop. launchd enforces a 10-second minimum
+       between respawns by default; ThrottleInterval makes that
+       explicit and large enough that a misconfigured host can't
+       hammer public Pkarr relays. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
