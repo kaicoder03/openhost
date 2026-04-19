@@ -25,8 +25,10 @@ pub mod error;
 #[cfg(feature = "nostr")]
 pub mod nostr;
 pub mod offer;
+#[cfg(feature = "full")]
 pub mod publisher;
 pub mod relays;
+#[cfg(feature = "full")]
 pub mod resolver;
 
 #[cfg(test)]
@@ -41,10 +43,16 @@ pub mod test_fakes;
 #[cfg(any(test, feature = "test-fakes"))]
 pub use test_fakes::MemoryPkarrNetwork;
 
+#[cfg(feature = "full")]
+pub use codec::encode;
 pub use codec::{
-    decode, encode, packet_public_key, BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME,
+    decode, packet_public_key, BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME,
     OPENHOST_TXT_TTL,
 };
+// Re-export the pkarr types callers need to invoke `decode` + the
+// offer/answer decoders. Saves downstream crates (notably
+// `openhost-pkarr-wasm`) from having to pin `pkarr` as a direct dep
+// just to name the `SignedPacket` parameter type.
 pub use error::{PkarrError, Result};
 pub use offer::{
     answer_txt_chunk_name, answer_txt_name, client_hash_label, decode_answer_fragments_from_packet,
@@ -53,9 +61,12 @@ pub use offer::{
     CLIENT_HASH_LEN, HOST_HASH_LEN, MAX_FRAGMENT_PAYLOAD_BYTES, MAX_FRAGMENT_TOTAL,
     OFFER_SDP_HASH_LEN, OFFER_TXT_PREFIX, OFFER_TXT_TTL,
 };
+pub use pkarr::SignedPacket;
+#[cfg(feature = "full")]
 pub use publisher::{
     AnswerSource, InitialPublishOutcome, PkarrTransport, Publisher, PublisherHandle, RecordSource,
     Transport, INITIAL_PUBLISH_ATTEMPTS, INITIAL_PUBLISH_BACKOFF, REPUBLISH_INTERVAL,
 };
 pub use relays::DEFAULT_RELAYS;
+#[cfg(feature = "full")]
 pub use resolver::{PkarrResolve, Resolve, Resolver, GRACE_WINDOW};

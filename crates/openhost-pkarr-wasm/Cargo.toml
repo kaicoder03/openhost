@@ -1,0 +1,56 @@
+[package]
+name = "openhost-pkarr-wasm"
+description = "wasm-bindgen shim over openhost-pkarr's resolver-side decode functions, consumed by the browser extension."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lib]
+# cdylib = wasm-pack's required output for `--target web`. rlib is
+# kept so this crate is also usable from the host-target smoke test
+# (`cargo test -p openhost-pkarr-wasm`) without a wasm toolchain.
+crate-type = ["cdylib", "rlib"]
+
+# wasm-pack v0.14 ships a stale bundled `wasm-opt` that rejects the
+# bulk-memory ops emitted by current rustc. Disabling the optimizer
+# keeps the build green; the resulting `.wasm` is ~10% larger than
+# an opt pass would produce. PR #28.6 (reproducible builds) will
+# pin a known-good wasm-opt alongside wasm-bindgen + rustc.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dependencies]
+openhost-core = { path = "../openhost-core" }
+# `resolver-only` strips the daemon-side publisher + pkarr `full-client`
+# and leaves just sync decode + codec types. That subset compiles clean
+# for `wasm32-unknown-unknown`. `openhost-pkarr` re-exports the
+# `pkarr::SignedPacket` type we need via `openhost_pkarr::SignedPacket`,
+# so we don't list `pkarr` as a direct dep here.
+openhost-pkarr = { path = "../openhost-pkarr", default-features = false, features = ["resolver-only"] }
+serde = { workspace = true }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+thiserror = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# The `rand_core` → `getrandom` chain in `openhost-core` fails to
+# compile for wasm32 unless `getrandom` is built with `features =
+# ["js"]`. The cfg-gate here is the canonical pattern: the feature
+# only applies to the wasm target, so native builds (including
+# `cargo test -p openhost-pkarr-wasm` on the host) aren't affected.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+# Reuse the crate's own test vectors / fixtures via the existing
+# `MemoryPkarrNetwork` scaffold. `full` is required because the fake
+# substrate in-turn drives publishing + resolving.
+openhost-pkarr = { path = "../openhost-pkarr", default-features = false, features = ["full", "test-fakes"] }
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -86,22 +86,30 @@ the only piece that the WASM doesn't own.
 
 ## Implementation plan (future PRs)
 
-- **PR #28 (this one).** Scaffold. Directory layout (`src/`, `wasm/`,
-  `public/`, `scripts/`), a stub MV3 `manifest.json`, a placeholder
-  `src/background.js` that logs a roadmap pointer, a Node `package.json`
-  with echo-only `lint` / `build` scripts, and this README. No protocol
-  logic. Loadable as an unpacked extension (Chrome will accept it as a
-  valid MV3 manifest) but does nothing.
+- **PR #28 ✅.** Scaffold. Directory layout (`src/`, `wasm/`,
+  `public/`, `scripts/`), stub MV3 `manifest.json`, placeholder
+  `src/background.js` that logs a roadmap pointer, a Node
+  `package.json` with echo-only scripts, and this README. No protocol
+  logic.
 
-- **PR #28.2.** WASM build of
-  [`openhost-pkarr`](../crates/openhost-pkarr/)'s resolver module.
-  `scripts/build-wasm.sh` drives `wasm-pack` with a
-  `browser`-targeted pkg. A standalone test harness (loaded from
-  `src/dev/resolver-probe.js`, not shipped in the production bundle)
-  resolves a known pubkey against 3 public Pkarr relays and prints
-  the decoded record + ICE fragments. No service-worker integration
-  yet; this PR only proves the resolver compiles, links, and returns
-  a parsed record.
+- **PR #28.2 ✅.** WASM build of
+  [`openhost-pkarr`](../crates/openhost-pkarr/)'s resolver read path.
+  Lives in the new `openhost-pkarr-wasm` crate; four `#[wasm_bindgen]`
+  exports — `parse_host_record` (unverified structural decode),
+  `decode_and_verify` (combined decode + Ed25519 verify +
+  freshness-window check), `decode_offer`, and
+  `decode_answer_fragments` — cover the complete substrate decode
+  surface that PR #28.3's Dialer will need. JS does the HTTP `fetch`
+  against a public Pkarr relay; WASM owns only the sync parse +
+  crypto verify. `scripts/build-wasm.sh` drives `wasm-pack` with
+  `--target web` and emits `wasm/pkg/openhost_pkarr.{js,_bg.wasm}`
+  for the service worker to `import` as an ES module.
+  `src/dev/resolver-probe.js` exercises all four exports end-to-end;
+  `src/background.js` stays passive by default and documents the
+  one-line uncomment required to run the probe. The manifest gains
+  `host_permissions` for the three default Pkarr relays + a CSP that
+  permits WASM instantiation via `'wasm-unsafe-eval'` (MV3's only
+  route to running WebAssembly).
 
 - **PR #28.3.** WASM build of `openhost-client`'s `Dialer` and
   `OpenhostSession`. Wires the WASM into a tiny dev page that opens a
@@ -260,32 +268,60 @@ permission diff in the PR description.
 
 ## Local development
 
-Not runnable yet — this PR ships directory structure and a placeholder
-manifest only. Once PR #28.2 lands, the development flow will be:
+### Prerequisites (one-time)
+
+```bash
+# Rust toolchain matching rust-toolchain.toml (rustup picks it up
+# automatically on the first `cargo` invocation in this repo).
+rustup target add wasm32-unknown-unknown
+
+# wasm-pack drives the `cargo build` + `wasm-bindgen` + `wasm-opt`
+# pipeline with one command. Two install options:
+cargo install wasm-pack
+# or:
+curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+```
+
+No Node dependencies. `extension/package.json` is a thin wrapper
+whose only `build` script shells out to `scripts/build-wasm.sh`.
+
+### Build the WASM pkg
 
 ```bash
 cd extension
-
-# install dev deps (none in PR #28; wasm-pack + Chrome MV3 linter land in 28.2)
-npm install
-
-# build the WASM modules and copy them into wasm/pkg/
+./scripts/build-wasm.sh
+# or equivalently:
 npm run build
-
-# lint the manifest + JS glue
-npm run lint
 ```
 
-To load the extension into Chrome today:
+This produces `extension/wasm/pkg/openhost_pkarr.js` +
+`openhost_pkarr_bg.wasm`. `wasm/pkg/` is gitignored so committed
+state stays source-only.
+
+### Load the extension into Chrome
 
 1. Open `chrome://extensions`.
 2. Enable **Developer mode** (top right).
 3. Click **Load unpacked** and select this `extension/` directory.
-4. Chrome will load the scaffold and log the roadmap pointer from
-   `src/background.js` to the service-worker devtools console. That
-   is the complete current feature set.
+4. Chrome will load the extension and log the roadmap pointer from
+   `src/background.js` to the service-worker devtools console.
 
-The scaffold does not render any UI, intercept any navigation, or
-contact any network. Any apparent network activity from an installed
-scaffold build is a bug and should be reported as a security issue per
-[`SECURITY.md`](../SECURITY.md).
+### Exercise the PR #28.2 resolver probe
+
+```js
+// Uncomment the two lines at the bottom of src/background.js:
+// import { runResolverProbe } from "./dev/resolver-probe.js";
+// runResolverProbe("<52-char-zbase32-pubkey>");
+```
+
+Use the pubkey of a running `openhostd` instance (read it from the
+daemon's log line `identity: <zbase32>`). Reload the extension;
+the service-worker console will log four `[probe] …` lines —
+record decode, signature verify, offer lookup (usually `None`), and
+answer fragments (usually `None` without a daemon-side client pair).
+
+The default-installed extension does not render any UI, intercept
+any navigation, or contact any network until the probe is opted in.
+Any apparent network activity from an installed build (outside the
+opt-in probe above) is a bug and should be reported as a security
+issue per [`SECURITY.md`](../SECURITY.md).

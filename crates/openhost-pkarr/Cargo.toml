@@ -12,23 +12,40 @@ readme.workspace = true
 path = "src/lib.rs"
 
 [features]
-default = []
+# PR #28.2: resolve-side consumers (e.g. the browser extension's
+# `openhost-pkarr-wasm` shim) need the sync decode functions in
+# `codec` + `offer` without the async `pkarr::Client`, tokio, or the
+# publisher module. `full` is what the daemon + CLI client use; it
+# enables the substrate-facing modules and the tokio-driven
+# publish/resolve loops. Pick exactly one.
+default = ["full"]
+full = [
+    "dep:tokio",
+    "dep:async-trait",
+    "pkarr/full-client",
+]
+# Resolver-only: sync codec + offer decode + pkarr `signed_packet`
+# types. Compiles on wasm32-unknown-unknown.
+resolver-only = []
 nostr = ["serde_json", "hex"]
 # PR #8: in-memory pkarr substrate for end-to-end tests that drive a
 # real `App` + `Dialer` against each other without touching the
 # network. Gated so the fake never leaks into release builds.
-test-fakes = []
+test-fakes = ["full"]
 
 [dependencies]
 openhost-core = { path = "../openhost-core" }
 ed25519-dalek = { workspace = true }
-pkarr = { workspace = true }
+# The `signed_packet` + `keys` pkarr feature set is sync-only and
+# WASM-compatible. `full` (our default) additively layers the async
+# `full-client` (relays + DHT) on top via the feature chain.
+pkarr = { workspace = true, default-features = false, features = ["signed_packet", "keys"] }
 base64 = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, optional = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
+async-trait = { workspace = true, optional = true }
 # Offer/answer codec (PR #7a)
 sha2 = { workspace = true }
 zbase32 = { workspace = true }
