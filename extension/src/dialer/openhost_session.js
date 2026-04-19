@@ -158,6 +158,14 @@ export async function dialOhUrl(ohUrl, opts = {}) {
   // 1. Resolve + verify host record.
   const hostPacket = await fetchHostPacket(daemonPkZ);
   const hostRecord = decode_and_verify(hostPacket, daemonPkZ, nowTsBig);
+  if (hostRecord.pubkey_zbase32 !== daemonPkZ) {
+    // decode_and_verify already passed, so this is belt-and-suspenders —
+    // the WASM layer pins the pubkey it was asked about into the DTO.
+    // A mismatch here means something upstream re-shaped the struct.
+    throw new Error(
+      `host-record pubkey mismatch: asked ${daemonPkZ}, got ${hostRecord.pubkey_zbase32}`,
+    );
+  }
   const daemonSalt = hexToBytes(hostRecord.salt_hex);
 
   // 2. Client identity.
@@ -262,13 +270,21 @@ function waitForDcOpen(dc, timeoutMs) {
 async function readRemoteCertDer(pc) {
   // RTCDtlsTransport.getRemoteCertificates() returns an ArrayBuffer[]
   // (Chromium). Only the first cert is the peer's leaf.
+  //
+  // On some Chromium builds the cert array is populated *just after*
+  // connectionState flips to "connected"; a short retry loop avoids a
+  // false AUTH_NONCE-before-cert race on fast local connections.
   const transport = pc.sctp?.transport;
   if (!transport || typeof transport.getRemoteCertificates !== "function") {
     throw new Error("RTCDtlsTransport.getRemoteCertificates() unavailable");
   }
-  const certs = transport.getRemoteCertificates();
-  if (!certs || certs.length === 0) throw new Error("remote DTLS cert not available yet");
-  return new Uint8Array(certs[0]);
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    const certs = transport.getRemoteCertificates();
+    if (certs && certs.length > 0) return new Uint8Array(certs[0]);
+    await new Promise(r => setTimeout(r, 25));
+  }
+  throw new Error("remote DTLS cert not available 1s after DC open");
 }
 
 async function publishOfferPacket(clientPkZ, packetBytes) {
