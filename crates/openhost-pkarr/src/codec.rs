@@ -434,21 +434,18 @@ mod tests {
         );
     }
 
+    /// Sanity-check: a v2 record with a maxed-out `disc` still encodes
+    /// successfully — the main record alone can't overflow the BEP44
+    /// packet budget. The actual overflow + eviction path now lives in
+    /// `offer::tests::encode_evicts_oldest_when_overflow` (PR #15
+    /// introduced fragment eviction; v2 records are small enough that
+    /// the main record by itself can't trip the 1000-byte cap).
     #[test]
-    fn packet_too_large_is_rejected() {
+    fn max_disc_record_still_encodes() {
         let sk = SigningKey::from_bytes(&RFC_SEED);
         let mut record = reference_record();
-        // v2 records are compact — inflate `disc` (capped at MAX_DISC_LEN
-        // = 256 but we stop at validate time, so use something below the
-        // cap; the BEP44 1000-byte packet limit kicks in first once we
-        // add a long synthetic disc string + a pile of fake answer
-        // fragments on top). Use answer fragments via encode_with_answers
-        // to provoke the limit cleanly.
         record.disc = "x".repeat(MAX_DISC_LEN);
         let signed = SignedRecord::sign(record, &sk).unwrap();
-        // The single-record encode still fits; the BEP44 limit is meant
-        // to gate encode_with_answers. Verify encode() succeeds here and
-        // the overflow path is covered by offer::tests' eviction tests.
         assert!(encode(&signed, &sk).is_ok());
     }
 }

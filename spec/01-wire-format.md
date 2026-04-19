@@ -10,6 +10,8 @@ This document specifies the openhost wire format: identity encoding, the Pkarr r
 
 **v1 → v2 schema change (PR #22):** the main `_openhost` record no longer carries `allow` or `ice` fields in its canonical signing bytes. The host's allowlist is now private state (enforced inside the daemon on the offer-poll path); per-client ICE ciphertext will be published as separate records when that path is wired up. The `version` byte in the canonical bytes distinguishes v1 (`0x01`) from v2 (`0x02`) records; decoders **MUST** reject records whose `version` does not match their own implementation.
 
+The 9-byte domain separator `"openhost1"` is retained unchanged in v2 — it acts as an eternal "this is an openhost record" marker rather than a schema selector, which is the `version` byte's job. Future schema bumps (v3, v4, …) will keep `"openhost1"` and advance the `version` byte instead of renaming the prefix, so a decoder that does not recognise the record schema can still confirm it IS an openhost record before rejecting.
+
 Conformance language follows [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) / [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174): **MUST**, **SHOULD**, **MAY** carry their standard meanings.
 
 ## 1. Identity
