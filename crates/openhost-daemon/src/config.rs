@@ -176,6 +176,47 @@ pub struct DtlsConfig {
     /// Seconds between rotations. Defaults to [`DEFAULT_ROTATE_SECS`].
     #[serde(default = "default_rotate_secs")]
     pub rotate_secs: u64,
+    /// Channel-binding modes the daemon will accept on inbound offers.
+    /// Default: `["exporter", "cert_fp"]` — accept CLI dialers + browser
+    /// dialers. Operators running a CLI-only deployment can lock this
+    /// to `["exporter"]` to reject any browser-originated dial.
+    /// `[]` disables the listener entirely.
+    #[serde(default = "default_allowed_binding_modes")]
+    pub allowed_binding_modes: Vec<BindingModeConfig>,
+}
+
+/// Serializable mirror of [`openhost_pkarr::BindingMode`] for config
+/// files. Uses lowercase TOML strings (`"exporter"`, `"cert_fp"`) so
+/// the config file reads naturally.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingModeConfig {
+    /// Corresponds to [`openhost_pkarr::BindingMode::Exporter`].
+    Exporter,
+    /// Corresponds to [`openhost_pkarr::BindingMode::CertFp`].
+    CertFp,
+}
+
+impl From<BindingModeConfig> for openhost_pkarr::BindingMode {
+    fn from(m: BindingModeConfig) -> Self {
+        match m {
+            BindingModeConfig::Exporter => openhost_pkarr::BindingMode::Exporter,
+            BindingModeConfig::CertFp => openhost_pkarr::BindingMode::CertFp,
+        }
+    }
+}
+
+impl From<openhost_pkarr::BindingMode> for BindingModeConfig {
+    fn from(m: openhost_pkarr::BindingMode) -> Self {
+        match m {
+            openhost_pkarr::BindingMode::Exporter => Self::Exporter,
+            openhost_pkarr::BindingMode::CertFp => Self::CertFp,
+        }
+    }
+}
+
+fn default_allowed_binding_modes() -> Vec<BindingModeConfig> {
+    vec![BindingModeConfig::Exporter, BindingModeConfig::CertFp]
 }
 
 /// Localhost forward configuration (PR #6). Spec §7.12 mitigation +
@@ -412,6 +453,7 @@ pub fn seed_config(data_dir: &Path) -> Config {
         dtls: DtlsConfig {
             cert_path: data_dir.join("dtls.pem"),
             rotate_secs: DEFAULT_ROTATE_SECS,
+            allowed_binding_modes: default_allowed_binding_modes(),
         },
         forward: None,
         log: LogConfig::default(),

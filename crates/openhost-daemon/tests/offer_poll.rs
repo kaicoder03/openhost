@@ -64,6 +64,10 @@ fn daemon_config(
         dtls: DtlsConfig {
             cert_path: tmp.path().join("dtls.pem"),
             rotate_secs: 3600,
+            allowed_binding_modes: vec![
+                openhost_daemon::config::BindingModeConfig::Exporter,
+                openhost_daemon::config::BindingModeConfig::CertFp,
+            ],
         },
         forward: None,
         log: LogConfig::default(),
@@ -82,6 +86,7 @@ async fn build_client_offer_packet(
     let plaintext = OfferPlaintext {
         client_pk: client_sk.public_key(),
         offer_sdp: offer_sdp.to_string(),
+        binding_mode: openhost_pkarr::BindingMode::Exporter,
     };
     let mut rng = OsRng;
     let offer = OfferRecord::seal(&mut rng, daemon_pk, &plaintext).unwrap();
@@ -335,6 +340,7 @@ async fn daemon_rejects_inner_outer_client_pk_mismatch() -> DaemonResult<()> {
     let plaintext = OfferPlaintext {
         client_pk: client_pk_b,
         offer_sdp: offer_sdp.to_string(),
+        binding_mode: openhost_pkarr::BindingMode::Exporter,
     };
     let mut rng = OsRng;
     let offer = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();

@@ -100,11 +100,70 @@ impl CompressionTag {
 /// exceed this cap.
 const MAX_DECOMPRESSED_PLAINTEXT: usize = 64 * 1024;
 
-/// Domain separator embedded in the offer inner plaintext.
-pub const OFFER_INNER_DOMAIN: &[u8] = b"openhost-offer-inner1";
+/// Domain separator for the v1 offer inner plaintext body. Still
+/// accepted on decode for backwards compatibility; v1 bodies carry no
+/// explicit `binding_mode` byte and default to
+/// [`BindingMode::Exporter`]. New encoders emit v2 via
+/// [`OFFER_INNER_DOMAIN_V2`].
+pub const OFFER_INNER_DOMAIN_V1: &[u8] = b"openhost-offer-inner1";
+
+/// Alias for [`OFFER_INNER_DOMAIN_V1`]. Retained for downstream
+/// diagnostic tooling that referenced the pre-PR-28.3 constant name.
+pub const OFFER_INNER_DOMAIN: &[u8] = OFFER_INNER_DOMAIN_V1;
+
+/// Domain separator for the v2 offer inner plaintext body (PR #28.3+).
+/// v2 appends a 1-byte `binding_mode` field after the SDP so browsers
+/// can advertise cert-fingerprint binding (see [`BindingMode`]).
+pub const OFFER_INNER_DOMAIN_V2: &[u8] = b"openhost-offer-inner2";
 
 /// Domain separator embedded in the answer inner plaintext.
 pub const ANSWER_INNER_DOMAIN: &[u8] = b"openhost-answer-inner1";
+
+/// Channel-binding mode advertised by the client in an offer plaintext.
+///
+/// - [`Exporter`][BindingMode::Exporter]: RFC 5705 DTLS exporter bytes
+///   feed the channel-binding HMAC (the original CLI-to-CLI path).
+///   Spec reference: `spec/04-security.md §7.6` "exporter binding."
+/// - [`CertFp`][BindingMode::CertFp]: SHA-256 of the host's DTLS
+///   certificate DER substitutes for the exporter bytes. Required for
+///   browser clients — `RTCDtlsTransport` does not expose the RFC 5705
+///   exporter today. The cert fingerprint is pinned via Pkarr so an
+///   attacker who forges a matching fingerprint has already broken the
+///   host's Ed25519 identity key; the security delta vs. Exporter is
+///   therefore near-zero for openhost's threat model. See
+///   `spec/04-security.md §7.6` "cert-fingerprint binding."
+///
+/// Wire format: 1 byte. `0x01` = Exporter, `0x02` = CertFp, other
+/// values rejected on decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum BindingMode {
+    /// RFC 5705 DTLS exporter binding (CLI default).
+    Exporter = 0x01,
+    /// SHA-256-of-cert-DER binding (browser-mandatory).
+    CertFp = 0x02,
+}
+
+impl BindingMode {
+    /// Encode the mode as the single byte that lands on the wire.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse a wire byte into a `BindingMode`. Unknown bytes are a
+    /// hard decode error — the shim must refuse to speak an unknown
+    /// binding protocol.
+    pub fn try_from_u8(b: u8) -> Result<Self> {
+        match b {
+            0x01 => Ok(Self::Exporter),
+            0x02 => Ok(Self::CertFp),
+            _ => Err(PkarrError::MalformedCanonical(
+                "unknown offer binding_mode byte",
+            )),
+        }
+    }
+}
 
 /// Domain separator used when deriving the `_offer.` DNS label from the
 /// daemon's pubkey. Domain-separated from `allowlist_hash` so observers
@@ -298,6 +357,25 @@ pub struct OfferPlaintext {
     pub client_pk: PublicKey,
     /// SDP offer text (UTF-8).
     pub offer_sdp: String,
+    /// Channel-binding mode the client will use on the resulting data
+    /// channel. v1 offer bodies on the wire carry no binding_mode byte
+    /// and decode with [`BindingMode::Exporter`]; v2 bodies (PR #28.3+)
+    /// carry it explicitly.
+    pub binding_mode: BindingMode,
+}
+
+impl OfferPlaintext {
+    /// Convenience constructor matching the pre-PR-28.3 field set;
+    /// `binding_mode` defaults to [`BindingMode::Exporter`], preserving
+    /// the CLI-to-CLI semantics that predated browser support.
+    #[must_use]
+    pub fn new(client_pk: PublicKey, offer_sdp: String) -> Self {
+        Self {
+            client_pk,
+            offer_sdp,
+            binding_mode: BindingMode::Exporter,
+        }
+    }
 }
 
 /// One answer record the daemon has queued for publication. Each entry
@@ -792,30 +870,57 @@ fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String
 // Inner plaintext encode / decode
 // ============================================================================
 
-/// Shape of the v1 body: `domain || client_pk || sdp_len(u32be) || sdp`.
-/// No leading compression tag — that's added by
-/// [`encode_offer_plaintext`] / [`parse_offer_plaintext`] around the
-/// compression layer.
+/// Encode an offer body in the v2 shape (PR #28.3+).
+///
+/// Wire layout:
+///
+/// ```text
+/// domain(OFFER_INNER_DOMAIN_V2) || client_pk(32B) ||
+/// sdp_len(u32 BE) || sdp || binding_mode(u8)
+/// ```
+///
+/// Decoders MUST accept both v1 and v2 shapes (see
+/// [`parse_offer_body`]); encoders MUST emit v2 so every offer
+/// advertises its binding mode explicitly.
+///
+/// The surrounding [`encode_offer_plaintext`] wraps the body with a
+/// compression tag byte — this function only produces the body.
 fn encode_offer_body(p: &OfferPlaintext) -> Vec<u8> {
     let sdp = p.offer_sdp.as_bytes();
-    let mut out = Vec::with_capacity(OFFER_INNER_DOMAIN.len() + PUBLIC_KEY_LEN + 4 + sdp.len());
-    out.extend_from_slice(OFFER_INNER_DOMAIN);
+    let mut out =
+        Vec::with_capacity(OFFER_INNER_DOMAIN_V2.len() + PUBLIC_KEY_LEN + 4 + sdp.len() + 1);
+    out.extend_from_slice(OFFER_INNER_DOMAIN_V2);
     out.extend_from_slice(&p.client_pk.to_bytes());
     let len = u32::try_from(sdp.len())
         .expect("SDP length bounded well below u32::MAX by BEP44 1000-byte cap");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(sdp);
+    out.push(p.binding_mode.as_u8());
     out
 }
 
+/// Parse an offer body. Accepts v1 (`openhost-offer-inner1`, no
+/// binding_mode byte — defaults to [`BindingMode::Exporter`]) and v2
+/// (`openhost-offer-inner2`, trailing binding_mode byte required).
 fn parse_offer_body(body: &[u8]) -> Result<OfferPlaintext> {
-    let mut r = InnerCursor::new(body);
-    let domain = r.take(OFFER_INNER_DOMAIN.len())?;
-    if domain != OFFER_INNER_DOMAIN {
+    // Peek the domain to pick a parser.
+    if body.len() < OFFER_INNER_DOMAIN_V1.len() {
         return Err(PkarrError::MalformedCanonical(
-            "missing openhost-offer-inner1 domain separator",
+            "offer plaintext shorter than domain separator",
         ));
     }
+    let domain = &body[..OFFER_INNER_DOMAIN_V1.len()];
+    let is_v2 = domain == OFFER_INNER_DOMAIN_V2;
+    let is_v1 = domain == OFFER_INNER_DOMAIN_V1;
+    if !is_v1 && !is_v2 {
+        return Err(PkarrError::MalformedCanonical(
+            "unknown openhost-offer-inner domain separator",
+        ));
+    }
+
+    let mut r = InnerCursor::new(body);
+    // Consume the domain; we already validated it above.
+    let _domain = r.take(OFFER_INNER_DOMAIN_V1.len())?;
     let mut pk_bytes = [0u8; PUBLIC_KEY_LEN];
     pk_bytes.copy_from_slice(r.take(PUBLIC_KEY_LEN)?);
     let client_pk = PublicKey::from_bytes(&pk_bytes).map_err(PkarrError::Core)?;
@@ -824,6 +929,12 @@ fn parse_offer_body(body: &[u8]) -> Result<OfferPlaintext> {
     let offer_sdp = core::str::from_utf8(sdp_bytes)
         .map_err(|_| PkarrError::MalformedCanonical("offer SDP is not valid UTF-8"))?
         .to_string();
+    let binding_mode = if is_v2 {
+        let b = r.u8()?;
+        BindingMode::try_from_u8(b)?
+    } else {
+        BindingMode::Exporter
+    };
     if !r.is_empty() {
         return Err(PkarrError::MalformedCanonical(
             "trailing bytes after offer plaintext",
@@ -832,6 +943,7 @@ fn parse_offer_body(body: &[u8]) -> Result<OfferPlaintext> {
     Ok(OfferPlaintext {
         client_pk,
         offer_sdp,
+        binding_mode,
     })
 }
 
@@ -1095,6 +1207,7 @@ mod tests {
         let p = OfferPlaintext {
             client_pk,
             offer_sdp: SAMPLE_OFFER_SDP.to_string(),
+            binding_mode: BindingMode::Exporter,
         };
         let enc = encode_offer_plaintext(&p);
         let dec = parse_offer_plaintext(&enc).unwrap();
@@ -1106,6 +1219,7 @@ mod tests {
         let p = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: "v=0".to_string(),
+            binding_mode: BindingMode::Exporter,
         };
         let mut enc = encode_offer_plaintext(&p);
         enc[0] = 0xFF;
@@ -1123,6 +1237,7 @@ mod tests {
         let p = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: "v=0".to_string(),
+            binding_mode: BindingMode::Exporter,
         };
         let enc = encode_offer_plaintext(&p);
         assert!(matches!(
@@ -1131,21 +1246,96 @@ mod tests {
         ));
     }
 
-    /// Hand-craft a v1 (uncompressed) offer plaintext and confirm the
-    /// new v2 decoder accepts it. Locks the legacy wire layout against
+    /// Hand-craft a legacy v1 *body* (the pre-PR-28.3 shape: v1 domain
+    /// separator, no trailing `binding_mode` byte) wrapped in the
+    /// Uncompressed compression tag, and confirm the new v2-aware
+    /// decoder accepts it with `binding_mode = Exporter` as the
+    /// documented default. Locks the legacy wire layout against
     /// accidental encoder breakage.
     #[test]
-    fn offer_plaintext_accepts_v1_uncompressed_for_backcompat() {
-        let p = OfferPlaintext {
-            client_pk: client_sk().public_key(),
-            offer_sdp: SAMPLE_OFFER_SDP.to_string(),
-        };
-        let body = encode_offer_body(&p);
-        let mut v1 = Vec::with_capacity(1 + body.len());
-        v1.push(0x01);
-        v1.extend_from_slice(&body);
-        let dec = parse_offer_plaintext(&v1).unwrap();
-        assert_eq!(dec, p);
+    fn offer_plaintext_accepts_v1_uncompressed_body_for_backcompat() {
+        let client_pk = client_sk().public_key();
+        let sdp = SAMPLE_OFFER_SDP.as_bytes();
+        // Handroll the v1 body verbatim — do NOT route through
+        // encode_offer_body, which now emits v2.
+        let mut body =
+            Vec::with_capacity(OFFER_INNER_DOMAIN_V1.len() + PUBLIC_KEY_LEN + 4 + sdp.len());
+        body.extend_from_slice(OFFER_INNER_DOMAIN_V1);
+        body.extend_from_slice(&client_pk.to_bytes());
+        body.extend_from_slice(&u32::try_from(sdp.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(sdp);
+
+        let mut wrapped = Vec::with_capacity(1 + body.len());
+        wrapped.push(CompressionTag::Uncompressed as u8);
+        wrapped.extend_from_slice(&body);
+
+        let dec = parse_offer_plaintext(&wrapped).unwrap();
+        assert_eq!(dec.client_pk, client_pk);
+        assert_eq!(dec.offer_sdp, SAMPLE_OFFER_SDP);
+        assert_eq!(
+            dec.binding_mode,
+            BindingMode::Exporter,
+            "v1 bodies must default to Exporter binding",
+        );
+    }
+
+    /// v2 bodies MUST round-trip both binding modes byte-for-byte.
+    #[test]
+    fn offer_plaintext_v2_roundtrips_both_binding_modes() {
+        for mode in [BindingMode::Exporter, BindingMode::CertFp] {
+            let p = OfferPlaintext {
+                client_pk: client_sk().public_key(),
+                offer_sdp: SAMPLE_OFFER_SDP.to_string(),
+                binding_mode: mode,
+            };
+            let enc = encode_offer_plaintext(&p);
+            let dec = parse_offer_plaintext(&enc).unwrap();
+            assert_eq!(dec, p, "roundtrip failed for {mode:?}");
+        }
+    }
+
+    /// A v2 body with a garbage binding_mode byte must be rejected as
+    /// malformed — we never silently downgrade to a default mode when
+    /// the explicit byte is present but unknown.
+    #[test]
+    fn offer_plaintext_v2_rejects_unknown_binding_mode_byte() {
+        let client_pk = client_sk().public_key();
+        let sdp = SAMPLE_OFFER_SDP.as_bytes();
+        let mut body =
+            Vec::with_capacity(OFFER_INNER_DOMAIN_V2.len() + PUBLIC_KEY_LEN + 4 + sdp.len() + 1);
+        body.extend_from_slice(OFFER_INNER_DOMAIN_V2);
+        body.extend_from_slice(&client_pk.to_bytes());
+        body.extend_from_slice(&u32::try_from(sdp.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(sdp);
+        body.push(0xFF); // garbage binding_mode
+
+        let mut wrapped = Vec::with_capacity(1 + body.len());
+        wrapped.push(CompressionTag::Uncompressed as u8);
+        wrapped.extend_from_slice(&body);
+
+        assert!(matches!(
+            parse_offer_plaintext(&wrapped),
+            Err(PkarrError::MalformedCanonical(
+                "unknown offer binding_mode byte"
+            )),
+        ));
+    }
+
+    #[test]
+    fn binding_mode_try_from_rejects_unknown_bytes() {
+        assert!(matches!(
+            BindingMode::try_from_u8(0x00),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+        assert!(matches!(
+            BindingMode::try_from_u8(0xFF),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+        assert_eq!(
+            BindingMode::try_from_u8(0x01).unwrap(),
+            BindingMode::Exporter
+        );
+        assert_eq!(BindingMode::try_from_u8(0x02).unwrap(), BindingMode::CertFp);
     }
 
     /// Zlib compression MUST strictly shrink a realistic-sized SDP
@@ -1164,6 +1354,7 @@ mod tests {
         let p = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: sdp.clone(),
+            binding_mode: BindingMode::Exporter,
         };
         let v1_body = encode_offer_body(&p);
         let v1_total = 1 + v1_body.len();
@@ -1200,6 +1391,7 @@ mod tests {
         let p = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: String::new(),
+            binding_mode: BindingMode::Exporter,
         };
         let enc = encode_offer_plaintext(&p);
         let dec = parse_offer_plaintext(&enc).unwrap();
@@ -1244,6 +1436,7 @@ mod tests {
         let plaintext = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: SAMPLE_OFFER_SDP.to_string(),
+            binding_mode: BindingMode::Exporter,
         };
         let mut rng = deterministic_rng();
         let record = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();
@@ -1257,6 +1450,7 @@ mod tests {
         let plaintext = OfferPlaintext {
             client_pk: client_sk().public_key(),
             offer_sdp: SAMPLE_OFFER_SDP.to_string(),
+            binding_mode: BindingMode::Exporter,
         };
         let mut rng = deterministic_rng();
         let record = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();
@@ -1702,6 +1896,7 @@ mod tests {
         let plaintext = OfferPlaintext {
             client_pk: client_sk.public_key(),
             offer_sdp: SAMPLE_OFFER_SDP.to_string(),
+            binding_mode: BindingMode::Exporter,
         };
         let mut rng = deterministic_rng();
         let offer = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();

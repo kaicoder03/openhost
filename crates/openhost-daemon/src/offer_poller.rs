@@ -54,6 +54,11 @@ pub struct OfferPollerConfig {
     /// Token-bucket refill rate in tokens per second (= 1.0 /
     /// `rate_limit_refill_secs` in the config).
     pub rate_limit_refill_per_sec: f64,
+    /// Channel-binding modes the daemon accepts on incoming offers.
+    /// Offers whose `binding_mode` is absent from this list are
+    /// dropped pre-handshake with a `warn!`. Mirrors
+    /// `[dtls] allowed_binding_modes` from the config file.
+    pub allowed_binding_modes: Vec<openhost_pkarr::BindingMode>,
 }
 
 impl Default for OfferPollerConfig {
@@ -65,6 +70,10 @@ impl Default for OfferPollerConfig {
             enforce_allowlist: true,
             rate_limit_burst: 3,
             rate_limit_refill_per_sec: 1.0 / 5.0,
+            allowed_binding_modes: vec![
+                openhost_pkarr::BindingMode::Exporter,
+                openhost_pkarr::BindingMode::CertFp,
+            ],
         }
     }
 }
@@ -351,6 +360,20 @@ async fn process_client_packet(
         return;
     }
 
+    // PR #28.3 binding-mode gate: drop offers whose advertised mode is
+    // not on the operator's allowlist (e.g. a CLI-only deployment that
+    // explicitly excludes browser cert_fp offers).
+    if !cfg.allowed_binding_modes.contains(&plaintext.binding_mode) {
+        tracing::warn!(
+            client = %client_pk,
+            binding_mode = ?plaintext.binding_mode,
+            "offer poll: binding mode not in [dtls] allowed_binding_modes; skipping",
+        );
+        entry.last_ts = packet_ts_secs;
+        entry.last_processed = Some(now_instant);
+        return;
+    }
+
     // PR #7b rate-limit gate: consume a token. On empty bucket, skip.
     if !entry.bucket.try_consume(now_instant) {
         tracing::warn!(
@@ -366,7 +389,10 @@ async fn process_client_packet(
 
     // Run the handshake. `handle_offer` drains ICE and returns the
     // answer SDP.
-    let answer_sdp = match listener.handle_offer(&plaintext.offer_sdp).await {
+    let answer_sdp = match listener
+        .handle_offer(&plaintext.offer_sdp, plaintext.binding_mode)
+        .await
+    {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(?err, client = %client_pk, "offer poll: handle_offer failed");

@@ -36,7 +36,10 @@ async fn offer_with_passive_setup_role_is_rejected_before_any_pc_is_built() -> D
                    m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
                    c=IN IP4 0.0.0.0\r\na=setup:passive\r\n";
 
-    let err = app.handle_offer(bad_sdp).await.unwrap_err();
+    let err = app
+        .handle_offer(bad_sdp, openhost_pkarr::BindingMode::Exporter)
+        .await
+        .unwrap_err();
     assert!(matches!(
         err,
         DaemonError::Listener(ListenerError::SetupRoleMismatch { ref found }) if found == "passive"
@@ -51,7 +54,10 @@ async fn offer_missing_setup_line_is_rejected() -> DaemonResult<()> {
     let cfg = test_config_noforward(&tmp);
     let (_tmp, app) = build_noop_daemon_with_config(cfg).await;
     let bad_sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
-    let err = app.handle_offer(bad_sdp).await.unwrap_err();
+    let err = app
+        .handle_offer(bad_sdp, openhost_pkarr::BindingMode::Exporter)
+        .await
+        .unwrap_err();
     assert!(matches!(
         err,
         DaemonError::Listener(ListenerError::OfferParse(_))

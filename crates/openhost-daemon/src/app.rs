@@ -193,11 +193,17 @@ impl App {
     }
 
     /// Convenience: hand `offer_sdp` to the listener and return the
-    /// answer SDP. Mirrors what the offer-record poller will call in
-    /// PR #7.
-    pub async fn handle_offer(&self, offer_sdp: &str) -> Result<String> {
+    /// answer SDP. `binding_mode` is the channel-binding variant the
+    /// client advertised in its offer plaintext — the offer poller
+    /// threads it in, direct callers (tests, examples) default to
+    /// [`openhost_pkarr::BindingMode::Exporter`].
+    pub async fn handle_offer(
+        &self,
+        offer_sdp: &str,
+        binding_mode: openhost_pkarr::BindingMode,
+    ) -> Result<String> {
         self.listener
-            .handle_offer(offer_sdp)
+            .handle_offer(offer_sdp, binding_mode)
             .await
             .map_err(Into::into)
     }
@@ -414,6 +420,13 @@ fn build_offer_poller(
             enforce_allowlist: cfg_poll.enforce_allowlist,
             rate_limit_burst: cfg_poll.rate_limit_burst,
             rate_limit_refill_per_sec: 1.0 / cfg_poll.rate_limit_refill_secs,
+            allowed_binding_modes: cfg
+                .dtls
+                .allowed_binding_modes
+                .iter()
+                .copied()
+                .map(openhost_pkarr::BindingMode::from)
+                .collect(),
         },
     ))
 }

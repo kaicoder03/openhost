@@ -1,9 +1,13 @@
 {
   "manifest_version": 3,
   "name": "openhost",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Your home server. Reachable. Nothing else in between. Resolve oh://<pubkey>/ URLs over end-to-end encrypted WebRTC.",
-  "permissions": [],
+  "permissions": [
+    "webNavigation",
+    "tabs",
+    "storage"
+  ],
   "host_permissions": [
     "https://relay.pkarr.org/*",
     "https://pkarr.pubky.app/*",
@@ -16,6 +20,12 @@
   "action": {
     "default_title": "openhost"
   },
+  "web_accessible_resources": [
+    {
+      "resources": ["viewer.html", "src/*", "wasm/pkg/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   }
