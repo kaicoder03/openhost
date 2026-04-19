@@ -49,6 +49,10 @@ pub use codec::{
     decode, packet_public_key, BEP44_MAX_V_BYTES, MICROS_PER_SECOND, OPENHOST_TXT_NAME,
     OPENHOST_TXT_TTL,
 };
+// Re-export the pkarr types callers need to invoke `decode` + the
+// offer/answer decoders. Saves downstream crates (notably
+// `openhost-pkarr-wasm`) from having to pin `pkarr` as a direct dep
+// just to name the `SignedPacket` parameter type.
 pub use error::{PkarrError, Result};
 pub use offer::{
     answer_txt_chunk_name, answer_txt_name, client_hash_label, decode_answer_fragments_from_packet,
@@ -57,6 +61,7 @@ pub use offer::{
     CLIENT_HASH_LEN, HOST_HASH_LEN, MAX_FRAGMENT_PAYLOAD_BYTES, MAX_FRAGMENT_TOTAL,
     OFFER_SDP_HASH_LEN, OFFER_TXT_PREFIX, OFFER_TXT_TTL,
 };
+pub use pkarr::SignedPacket;
 #[cfg(feature = "full")]
 pub use publisher::{
     AnswerSource, InitialPublishOutcome, PkarrTransport, Publisher, PublisherHandle, RecordSource,

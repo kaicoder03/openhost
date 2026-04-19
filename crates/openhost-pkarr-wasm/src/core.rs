@@ -8,7 +8,7 @@
 
 use openhost_core::identity::PublicKey;
 use openhost_core::pkarr_record::{SignedRecord, SALT_LEN};
-use pkarr::SignedPacket;
+use openhost_pkarr::SignedPacket;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -33,6 +33,11 @@ pub enum Error {
     /// `_openhost` TXT record, base64 decode error, etc.).
     #[error("decode failed: {0}")]
     Pkarr(#[from] openhost_pkarr::PkarrError),
+    /// `decode_and_verify` ran but the inner Ed25519 signature was
+    /// invalid, the record was outside its freshness window, or a
+    /// structural invariant failed.
+    #[error("record verify failed: {0}")]
+    VerifyFailed(String),
 }
 
 /// Result alias over [`Error`].
@@ -59,8 +64,10 @@ pub struct HostRecord {
     pub salt_hex: String,
     /// UTF-8 discovery hints.
     pub disc: String,
-    /// 64-byte Ed25519 signature, hex. Use [`crate::verify_record`] to
-    /// actually validate it.
+    /// 64-byte Ed25519 signature, hex. Already validated against
+    /// `pubkey_zbase32` when this value came from
+    /// [`decode_and_verify`]; advisory only when it came from
+    /// [`parse_host_record`].
     pub signature_hex: String,
 }
 
@@ -119,13 +126,12 @@ fn host_record_dto(pubkey_zbase32: &str, signed: &SignedRecord) -> HostRecord {
     }
 }
 
-/// Decode a pkarr packet into its `_openhost` main record. See the
-/// wasm-bindgen wrapper at crate root for API documentation.
-pub fn decode_host_record(
-    packet_bytes: &[u8],
-    pubkey_zbase32: &str,
-    _now_ts: u64,
-) -> Result<HostRecord> {
+/// Structurally parse a pkarr packet into its `_openhost` main
+/// record. Does **not** verify the inner Ed25519 signature or the
+/// freshness window — callers that need either should call
+/// [`decode_and_verify`] instead. See the wasm-bindgen wrapper at
+/// crate root for API documentation.
+pub fn parse_host_record(packet_bytes: &[u8], pubkey_zbase32: &str) -> Result<HostRecord> {
     // Validate the pubkey up-front — a garbage pubkey here is the
     // easiest bug to diagnose, so surface it before spending cycles
     // on packet deserialization.
@@ -135,13 +141,26 @@ pub fn decode_host_record(
     Ok(host_record_dto(pubkey_zbase32, &signed))
 }
 
-/// Verify the inner Ed25519 signature + 2-hour freshness window. See
-/// the wasm-bindgen wrapper at crate root for API documentation.
-pub fn verify_record(packet_bytes: &[u8], pubkey_zbase32: &str, now_ts: u64) -> Result<bool> {
+/// Parse a pkarr packet AND verify the inner Ed25519 signature plus
+/// 2-hour freshness window against `now_ts`. Folds `parse_host_record`
+/// plus `SignedRecord::verify` into a single pass so the browser
+/// doesn't pay the `SignedPacket::deserialize` cost twice.
+///
+/// Returns `Err(VerifyFailed)` when decode succeeds but verification
+/// fails — JS can handle that path as "substrate lied to us; try
+/// another relay" distinctly from a structural parse failure.
+pub fn decode_and_verify(
+    packet_bytes: &[u8],
+    pubkey_zbase32: &str,
+    now_ts: u64,
+) -> Result<HostRecord> {
     let pubkey = parse_pubkey(pubkey_zbase32)?;
     let packet = parse_packet(packet_bytes)?;
     let signed = openhost_pkarr::decode(&packet)?;
-    Ok(signed.verify(&pubkey, now_ts).is_ok())
+    signed
+        .verify(&pubkey, now_ts)
+        .map_err(|e| Error::VerifyFailed(e.to_string()))?;
+    Ok(host_record_dto(pubkey_zbase32, &signed))
 }
 
 /// Look up the sealed offer record (if any) inside a daemon's pkarr

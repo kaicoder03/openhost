@@ -19,8 +19,8 @@ console.log(
 // ---------------------------------------------------------------------------
 // PR #28.2 resolver probe — dev-only.
 //
-// To exercise the four wasm-bindgen exports (decode_host_record,
-// verify_record, decode_offer, decode_answer_fragments):
+// To exercise the four wasm-bindgen exports (parse_host_record,
+// decode_and_verify, decode_offer, decode_answer_fragments):
 //
 //   1. Build the WASM pkg:  `./extension/scripts/build-wasm.sh`
 //   2. Uncomment the lines below; replace <pubkey> with a 52-char

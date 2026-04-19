@@ -43,7 +43,14 @@ flate2 = "1"
 rand = { version = "0.8", features = ["std_rng"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
-# Protocol integrations (used by openhost-pkarr / -daemon at M2/M3)
+# Protocol integrations (used by openhost-pkarr / -daemon at M2/M3).
+# `default-features = false` (PR #28.2) because the WASM-targeted
+# `openhost-pkarr-wasm` shim needs only `signed_packet + keys` (sync
+# types, no tokio/reqwest), while the daemon + CLI still want the
+# full `full-client` set — each consumer opts into the features it
+# needs. If you add a new workspace member that uses `pkarr =
+# { workspace = true }`, you MUST specify features explicitly or
+# nothing will link at runtime.
 pkarr = { version = "5", default-features = false }
 mainline = "6"
 webrtc = { version = "0.17", features = ["pem"] }

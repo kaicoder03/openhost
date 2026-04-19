@@ -38,14 +38,14 @@ fn now_ts() -> u64 {
 }
 
 #[test]
-fn decode_host_record_returns_fields_matching_the_source() {
+fn parse_host_record_returns_fields_matching_the_source() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
     let bytes = packet.serialize();
 
     let pk_z = sk.public_key().to_zbase32();
-    let dto = core::decode_host_record(&bytes, &pk_z, ts).expect("decode succeeds");
+    let dto = core::parse_host_record(&bytes, &pk_z).expect("decode succeeds");
 
     assert_eq!(dto.pubkey_zbase32, pk_z);
     assert_eq!(dto.version, PROTOCOL_VERSION);
@@ -58,13 +58,13 @@ fn decode_host_record_returns_fields_matching_the_source() {
 }
 
 #[test]
-fn decode_host_record_rejects_invalid_pubkey() {
+fn parse_host_record_rejects_invalid_pubkey() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
     let bytes = packet.serialize();
 
-    let err = core::decode_host_record(&bytes, "not-a-real-pubkey", ts).expect_err("must reject");
+    let err = core::parse_host_record(&bytes, "not-a-real-pubkey").expect_err("must reject");
     let s = err.to_string();
     assert!(
         s.contains("zbase32"),
@@ -73,23 +73,55 @@ fn decode_host_record_rejects_invalid_pubkey() {
 }
 
 #[test]
-fn verify_record_accepts_good_signature_rejects_tampered() {
+fn decode_and_verify_accepts_good_signature() {
     let ts = now_ts();
     let (sk, signed) = sample_signed_record(ts);
     let packet = encode(&signed, &sk).unwrap();
     let bytes = packet.serialize();
 
     let pk_z = sk.public_key().to_zbase32();
-    let ok = core::verify_record(&bytes, &pk_z, ts).expect("verify runs");
-    assert!(ok, "good packet must verify");
+    let dto = core::decode_and_verify(&bytes, &pk_z, ts).expect("verify succeeds");
+    assert_eq!(dto.ts, ts);
+    assert_eq!(dto.version, PROTOCOL_VERSION);
+}
+
+#[test]
+fn decode_and_verify_rejects_wrong_pubkey_with_verify_failed() {
+    let ts = now_ts();
+    let (sk, signed) = sample_signed_record(ts);
+    let packet = encode(&signed, &sk).unwrap();
+    let bytes = packet.serialize();
 
     // Verify against a *different* pubkey — the inner Ed25519 sig is
-    // over canonical bytes signed by `sk`, so verification against
-    // anyone else's pubkey must fail.
+    // over canonical bytes signed by `sk`, so the verify path must
+    // surface `VerifyFailed` (not a parse error).
     let other_sk = SigningKey::from_bytes(&CLIENT_SEED);
     let wrong_pk_z = other_sk.public_key().to_zbase32();
-    let bad = core::verify_record(&bytes, &wrong_pk_z, ts).expect("verify runs for wrong pk");
-    assert!(!bad, "wrong-pubkey verify must return false");
+    let err = core::decode_and_verify(&bytes, &wrong_pk_z, ts)
+        .expect_err("mismatched pubkey must fail verify");
+    assert!(
+        matches!(err, core::Error::VerifyFailed(_)),
+        "expected VerifyFailed, got {err:?}",
+    );
+}
+
+#[test]
+fn decode_and_verify_rejects_stale_record_with_verify_failed() {
+    let ts = now_ts();
+    let (sk, signed) = sample_signed_record(ts);
+    let packet = encode(&signed, &sk).unwrap();
+    let bytes = packet.serialize();
+
+    let pk_z = sk.public_key().to_zbase32();
+    // 3-hour skew pushes the record outside the spec's 2-hour
+    // freshness window.
+    let stale_now = ts + 3 * 3600;
+    let err = core::decode_and_verify(&bytes, &pk_z, stale_now)
+        .expect_err("stale record must fail verify");
+    assert!(
+        matches!(err, core::Error::VerifyFailed(_)),
+        "expected VerifyFailed for stale record, got {err:?}",
+    );
 }
 
 #[test]
@@ -142,7 +174,14 @@ fn decode_answer_fragments_reassembles_published_fragments() {
 
     let client_pk_z = client_pk.to_zbase32();
     let out = core::decode_answer_fragments(&bytes, &salt, &client_pk_z).expect("runs");
-    let dto = out.expect("fragments present");
+    let dto = out.unwrap_or_else(|| {
+        panic!(
+            "fragment set for client pubkey {client_pk_z} was absent on the wire; \
+             if this is repeatable, the encoder likely evicted the answer because \
+             the BEP44 1000-byte cap was exceeded. Check the test's synthetic \
+             answer SDP length."
+        )
+    });
     assert_eq!(dto.client_hash_hex, expected_hash_hex);
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;

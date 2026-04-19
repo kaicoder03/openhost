@@ -31,13 +31,16 @@
 //!
 //! # Exports
 //!
-//! - [`decode_host_record`] — parse + shape-check the main `_openhost`
-//!   record. Does NOT verify the signature; callers get the raw
-//!   decoded fields back and can present them to the user before
-//!   paying the crypto-verify cost.
-//! - [`verify_record`] — deterministic Ed25519 verify. Returns `true`
-//!   on a good signature + fresh `ts`, `false` otherwise. Separated
-//!   from decode so JS can stage the two without re-parsing.
+//! - [`parse_host_record`] — structurally decode the main `_openhost`
+//!   record from packet bytes. **Does not verify the signature** —
+//!   used when JS wants to render a preview ("we found a pkarr record
+//!   for this pubkey, here's what it claims") before paying the
+//!   crypto-verify cost.
+//! - [`decode_and_verify`] — combined decode + Ed25519-verify +
+//!   2-hour-freshness pass. This is the recommended export for any
+//!   JS caller that's going to trust the returned record. Folds
+//!   `parse_host_record` + `SignedRecord::verify` into a single
+//!   parse so the browser doesn't deserialize the packet twice.
 //! - [`decode_offer`] — pull a sealed offer record out of a daemon's
 //!   packet (used by the dialer's offer-poll loop).
 //! - [`decode_answer_fragments`] — reassemble + return the fragmented
@@ -55,55 +58,60 @@ fn to_js<T: Serialize + ?Sized>(value: &T) -> Result<JsValue, JsError> {
         .map_err(|e| JsError::new(&format!("JS serialization failed: {e}")))
 }
 
-/// Decode a pkarr packet into its `_openhost` main record.
+fn to_js_err<E: std::fmt::Display>(e: &E) -> JsError {
+    JsError::new(&e.to_string())
+}
+
+/// Structurally decode a pkarr packet into its `_openhost` main
+/// record.
 ///
 /// `packet_bytes` — raw bytes returned by a relay (the HTTP response
 /// body from `GET /<zbase32-pubkey>` against a public Pkarr relay).
 /// `pubkey_zbase32` — the zbase32 form of the host's Ed25519 pubkey
 /// the caller asked about. Returned back on the record for
-/// convenience. `now_ts` — caller's current Unix timestamp (seconds).
-/// Not used for verification here (see [`verify_record`]); exposed on
-/// the signature so future shape checks can be folded in.
+/// convenience.
 ///
-/// Returns a JS object matching [`core::HostRecord`].
+/// **Does not verify the signature or freshness.** Use
+/// [`decode_and_verify`] whenever the returned record will be trusted
+/// to pick a connection endpoint. Returns a JS object matching
+/// [`core::HostRecord`].
 #[wasm_bindgen]
-pub fn decode_host_record(
-    packet_bytes: &[u8],
-    pubkey_zbase32: &str,
-    _now_ts: u64,
-) -> Result<JsValue, JsError> {
-    let out = core::decode_host_record(packet_bytes, pubkey_zbase32, _now_ts)
-        .map_err(|e| JsError::new(&format!("{e}")))?;
+pub fn parse_host_record(packet_bytes: &[u8], pubkey_zbase32: &str) -> Result<JsValue, JsError> {
+    let out = core::parse_host_record(packet_bytes, pubkey_zbase32).map_err(|e| to_js_err(&e))?;
     to_js(&out)
 }
 
-/// Verify the inner Ed25519 signature + 2-hour freshness window on a
-/// pkarr packet's `_openhost` record.
+/// Decode + verify a pkarr packet in one pass.
 ///
-/// Returns `true` when the record is structurally valid, its `ts` is
-/// within the freshness window around `now_ts`, and the signature
-/// over the canonical bytes verifies against `pubkey_zbase32`.
-/// Returns `false` when decode succeeds but verification fails — JS
-/// can treat `false` as "retry another relay" without special error
-/// handling. Structural/parse errors surface as `JsError`.
+/// Runs the same decode as [`parse_host_record`], then the Ed25519
+/// signature check + 2-hour freshness window. Returns the decoded
+/// record on success. On failure, the returned `JsError` message
+/// distinguishes structural-parse failures (malformed TXT, base64
+/// error) from verification failures ("record verify failed: ...") so
+/// JS can branch on the message prefix today; a structured error
+/// union is planned for PR #28.3.
+///
+/// `now_ts` is the caller's current Unix timestamp (seconds). Use
+/// `Math.floor(Date.now() / 1000)` on the JS side; the shim enforces
+/// the spec's 2-hour window around this value.
 #[wasm_bindgen]
-pub fn verify_record(
+pub fn decode_and_verify(
     packet_bytes: &[u8],
     pubkey_zbase32: &str,
     now_ts: u64,
-) -> Result<bool, JsError> {
-    core::verify_record(packet_bytes, pubkey_zbase32, now_ts)
-        .map_err(|e| JsError::new(&format!("{e}")))
+) -> Result<JsValue, JsError> {
+    let out =
+        core::decode_and_verify(packet_bytes, pubkey_zbase32, now_ts).map_err(|e| to_js_err(&e))?;
+    to_js(&out)
 }
 
 /// Look up the sealed offer record (if any) inside a daemon's pkarr
-/// packet. Returns `Ok(None)` when the packet carries no offer TXT
+/// packet. Returns `Ok(null)` when the packet carries no offer TXT
 /// for this daemon — the routine "no new offer yet" case for dialer
 /// poll loops.
 #[wasm_bindgen]
 pub fn decode_offer(packet_bytes: &[u8], daemon_pk_zbase32: &str) -> Result<JsValue, JsError> {
-    let out = core::decode_offer(packet_bytes, daemon_pk_zbase32)
-        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let out = core::decode_offer(packet_bytes, daemon_pk_zbase32).map_err(|e| to_js_err(&e))?;
     to_js(&out)
 }
 
@@ -114,7 +122,7 @@ pub fn decode_offer(packet_bytes: &[u8], daemon_pk_zbase32: &str) -> Result<JsVa
 /// function does NOT unseal — it returns the raw sealed ciphertext
 /// (concatenated across fragments) so the caller can run sealed-box
 /// open with the client's X25519 private key, which the WASM
-/// extension is not trusted to see. Returns `Ok(None)` when no
+/// extension is not trusted to see. Returns `Ok(null)` when no
 /// fragment set for this client is present.
 #[wasm_bindgen]
 pub fn decode_answer_fragments(
@@ -123,6 +131,6 @@ pub fn decode_answer_fragments(
     client_pk_zbase32: &str,
 ) -> Result<JsValue, JsError> {
     let out = core::decode_answer_fragments(packet_bytes, daemon_salt, client_pk_zbase32)
-        .map_err(|e| JsError::new(&format!("{e}")))?;
+        .map_err(|e| to_js_err(&e))?;
     to_js(&out)
 }

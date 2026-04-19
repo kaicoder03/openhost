@@ -95,7 +95,9 @@ the only piece that the WASM doesn't own.
 - **PR #28.2 ✅.** WASM build of
   [`openhost-pkarr`](../crates/openhost-pkarr/)'s resolver read path.
   Lives in the new `openhost-pkarr-wasm` crate; four `#[wasm_bindgen]`
-  exports — `decode_host_record`, `verify_record`, `decode_offer`,
+  exports — `parse_host_record` (unverified structural decode),
+  `decode_and_verify` (combined decode + Ed25519 verify +
+  freshness-window check), `decode_offer`, and
   `decode_answer_fragments` — cover the complete substrate decode
   surface that PR #28.3's Dialer will need. JS does the HTTP `fetch`
   against a public Pkarr relay; WASM owns only the sync parse +

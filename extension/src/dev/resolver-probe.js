@@ -11,8 +11,8 @@
 // for a nonexistent pubkey is the routine "no record here" case.
 
 import init, {
-  decode_host_record,
-  verify_record,
+  parse_host_record,
+  decode_and_verify,
   decode_offer,
   decode_answer_fragments,
 } from "../../wasm/pkg/openhost_pkarr.js";
@@ -41,7 +41,7 @@ export async function runResolverProbe(pubkeyZbase32, opts = {}) {
   await init();
 
   const relays = opts.relays ?? DEFAULT_RELAYS;
-  const nowTs = Math.floor(Date.now() / 1000);
+  const nowTs = BigInt(Math.floor(Date.now() / 1000));
 
   console.log("[probe] relays:", relays);
   console.log("[probe] pubkey:", pubkeyZbase32);
@@ -68,17 +68,21 @@ export async function runResolverProbe(pubkeyZbase32, opts = {}) {
   }
 
   try {
-    const record = decode_host_record(bytes, pubkeyZbase32, nowTs);
-    console.log("[probe] decode_host_record:", record);
+    const record = parse_host_record(bytes, pubkeyZbase32);
+    console.log("[probe] parse_host_record (unverified):", record);
   } catch (e) {
-    console.error("[probe] decode_host_record threw:", e);
+    console.error("[probe] parse_host_record threw:", e);
   }
 
   try {
-    const verified = verify_record(bytes, pubkeyZbase32, nowTs);
-    console.log(`[probe] verify_record: ${verified}`);
+    const verified = decode_and_verify(bytes, pubkeyZbase32, nowTs);
+    console.log("[probe] decode_and_verify (trusted):", verified);
   } catch (e) {
-    console.error("[probe] verify_record threw:", e);
+    // A verify failure (wrong pubkey / stale record / bad sig) lands
+    // here as a JsError whose message starts with "record verify
+    // failed:"; JS can branch on that prefix today pending a
+    // structured error union in PR #28.3.
+    console.warn("[probe] decode_and_verify rejected:", e.message ?? e);
   }
 
   try {
