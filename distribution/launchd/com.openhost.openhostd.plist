@@ -19,9 +19,10 @@
   <string>com.openhost.openhostd</string>
 
   <!-- Restart on boot (or at login for a user agent) and whenever the
-       daemon exits. KeepAlive's default value re-runs on any exit;
-       the ExitType variant below limits that to non-clean exits so
-       a manual `launchctl unload` doesn't get fought back. -->
+       daemon exits uncleanly. KeepAlive's dict form restricts the
+       restart to crash and network-state conditions — a manual
+       `launchctl unload` does not get fought back, and the daemon
+       doesn't respawn uselessly when no network is up. -->
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -29,6 +30,8 @@
     <key>SuccessfulExit</key>
     <false/>
     <key>Crashed</key>
+    <true/>
+    <key>NetworkState</key>
     <true/>
   </dict>
 
@@ -77,18 +80,5 @@
        hammer public Pkarr relays. -->
   <key>ThrottleInterval</key>
   <integer>10</integer>
-
-  <!-- Network prerequisites: wait until at least one interface has
-       an IPv4/IPv6 route before starting the daemon. Avoids noisy
-       initial-publish warnings during boot. -->
-  <key>KeepAlive</key>
-  <dict>
-    <key>NetworkState</key>
-    <true/>
-    <key>SuccessfulExit</key>
-    <false/>
-    <key>Crashed</key>
-    <true/>
-  </dict>
 </dict>
 </plist>

@@ -160,14 +160,20 @@ jobs:
           tag="${{ steps.tag.outputs.tag }}"
           version="${tag#v}"
           # Slice out the section between `## [X.Y.Z]` and the next
-          # `## [` header. Drop the trailing header line.
-          awk -v v="[$version]" '
-            $0 ~ "^## "v {flag=1; print; next}
-            flag && $0 ~ "^## \\[" {exit}
-            flag {print}
+          # `## [` header. Uses literal-prefix comparison (index with
+          # offset 1) rather than regex — `[` in awk's `~` operator
+          # is a character class, not a literal, which silently
+          # emptied the output on every release.
+          awk -v hdr="## [$version]" '
+            index($0, hdr) == 1 && !flag { flag = 1; print; next }
+            flag && index($0, "## [") == 1 { exit }
+            flag { print }
           ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "WARN: no CHANGELOG section matched '## [$version]' — release body will be empty" >&2
+          fi
           echo "--- release-notes.md:"
-          cat release-notes.md
+          cat release-notes.md || true
 
       - name: Publish or update release
         uses: softprops/action-gh-release@v2
