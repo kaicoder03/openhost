@@ -235,6 +235,13 @@ impl WebSocketConfig {
     /// Whether `request_path` is allowed to upgrade to WebSocket.
     /// `request_path` may include a query string (`?…`); only the path
     /// component is matched.
+    ///
+    /// Matching is strict byte equality after query-string stripping:
+    /// `/foo` and `/foo/` are distinct entries. WebSocket endpoints
+    /// conventionally have no trailing slash, so operators list them
+    /// in canonical form. If a future upstream requires prefix or
+    /// glob matching, this is the place to add it — no wire-format
+    /// implications.
     #[must_use]
     pub fn is_allowed(&self, request_path: &str) -> bool {
         let path = request_path.split('?').next().unwrap_or(request_path);
