@@ -269,7 +269,69 @@ sealed-box (`crypto_box_seal`) of the answer plaintext below,
 addressed to `public_key_to_x25519(client_pk)`.
 
 The answer plaintext carries the same `compression_tag || body`
-framing as the offer. The answer body is:
+framing as the offer. Post–compact-answer-blob PR, the daemon emits
+the **v2** shape; the v1 shape remains decode-only for clients
+resolving legacy daemons during rollout.
+
+**v2 body (`openhost-answer-inner2`, current encoder output):**
+
+```
+  body =  "openhost-answer-inner2"   (22 bytes)
+       || daemon_pk                   (32 bytes)
+       || offer_sdp_hash              (32 bytes, SHA-256 of the UTF-8
+                                       offer SDP being answered)
+       || blob_len                    (u16 big-endian; ≤ 512)
+       || answer_blob                 (blob_len bytes; structure below)
+```
+
+The `answer_blob` is:
+
+```
+  answer_blob =
+      version      : u8   (0x01)
+      flags        : u8   (bit 0 = setup_role: 0=active, 1=passive;
+                            bits 1..7 reserved, MUST be 0)
+      ufrag_len    : u8   (4..=32 per RFC 8445 §5.3)
+      ufrag        : ufrag_len bytes, ASCII ice-ufrag
+      pwd_len      : u8   (22..=32 per RFC 8445 §5.3)
+      pwd          : pwd_len bytes, ASCII ice-pwd
+      cand_count   : u8   (0..=8)
+      candidates[] : cand_count entries of:
+                        typ    : u8  (0=host, 1=srflx, 2=prflx, 3=relay)
+                        family : u8  (4=IPv4, 6=IPv6)
+                        addr   : 4 or 16 bytes depending on family
+                        port   : u16 big-endian
+```
+
+Clients reconstruct a complete answer SDP at consumption time from
+the blob plus the host's DTLS fingerprint (pinned under the outer
+BEP44 signature on the `_openhost` record). A reference
+reconstruction template:
+
+```
+  v=0
+  o=- 1 1 IN IP4 0.0.0.0
+  s=-
+  t=0 0
+  a=group:BUNDLE 0
+  m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+  c=IN IP4 0.0.0.0
+  a=mid:0
+  a=rtcp-mux
+  a=ice-ufrag:<blob.ufrag>
+  a=ice-pwd:<blob.pwd>
+  a=fingerprint:sha-256 <colon-hex(record.dtls_fp)>
+  a=setup:<active|passive from blob.flags bit 0>
+  a=sctp-port:5000
+  a=candidate:1 1 udp 1 <addr> <port> typ <host|srflx|prflx|relay> generation 0  (×cand_count)
+  a=end-of-candidates
+```
+
+The blob does **NOT** duplicate the DTLS fingerprint. Integrity of
+the fingerprint is already provided by the outer BEP44 signature
+over the main `_openhost` record that carries `dtls_fp`.
+
+**v1 body (`openhost-answer-inner1`, decode-only):**
 
 ```
   body =  "openhost-answer-inner1"   (22 bytes)
@@ -279,6 +341,9 @@ framing as the offer. The answer body is:
        || sdp_len                     (u32 big-endian)
        || answer_sdp_utf8             (sdp_len bytes)
 ```
+
+Decoders pick v1 vs v2 on the 22-byte domain-separator prefix.
+Encoders **MUST** emit v2.
 
 `offer_sdp_hash` binds the answer to a specific offer; a racing
 adversary cannot splice a valid answer onto a different offer. The

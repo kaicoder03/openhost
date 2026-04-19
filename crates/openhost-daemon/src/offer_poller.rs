@@ -28,7 +28,7 @@ use crate::publish::SharedState;
 use crate::rate_limit::TokenBucket;
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_pkarr::{
-    decode_offer_from_packet, hash_offer_sdp, AnswerEntry, AnswerPlaintext, Resolve,
+    decode_offer_from_packet, hash_offer_sdp, AnswerEntry, AnswerPayload, AnswerPlaintext, Resolve,
 };
 use rand::rngs::OsRng;
 use std::collections::HashMap;
@@ -388,12 +388,12 @@ async fn process_client_packet(
     tracing::info!(client = %client_pk, "offer poll: processing offer");
 
     // Run the handshake. `handle_offer` drains ICE and returns the
-    // answer SDP.
-    let answer_sdp = match listener
+    // compact answer blob ready for sealing.
+    let answer_blob = match listener
         .handle_offer(&plaintext.offer_sdp, plaintext.binding_mode)
         .await
     {
-        Ok(s) => s,
+        Ok(b) => b,
         Err(err) => {
             tracing::warn!(?err, client = %client_pk, "offer poll: handle_offer failed");
             entry.last_ts = packet_ts_secs;
@@ -402,11 +402,11 @@ async fn process_client_packet(
         }
     };
 
-    // Seal the answer back to the client.
+    // Seal the answer back to the client as a v2 compact blob.
     let plaintext_answer = AnswerPlaintext {
         daemon_pk: *daemon_pk,
         offer_sdp_hash: hash_offer_sdp(&plaintext.offer_sdp),
-        answer_sdp,
+        answer: AnswerPayload::V2Blob(answer_blob),
     };
     let daemon_salt = state.salt();
     let mut rng = OsRng;

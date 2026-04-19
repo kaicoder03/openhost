@@ -26,7 +26,7 @@ use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
-use openhost_pkarr::BindingMode;
+use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -108,81 +108,165 @@ fn default_stun_servers() -> Vec<webrtc::ice_transport::ice_server::RTCIceServer
     }]
 }
 
-/// Strip the component-2 (RTCP) `a=candidate:` lines from an SDP.
-/// SCTP data channels use `a=rtcp-mux` so component 2 is never sent;
-/// keeping it only bloats the sealed answer against BEP44's
-/// 1000-byte `v` cap.
+/// Extract the subset of an SDP answer the compact answer-blob needs.
 ///
-/// Parses conservatively: only drops a line when we can confirm it
-/// starts with `a=candidate:` AND the component field (position 1)
-/// is exactly `"2"`. A malformed candidate line with fewer tokens
-/// than expected is kept verbatim so a webrtc-rs format change
-/// can't silently eat candidates.
-///
-/// Terminates the output with CRLF (SDP convention) even if the
-/// input didn't — `str::lines()` strips terminators on the way in.
-fn trim_rtcp_component_candidates(sdp: &str) -> String {
-    let mut out = String::with_capacity(sdp.len());
-    for line in sdp.lines() {
-        let drop_line = line
-            .strip_prefix("a=candidate:")
-            .and_then(|rest| rest.split_whitespace().nth(1))
-            == Some("2");
-        if !drop_line {
-            out.push_str(line);
-            out.push_str("\r\n");
+/// Parses `a=ice-ufrag:`, `a=ice-pwd:`, `a=setup:`, and every
+/// `a=candidate:` line. Applies the same candidate-hygiene filters the
+/// legacy trim path used: component-1-only (SCTP data channels use
+/// `a=rtcp-mux` so component 2 is dead freight) and IPv4-only (IPv6
+/// answers routinely blew past BEP44's 1000-byte `v` cap on
+/// dual-stack hosts; see PR #31). Malformed `a=candidate:` lines are
+/// skipped with a `debug!` rather than rejected so a webrtc-rs format
+/// drift doesn't fail the whole handshake.
+fn sdp_to_answer_blob(sdp: &str) -> Result<AnswerBlob, ListenerError> {
+    let mut ice_ufrag: Option<String> = None;
+    let mut ice_pwd: Option<String> = None;
+    let mut setup: Option<SetupRole> = None;
+    let mut candidates: Vec<BlobCandidate> = Vec::new();
+
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("a=ice-ufrag:") {
+            ice_ufrag = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("a=ice-pwd:") {
+            ice_pwd = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("a=setup:") {
+            setup = match rest.trim() {
+                "active" => Some(SetupRole::Active),
+                "passive" => Some(SetupRole::Passive),
+                // webrtc-rs answers always pick a concrete role, so
+                // `actpass` / `holdconn` in the answer SDP is either a
+                // spec violation or a severe bug — refuse to encode.
+                other => {
+                    return Err(ListenerError::OfferParse(match other {
+                        "actpass" => {
+                            "answer SDP a=setup:actpass is invalid (answerer must pick a role)"
+                        }
+                        "holdconn" => "answer SDP a=setup:holdconn is unsupported",
+                        _ => "answer SDP a=setup has unknown value",
+                    }))
+                }
+            };
+        } else if let Some(rest) = line.strip_prefix("a=candidate:") {
+            if let Some(cand) = parse_candidate_line_for_blob(rest) {
+                if candidates.len() < openhost_pkarr::MAX_BLOB_CANDIDATES {
+                    candidates.push(cand);
+                } else {
+                    tracing::debug!(
+                        "openhostd: extra candidate beyond MAX_BLOB_CANDIDATES dropped"
+                    );
+                }
+            }
         }
     }
-    out
+
+    Ok(AnswerBlob {
+        ice_ufrag: ice_ufrag.ok_or(ListenerError::OfferParse("answer SDP missing a=ice-ufrag"))?,
+        ice_pwd: ice_pwd.ok_or(ListenerError::OfferParse("answer SDP missing a=ice-pwd"))?,
+        setup: setup.ok_or(ListenerError::OfferParse("answer SDP missing a=setup"))?,
+        candidates,
+    })
+}
+
+/// Parse the post-`a=candidate:` portion of one candidate line into a
+/// `BlobCandidate`, or `None` if the line fails any hygiene filter
+/// (component 2, IPv6, unknown type, unparseable port/ip, too few
+/// tokens). Returning `None` silently is intentional — callers log
+/// at `debug` and continue so one malformed line doesn't abort the
+/// whole answer.
+fn parse_candidate_line_for_blob(rest: &str) -> Option<BlobCandidate> {
+    let mut toks = rest.split_whitespace();
+    let _foundation = toks.next()?;
+    let component = toks.next()?;
+    if component != "1" {
+        return None;
+    }
+    let transport = toks.next()?;
+    if !transport.eq_ignore_ascii_case("udp") {
+        return None;
+    }
+    let _priority = toks.next()?;
+    let addr_s = toks.next()?;
+    let port_s = toks.next()?;
+    if toks.next() != Some("typ") {
+        return None;
+    }
+    let typ_s = toks.next()?;
+    let ip: std::net::IpAddr = addr_s.parse().ok()?;
+    let port: u16 = port_s.parse().ok()?;
+    // IPv4 only — mirrors the PR #31 filter on the client side; IPv6 is
+    // reserved for a future encoder bump when multi-fragment headroom
+    // is explicit.
+    let std::net::IpAddr::V4(_) = ip else {
+        return None;
+    };
+    let typ = match typ_s {
+        "host" => CandidateType::Host,
+        "srflx" => CandidateType::Srflx,
+        "prflx" => CandidateType::Prflx,
+        "relay" => CandidateType::Relay,
+        _ => return None,
+    };
+    Some(BlobCandidate { typ, ip, port })
 }
 
 #[cfg(test)]
-mod sdp_trim_tests {
-    use super::trim_rtcp_component_candidates;
+mod sdp_blob_tests {
+    use super::{parse_candidate_line_for_blob, sdp_to_answer_blob};
+    use openhost_pkarr::{CandidateType, SetupRole};
 
     const SAMPLE: &str = "v=0\r\n\
                           o=- 0 0 IN IP4 0.0.0.0\r\n\
+                          s=-\r\n\
+                          a=ice-ufrag:abcd\r\n\
+                          a=ice-pwd:0123456789abcdefghij!@\r\n\
+                          a=setup:passive\r\n\
                           a=candidate:111 1 udp 2130706431 10.0.0.5 1000 typ host\r\n\
                           a=candidate:111 2 udp 2130706431 10.0.0.5 1000 typ host\r\n\
                           a=candidate:222 1 udp 1694498815 1.2.3.4 2000 typ srflx raddr 0.0.0.0 rport 2000\r\n\
                           a=candidate:222 2 udp 1694498815 1.2.3.4 2000 typ srflx raddr 0.0.0.0 rport 2000\r\n\
+                          a=candidate:333 1 udp 2130706431 fe80::1 3000 typ host\r\n\
                           a=end-of-candidates\r\n";
 
     #[test]
-    fn drops_component_2_candidates_only() {
-        let out = trim_rtcp_component_candidates(SAMPLE);
-        let cand_lines: Vec<&str> = out
-            .lines()
-            .filter(|l| l.starts_with("a=candidate:"))
-            .collect();
-        assert_eq!(cand_lines.len(), 2, "should keep only component-1 lines");
-        for line in &cand_lines {
-            assert!(line.contains(" 1 udp "), "line missing component 1: {line}");
-        }
-        assert!(
-            out.contains("a=end-of-candidates"),
-            "non-candidate lines preserved"
-        );
-        assert!(out.ends_with("\r\n"));
-    }
-
-    #[test]
-    fn leaves_malformed_candidate_lines_alone() {
-        // Fewer tokens than expected — the filter keeps them so a
-        // webrtc-rs format drift can't silently eat candidates.
-        let odd = "a=candidate:notenoughtoken\r\n";
+    fn sdp_to_answer_blob_extracts_ufrag_pwd_setup_candidates() {
+        let blob = sdp_to_answer_blob(SAMPLE).unwrap();
+        assert_eq!(blob.ice_ufrag, "abcd");
+        assert_eq!(blob.ice_pwd, "0123456789abcdefghij!@");
+        assert_eq!(blob.setup, SetupRole::Passive);
+        // Expect exactly 2 candidates: the two component-1 IPv4 entries.
+        // Component-2 entries dropped, the IPv6 host dropped.
+        assert_eq!(blob.candidates.len(), 2);
+        assert!(matches!(blob.candidates[0].typ, CandidateType::Host));
+        assert!(matches!(blob.candidates[1].typ, CandidateType::Srflx));
         assert_eq!(
-            trim_rtcp_component_candidates(odd),
-            "a=candidate:notenoughtoken\r\n"
+            blob.candidates[0].ip,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))
         );
+        assert_eq!(blob.candidates[0].port, 1000);
     }
 
     #[test]
-    fn no_candidates_is_pass_through() {
-        let simple = "v=0\r\ns=-\r\n";
-        let out = trim_rtcp_component_candidates(simple);
-        assert!(out.contains("v=0"));
-        assert!(out.contains("s=-"));
+    fn sdp_to_answer_blob_errors_when_ufrag_missing() {
+        let bad = "v=0\r\na=setup:passive\r\na=ice-pwd:0123456789abcdefghij!@\r\n";
+        assert!(sdp_to_answer_blob(bad).is_err());
+    }
+
+    #[test]
+    fn parse_candidate_line_drops_component_2() {
+        let drop = parse_candidate_line_for_blob("111 2 udp 2130706431 10.0.0.5 1000 typ host");
+        assert!(drop.is_none());
+    }
+
+    #[test]
+    fn parse_candidate_line_drops_ipv6() {
+        let drop = parse_candidate_line_for_blob("222 1 udp 1 fe80::1 1000 typ host");
+        assert!(drop.is_none());
+    }
+
+    #[test]
+    fn parse_candidate_line_drops_malformed_tokens() {
+        assert!(parse_candidate_line_for_blob("notenoughtoken").is_none());
     }
 }
 
@@ -314,7 +398,8 @@ impl PassivePeer {
         self
     }
 
-    /// Accept an inbound SDP offer and return the SDP answer.
+    /// Accept an inbound SDP offer and return the compact answer blob
+    /// the caller will seal into the pkarr `_answer-*` records.
     ///
     /// Rejects offers that don't assert `a=setup:active` (spec §3.1)
     /// before any `RTCPeerConnection` is built. The returned
@@ -325,7 +410,7 @@ impl PassivePeer {
         &self,
         offer_sdp: &str,
         binding_mode: BindingMode,
-    ) -> Result<String, ListenerError> {
+    ) -> Result<AnswerBlob, ListenerError> {
         // 1. Pre-validate the DTLS role asserted in the offer.
         check_setup_role_is_active(offer_sdp)?;
 
@@ -358,7 +443,7 @@ impl PassivePeer {
         &self,
         offer_sdp: &str,
         binding_mode: BindingMode,
-    ) -> Result<String, ListenerError> {
+    ) -> Result<AnswerBlob, ListenerError> {
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
             ice_servers: default_stun_servers(),
@@ -407,21 +492,18 @@ impl PassivePeer {
                 "local description missing after set_local_description",
             ))?;
 
-        // Drop component-2 (RTCP) candidate lines — SCTP data
-        // channels use `a=rtcp-mux` so component 2 is never sent and
-        // the line just bloats the sealed answer record against BEP44's
-        // 1000-byte `v` cap. This halves the per-candidate overhead
-        // (a 5-candidate answer drops from 10 lines to 5) without
-        // breaking any ICE topology.
-        let trimmed_sdp = trim_rtcp_component_candidates(&local_desc.sdp);
+        // Project the answer SDP into the compact answer-blob shape.
+        // The blob's candidate-hygiene filters (component-1-only,
+        // IPv4-only) live inside `sdp_to_answer_blob`.
+        let blob = sdp_to_answer_blob(&local_desc.sdp)?;
 
         // Keep the PC alive so the DTLS handshake can complete after we
-        // return the answer SDP. The prune hook wired above will remove
+        // return the answer. The prune hook wired above will remove
         // this entry on Closed / Failed / Disconnected.
         let key = pc_key(&pc);
         self.active.lock().await.insert(key, pc);
 
-        Ok(trimmed_sdp)
+        Ok(blob)
     }
 }
 

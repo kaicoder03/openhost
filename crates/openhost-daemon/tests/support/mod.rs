@@ -285,10 +285,12 @@ pub async fn establish_connection_opts(
     let _ = gather.recv().await;
     let offer_sdp = client_pc.local_description().await.unwrap().sdp;
 
-    let answer_sdp = app
+    let answer_blob = app
         .handle_offer(&offer_sdp, openhost_pkarr::BindingMode::Exporter)
         .await
         .expect("daemon answers");
+    let answer_sdp =
+        openhost_pkarr::answer_blob_to_sdp(&answer_blob, &app.cert().fingerprint_sha256);
     let answer = RTCSessionDescription::answer(answer_sdp).expect("parse answer");
     client_pc
         .set_remote_description(answer)

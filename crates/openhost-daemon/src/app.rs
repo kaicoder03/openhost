@@ -193,15 +193,16 @@ impl App {
     }
 
     /// Convenience: hand `offer_sdp` to the listener and return the
-    /// answer SDP. `binding_mode` is the channel-binding variant the
-    /// client advertised in its offer plaintext — the offer poller
-    /// threads it in, direct callers (tests, examples) default to
-    /// [`openhost_pkarr::BindingMode::Exporter`].
+    /// compact [`openhost_pkarr::AnswerBlob`] the daemon seals into
+    /// its pkarr `_answer-*` record. `binding_mode` is the channel-
+    /// binding variant the client advertised in its offer plaintext —
+    /// the offer poller threads it in; direct callers (tests, examples)
+    /// default to [`openhost_pkarr::BindingMode::Exporter`].
     pub async fn handle_offer(
         &self,
         offer_sdp: &str,
         binding_mode: openhost_pkarr::BindingMode,
-    ) -> Result<String> {
+    ) -> Result<openhost_pkarr::AnswerBlob> {
         self.listener
             .handle_offer(offer_sdp, binding_mode)
             .await

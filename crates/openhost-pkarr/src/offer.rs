@@ -116,8 +116,23 @@ pub const OFFER_INNER_DOMAIN: &[u8] = OFFER_INNER_DOMAIN_V1;
 /// can advertise cert-fingerprint binding (see [`BindingMode`]).
 pub const OFFER_INNER_DOMAIN_V2: &[u8] = b"openhost-offer-inner2";
 
-/// Domain separator embedded in the answer inner plaintext.
-pub const ANSWER_INNER_DOMAIN: &[u8] = b"openhost-answer-inner1";
+/// Domain separator for the v1 answer inner plaintext body. Still
+/// accepted on decode (legacy daemons publishing full SDPs); new
+/// encoders emit v2 via [`ANSWER_INNER_DOMAIN_V2`].
+pub const ANSWER_INNER_DOMAIN_V1: &[u8] = b"openhost-answer-inner1";
+
+/// Alias for [`ANSWER_INNER_DOMAIN_V1`]. Retained for downstream
+/// diagnostic tooling that referenced the pre-PR-32 constant name.
+pub const ANSWER_INNER_DOMAIN: &[u8] = ANSWER_INNER_DOMAIN_V1;
+
+/// Domain separator for the v2 answer inner plaintext body (PR #32+).
+/// v2 replaces the full SDP with a compact binary [`AnswerBlob`] so the
+/// sealed + fragmented packet fits inside BEP44's 1000-byte `v` cap
+/// alongside the main `_openhost` record. Clients reconstruct a
+/// minimal-but-valid SDP at consumption time using the host's DTLS
+/// fingerprint (already pinned under the outer BEP44 signature via the
+/// main record).
+pub const ANSWER_INNER_DOMAIN_V2: &[u8] = b"openhost-answer-inner2";
 
 /// Channel-binding mode advertised by the client in an offer plaintext.
 ///
@@ -164,6 +179,159 @@ impl BindingMode {
         }
     }
 }
+
+/// DTLS `a=setup:` role carried in the v2 answer blob. Restricted to
+/// the two values the daemon actually emits (`active` when the daemon
+/// answered a browser offer that picked `actpass`, `passive` in every
+/// other case). `holdconn` and `actpass` are rejected on decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SetupRole {
+    /// `a=setup:active` — the side that initiates the DTLS handshake.
+    Active = 0,
+    /// `a=setup:passive` — the side that waits for DTLS ClientHello.
+    Passive = 1,
+}
+
+impl SetupRole {
+    /// SDP-textual form (`"active"` or `"passive"`) used when
+    /// reconstructing the minimal SDP on the client side.
+    #[must_use]
+    pub fn as_sdp_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Passive => "passive",
+        }
+    }
+}
+
+/// ICE candidate type. Mirrors the lowercase strings that appear in
+/// SDP `a=candidate:` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CandidateType {
+    /// Local interface address.
+    Host = 0,
+    /// Server-reflexive (learned via STUN).
+    Srflx = 1,
+    /// Peer-reflexive (learned via an inbound connectivity check).
+    Prflx = 2,
+    /// Relayed (TURN).
+    Relay = 3,
+}
+
+impl CandidateType {
+    /// SDP `typ` string used when reconstructing `a=candidate:` lines.
+    #[must_use]
+    pub fn as_sdp_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Srflx => "srflx",
+            Self::Prflx => "prflx",
+            Self::Relay => "relay",
+        }
+    }
+
+    fn from_u8(b: u8) -> Result<Self> {
+        match b {
+            0 => Ok(Self::Host),
+            1 => Ok(Self::Srflx),
+            2 => Ok(Self::Prflx),
+            3 => Ok(Self::Relay),
+            _ => Err(PkarrError::MalformedCanonical(
+                "unknown answer-blob candidate type",
+            )),
+        }
+    }
+}
+
+/// One ICE candidate carried inside an [`AnswerBlob`]. The blob omits
+/// foundation, priority, component, and transport: at consumption time
+/// the client synthesises a stable placeholder foundation (`1`),
+/// priority (`1`), component (`1`), and transport (`udp`), since the
+/// openhost handshake only ever uses UDP and a single RTP component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobCandidate {
+    /// Candidate type (host/srflx/prflx/relay).
+    pub typ: CandidateType,
+    /// IPv4 or IPv6 address. v2 encoders MUST emit only IPv4 (mirrors
+    /// the PR #31 candidate-hygiene filter); IPv6 is reserved for a
+    /// future encoder bump when multi-fragment headroom is explicit.
+    pub ip: std::net::IpAddr,
+    /// UDP port.
+    pub port: u16,
+}
+
+/// Compact binary representation of a WebRTC answer. Replaces the full
+/// SDP in v2 answer records. The client reconstructs a minimal valid
+/// SDP from these fields plus the host's DTLS fingerprint.
+///
+/// Wire layout (inside the v2 answer body, after the 22-byte domain,
+/// 32-byte `daemon_pk`, 32-byte `offer_sdp_hash`, and a `u16` blob
+/// length prefix):
+///
+/// ```text
+/// version      : u8 (0x01)
+/// flags        : u8  (bit 0 = setup_role: 0=active, 1=passive; rest MUST be 0)
+/// ufrag_len    : u8  (4..=32 per RFC 8445 §5.3)
+/// ufrag        : <ufrag_len> ASCII bytes
+/// pwd_len      : u8  (22..=32 per RFC 8445 §5.3)
+/// pwd          : <pwd_len> ASCII bytes
+/// cand_count   : u8  (0..=MAX_BLOB_CANDIDATES)
+/// candidates[] : cand_count entries of:
+///                  typ    : u8   (CandidateType)
+///                  family : u8   (4 | 6)
+///                  addr   : 4 or 16 bytes
+///                  port   : u16 big-endian
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerBlob {
+    /// ICE ufrag — MUST be 4..=32 ASCII bytes (RFC 8445 §5.3).
+    pub ice_ufrag: String,
+    /// ICE pwd — MUST be 22..=32 ASCII bytes (RFC 8445 §5.3).
+    pub ice_pwd: String,
+    /// Setup role emitted by the daemon.
+    pub setup: SetupRole,
+    /// Post-gather-complete candidate list. Length bounded by
+    /// [`MAX_BLOB_CANDIDATES`].
+    pub candidates: Vec<BlobCandidate>,
+}
+
+/// Plaintext answer payload carried inside an [`AnswerPlaintext`].
+/// v1 is decode-only (legacy daemons shipping a full SDP); all v2+
+/// emitters MUST produce [`AnswerPayload::V2Blob`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerPayload {
+    /// v1 answer body: the daemon's full SDP as a string. Post-PR-32
+    /// emitters never produce this variant; it exists so clients can
+    /// still consume answers from pre-PR-32 daemons during rollout.
+    V1Sdp(String),
+    /// v2 answer body: compact binary blob (see [`AnswerBlob`]).
+    V2Blob(AnswerBlob),
+}
+
+/// Version byte at the front of the v2 answer blob body.
+const ANSWER_BLOB_VERSION: u8 = 0x01;
+
+/// Ceiling on the blob byte length carried in the `u16` length prefix.
+/// A fully-packed blob with 8 IPv4 candidates, a 32-byte ufrag, and a
+/// 32-byte pwd weighs ~140 bytes; 512 gives ~3.5× headroom against
+/// future encoder drift without allowing a malicious decoder DoS.
+pub const MAX_ANSWER_BLOB_LEN: usize = 512;
+
+/// Ceiling on the per-blob candidate count. Post-PR-31 filters reduce
+/// a typical answer to 1 srflx + 0-3 host candidates; 8 still leaves
+/// room for multi-interface hosts.
+pub const MAX_BLOB_CANDIDATES: usize = 8;
+
+/// Minimum ICE ufrag length per RFC 8445 §5.3.
+pub const MIN_ICE_UFRAG_LEN: usize = 4;
+/// Maximum ICE ufrag length per RFC 8445 §5.3.
+pub const MAX_ICE_UFRAG_LEN: usize = 32;
+/// Minimum ICE pwd length per RFC 8445 §5.3.
+pub const MIN_ICE_PWD_LEN: usize = 22;
+/// Maximum ICE pwd length per RFC 8445 §5.3.
+pub const MAX_ICE_PWD_LEN: usize = 32;
 
 /// Domain separator used when deriving the `_offer.` DNS label from the
 /// daemon's pubkey. Domain-separated from `allowlist_hash` so observers
@@ -404,8 +572,43 @@ pub struct AnswerPlaintext {
     /// a racing adversary from re-binding a valid answer onto a different
     /// offer.
     pub offer_sdp_hash: [u8; OFFER_SDP_HASH_LEN],
-    /// SDP answer text (UTF-8).
-    pub answer_sdp: String,
+    /// Carried answer, either the v1 full-SDP form (decode-only) or
+    /// the v2 compact binary blob (the only form new emitters produce).
+    pub answer: AnswerPayload,
+}
+
+impl AnswerPlaintext {
+    /// Convenience constructor matching the pre-PR-32 field set; the
+    /// passed-in SDP string is stored as [`AnswerPayload::V1Sdp`]. Used
+    /// by tests that still want to exercise the legacy decode path
+    /// without hand-constructing an `AnswerPayload`.
+    #[must_use]
+    pub fn new_v1(
+        daemon_pk: PublicKey,
+        offer_sdp_hash: [u8; OFFER_SDP_HASH_LEN],
+        answer_sdp: String,
+    ) -> Self {
+        Self {
+            daemon_pk,
+            offer_sdp_hash,
+            answer: AnswerPayload::V1Sdp(answer_sdp),
+        }
+    }
+
+    /// Convenience constructor for the v2 compact-blob answer — the
+    /// form every post-PR-32 emitter produces.
+    #[must_use]
+    pub fn new_v2(
+        daemon_pk: PublicKey,
+        offer_sdp_hash: [u8; OFFER_SDP_HASH_LEN],
+        blob: AnswerBlob,
+    ) -> Self {
+        Self {
+            daemon_pk,
+            offer_sdp_hash,
+            answer: AnswerPayload::V2Blob(blob),
+        }
+    }
 }
 
 // ============================================================================
@@ -511,7 +714,7 @@ impl AnswerEntry {
         plaintext: &AnswerPlaintext,
         created_at: u64,
     ) -> Result<Self> {
-        let inner = encode_answer_plaintext(plaintext);
+        let inner = encode_answer_plaintext(plaintext)?;
         let recipient = public_key_to_x25519(client_pk).map_err(PkarrError::Core)?;
         let sealed = sealed_box_seal(rng, &recipient, &inner);
         let client_hash = allowlist_hash(daemon_salt, &client_pk.to_bytes());
@@ -973,30 +1176,223 @@ fn parse_offer_plaintext(bytes: &[u8]) -> Result<OfferPlaintext> {
     parse_offer_body(body)
 }
 
-/// Shape of the v1 answer body.
-fn encode_answer_body(p: &AnswerPlaintext) -> Vec<u8> {
-    let sdp = p.answer_sdp.as_bytes();
+/// Encode an answer body. v2 (compact blob, `openhost-answer-inner2`)
+/// is the only shape emitters produce; v1 is decode-only and
+/// [`encode_answer_body`] will panic in debug builds if handed a
+/// [`AnswerPayload::V1Sdp`] — use a v2 blob.
+///
+/// Wire layout for v2:
+///
+/// ```text
+/// domain(ANSWER_INNER_DOMAIN_V2) || daemon_pk(32B) ||
+/// offer_sdp_hash(32B) || blob_len(u16 BE, ≤ MAX_ANSWER_BLOB_LEN) || blob(blob_len bytes)
+/// ```
+fn encode_answer_body(p: &AnswerPlaintext) -> Result<Vec<u8>> {
+    let blob = match &p.answer {
+        AnswerPayload::V2Blob(b) => b,
+        AnswerPayload::V1Sdp(_) => {
+            debug_assert!(
+                false,
+                "openhost-pkarr: emitters MUST produce v2 AnswerBlob; V1Sdp is decode-only",
+            );
+            return Err(PkarrError::MalformedCanonical(
+                "encoders MUST emit v2 answer blobs — AnswerPayload::V1Sdp is decode-only",
+            ));
+        }
+    };
+    let blob_bytes = encode_answer_blob(blob)?;
     let mut out = Vec::with_capacity(
-        ANSWER_INNER_DOMAIN.len() + PUBLIC_KEY_LEN + OFFER_SDP_HASH_LEN + 4 + sdp.len(),
+        ANSWER_INNER_DOMAIN_V2.len() + PUBLIC_KEY_LEN + OFFER_SDP_HASH_LEN + 2 + blob_bytes.len(),
     );
-    out.extend_from_slice(ANSWER_INNER_DOMAIN);
+    out.extend_from_slice(ANSWER_INNER_DOMAIN_V2);
     out.extend_from_slice(&p.daemon_pk.to_bytes());
     out.extend_from_slice(&p.offer_sdp_hash);
-    let len = u32::try_from(sdp.len())
-        .expect("SDP length bounded well below u32::MAX by BEP44 1000-byte cap");
+    let len = u16::try_from(blob_bytes.len()).expect("blob_bytes ≤ MAX_ANSWER_BLOB_LEN < u16::MAX");
     out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(sdp);
-    out
+    out.extend_from_slice(&blob_bytes);
+    Ok(out)
 }
 
-/// Encode a v2 (zlib-compressed) answer inner plaintext.
-fn encode_answer_plaintext(p: &AnswerPlaintext) -> Vec<u8> {
-    let body = encode_answer_body(p);
+/// Serialise an [`AnswerBlob`] to its on-wire byte form. Validates
+/// RFC 8445 §5.3 ufrag/pwd length bounds, the reserved-flag-bits
+/// invariant, and the per-blob candidate ceiling.
+pub fn encode_answer_blob(b: &AnswerBlob) -> Result<Vec<u8>> {
+    let ufrag_bytes = b.ice_ufrag.as_bytes();
+    if ufrag_bytes.len() < MIN_ICE_UFRAG_LEN || ufrag_bytes.len() > MAX_ICE_UFRAG_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "AnswerBlob ice_ufrag length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    if !b.ice_ufrag.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "AnswerBlob ice_ufrag must be ASCII",
+        ));
+    }
+    let pwd_bytes = b.ice_pwd.as_bytes();
+    if pwd_bytes.len() < MIN_ICE_PWD_LEN || pwd_bytes.len() > MAX_ICE_PWD_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "AnswerBlob ice_pwd length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    if !b.ice_pwd.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "AnswerBlob ice_pwd must be ASCII",
+        ));
+    }
+    if b.candidates.len() > MAX_BLOB_CANDIDATES {
+        return Err(PkarrError::MalformedCanonical(
+            "AnswerBlob candidates exceed MAX_BLOB_CANDIDATES",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(32);
+    out.push(ANSWER_BLOB_VERSION);
+    // Flags byte: only bit 0 is allocated to setup_role (0=active, 1=passive);
+    // remaining bits MUST be zero on the wire (enforced on decode).
+    let flags: u8 = match b.setup {
+        SetupRole::Active => 0b0000_0000,
+        SetupRole::Passive => 0b0000_0001,
+    };
+    out.push(flags);
+    out.push(ufrag_bytes.len() as u8);
+    out.extend_from_slice(ufrag_bytes);
+    out.push(pwd_bytes.len() as u8);
+    out.extend_from_slice(pwd_bytes);
+    out.push(b.candidates.len() as u8);
+    for cand in &b.candidates {
+        out.push(cand.typ as u8);
+        match cand.ip {
+            std::net::IpAddr::V4(v4) => {
+                out.push(4);
+                out.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                out.push(6);
+                out.extend_from_slice(&v6.octets());
+            }
+        }
+        out.extend_from_slice(&cand.port.to_be_bytes());
+    }
+    if out.len() > MAX_ANSWER_BLOB_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "encoded AnswerBlob exceeds MAX_ANSWER_BLOB_LEN",
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse an [`AnswerBlob`] from its on-wire byte form. Strict inverse
+/// of [`encode_answer_blob`]: unknown versions, reserved-flag-bits,
+/// candidate types, address families, or length bounds all produce
+/// [`PkarrError::MalformedCanonical`].
+pub fn parse_answer_blob(bytes: &[u8]) -> Result<AnswerBlob> {
+    if bytes.len() > MAX_ANSWER_BLOB_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "answer blob exceeds MAX_ANSWER_BLOB_LEN",
+        ));
+    }
+    let mut r = InnerCursor::new(bytes);
+    let version = r.u8()?;
+    if version != ANSWER_BLOB_VERSION {
+        return Err(PkarrError::MalformedCanonical(
+            "unknown answer-blob version",
+        ));
+    }
+    let flags = r.u8()?;
+    // Only bit 0 is defined; any other bit set is a hard decode error
+    // so future encoder versions don't silently get ignored.
+    if flags & 0b1111_1110 != 0 {
+        return Err(PkarrError::MalformedCanonical(
+            "answer-blob reserved flag bits must be zero",
+        ));
+    }
+    let setup = if flags & 0b0000_0001 == 0 {
+        SetupRole::Active
+    } else {
+        SetupRole::Passive
+    };
+    let ufrag_len = r.u8()? as usize;
+    if !(MIN_ICE_UFRAG_LEN..=MAX_ICE_UFRAG_LEN).contains(&ufrag_len) {
+        return Err(PkarrError::MalformedCanonical(
+            "answer-blob ice_ufrag length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    let ufrag_bytes = r.take(ufrag_len)?;
+    if !ufrag_bytes.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "answer-blob ice_ufrag must be ASCII",
+        ));
+    }
+    let ice_ufrag = core::str::from_utf8(ufrag_bytes)
+        .map_err(|_| PkarrError::MalformedCanonical("answer-blob ice_ufrag is not UTF-8"))?
+        .to_string();
+    let pwd_len = r.u8()? as usize;
+    if !(MIN_ICE_PWD_LEN..=MAX_ICE_PWD_LEN).contains(&pwd_len) {
+        return Err(PkarrError::MalformedCanonical(
+            "answer-blob ice_pwd length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    let pwd_bytes = r.take(pwd_len)?;
+    if !pwd_bytes.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "answer-blob ice_pwd must be ASCII",
+        ));
+    }
+    let ice_pwd = core::str::from_utf8(pwd_bytes)
+        .map_err(|_| PkarrError::MalformedCanonical("answer-blob ice_pwd is not UTF-8"))?
+        .to_string();
+    let cand_count = r.u8()? as usize;
+    if cand_count > MAX_BLOB_CANDIDATES {
+        return Err(PkarrError::MalformedCanonical(
+            "answer-blob candidate count exceeds MAX_BLOB_CANDIDATES",
+        ));
+    }
+    let mut candidates = Vec::with_capacity(cand_count);
+    for _ in 0..cand_count {
+        let typ = CandidateType::from_u8(r.u8()?)?;
+        let family = r.u8()?;
+        let ip = match family {
+            4 => {
+                let b = r.take(4)?;
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+            }
+            6 => {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(arr))
+            }
+            _ => {
+                return Err(PkarrError::MalformedCanonical(
+                    "answer-blob candidate family must be 4 or 6",
+                ));
+            }
+        };
+        let port = r.u16_be()?;
+        candidates.push(BlobCandidate { typ, ip, port });
+    }
+    if !r.is_empty() {
+        return Err(PkarrError::MalformedCanonical(
+            "trailing bytes after answer blob",
+        ));
+    }
+    Ok(AnswerBlob {
+        ice_ufrag,
+        ice_pwd,
+        setup,
+        candidates,
+    })
+}
+
+/// Encode a zlib-compressed answer inner plaintext. The body emitted
+/// here is the v2 compact-blob form; v1 is decode-only.
+fn encode_answer_plaintext(p: &AnswerPlaintext) -> Result<Vec<u8>> {
+    let body = encode_answer_body(p)?;
     let compressed = zlib_compress(&body);
     let mut out = Vec::with_capacity(1 + compressed.len());
     out.push(CompressionTag::Zlib as u8);
     out.extend_from_slice(&compressed);
-    out
+    Ok(out)
 }
 
 fn parse_answer_plaintext(bytes: &[u8]) -> Result<AnswerPlaintext> {
@@ -1013,14 +1409,31 @@ fn parse_answer_plaintext(bytes: &[u8]) -> Result<AnswerPlaintext> {
     parse_answer_body(body)
 }
 
+/// Parse an answer body. Dispatches on the domain-separator prefix:
+/// `openhost-answer-inner1` yields a v1 [`AnswerPayload::V1Sdp`] with
+/// a full SDP string (legacy); `openhost-answer-inner2` yields a v2
+/// [`AnswerPayload::V2Blob`] with a compact binary blob.
 fn parse_answer_body(body: &[u8]) -> Result<AnswerPlaintext> {
-    let mut r = InnerCursor::new(body);
-    let domain = r.take(ANSWER_INNER_DOMAIN.len())?;
-    if domain != ANSWER_INNER_DOMAIN {
+    if body.len() < ANSWER_INNER_DOMAIN_V1.len() {
         return Err(PkarrError::MalformedCanonical(
-            "missing openhost-answer-inner1 domain separator",
+            "answer plaintext shorter than domain separator",
         ));
     }
+    let domain = &body[..ANSWER_INNER_DOMAIN_V1.len()];
+    if domain == ANSWER_INNER_DOMAIN_V2 {
+        parse_answer_body_v2(body)
+    } else if domain == ANSWER_INNER_DOMAIN_V1 {
+        parse_answer_body_v1(body)
+    } else {
+        Err(PkarrError::MalformedCanonical(
+            "unknown openhost-answer-inner domain separator",
+        ))
+    }
+}
+
+fn parse_answer_body_v1(body: &[u8]) -> Result<AnswerPlaintext> {
+    let mut r = InnerCursor::new(body);
+    let _domain = r.take(ANSWER_INNER_DOMAIN_V1.len())?;
     let mut pk_bytes = [0u8; PUBLIC_KEY_LEN];
     pk_bytes.copy_from_slice(r.take(PUBLIC_KEY_LEN)?);
     let daemon_pk = PublicKey::from_bytes(&pk_bytes).map_err(PkarrError::Core)?;
@@ -1033,13 +1446,41 @@ fn parse_answer_body(body: &[u8]) -> Result<AnswerPlaintext> {
         .to_string();
     if !r.is_empty() {
         return Err(PkarrError::MalformedCanonical(
-            "trailing bytes after answer plaintext",
+            "trailing bytes after v1 answer plaintext",
         ));
     }
     Ok(AnswerPlaintext {
         daemon_pk,
         offer_sdp_hash,
-        answer_sdp,
+        answer: AnswerPayload::V1Sdp(answer_sdp),
+    })
+}
+
+fn parse_answer_body_v2(body: &[u8]) -> Result<AnswerPlaintext> {
+    let mut r = InnerCursor::new(body);
+    let _domain = r.take(ANSWER_INNER_DOMAIN_V2.len())?;
+    let mut pk_bytes = [0u8; PUBLIC_KEY_LEN];
+    pk_bytes.copy_from_slice(r.take(PUBLIC_KEY_LEN)?);
+    let daemon_pk = PublicKey::from_bytes(&pk_bytes).map_err(PkarrError::Core)?;
+    let mut offer_sdp_hash = [0u8; OFFER_SDP_HASH_LEN];
+    offer_sdp_hash.copy_from_slice(r.take(OFFER_SDP_HASH_LEN)?);
+    let blob_len = r.u16_be()? as usize;
+    if blob_len > MAX_ANSWER_BLOB_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "v2 answer blob_len exceeds MAX_ANSWER_BLOB_LEN",
+        ));
+    }
+    let blob_bytes = r.take(blob_len)?;
+    let blob = parse_answer_blob(blob_bytes)?;
+    if !r.is_empty() {
+        return Err(PkarrError::MalformedCanonical(
+            "trailing bytes after v2 answer plaintext",
+        ));
+    }
+    Ok(AnswerPlaintext {
+        daemon_pk,
+        offer_sdp_hash,
+        answer: AnswerPayload::V2Blob(blob),
     })
 }
 
@@ -1077,6 +1518,10 @@ impl<'a> InnerCursor<'a> {
     }
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
+    }
+    fn u16_be(&mut self) -> Result<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
     }
     fn u32_be(&mut self) -> Result<u32> {
         let b = self.take(4)?;
@@ -1133,6 +1578,81 @@ fn zlib_decompress_capped(input: &[u8], cap: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// DTLS fingerprint byte length — SHA-256 output.
+pub const DTLS_FP_LEN: usize = 32;
+
+/// Reconstruct a minimal but webrtc-rs + Chromium-compatible SDP
+/// answer from a compact [`AnswerBlob`] + the host's already-verified
+/// DTLS certificate fingerprint. Produced string matches what
+/// legacy v1 answer records used to carry verbatim.
+///
+/// Implementation notes:
+///
+/// - `o=` origin session-id / version / `IN IP4 0.0.0.0` — safe
+///   placeholders; neither webrtc-rs nor Chromium trust them for
+///   anything load-bearing.
+/// - `m=application 9 UDP/DTLS/SCTP webrtc-datachannel` with
+///   `a=rtcp-mux` ⇒ one component, matches the daemon's generation.
+/// - `a=sctp-port:5000` matches webrtc-rs's default (pion's too); if
+///   the daemon ever drifts from 5000 the offer will still negotiate
+///   because the offerer echoes what it received.
+/// - `a=fingerprint:sha-256 <colon-hex>` is the load-bearing field —
+///   it binds the DTLS handshake to the pkarr record's pinned
+///   fingerprint, which is verified under the BEP44 signature before
+///   the blob is ever opened.
+/// - Each candidate synthesises a foundation of `1` and priority of
+///   `1`: the offerer's pairing logic uses the
+///   (local-candidate, remote-candidate) tuple for pair keys, so
+///   placeholder values don't confuse it. `generation 0` is emitted
+///   to match webrtc-rs's own answer output shape.
+///
+/// The output always ends with CRLF, matches the daemon-generated
+/// SDP byte-for-byte in the fields the peers actually consume.
+#[must_use]
+pub fn answer_blob_to_sdp(blob: &AnswerBlob, dtls_fp: &[u8; DTLS_FP_LEN]) -> String {
+    let fp_hex = colon_hex_upper(dtls_fp);
+    let mut s = String::with_capacity(512);
+    s.push_str("v=0\r\n");
+    s.push_str("o=- 1 1 IN IP4 0.0.0.0\r\n");
+    s.push_str("s=-\r\n");
+    s.push_str("t=0 0\r\n");
+    s.push_str("a=group:BUNDLE 0\r\n");
+    s.push_str("m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n");
+    s.push_str("c=IN IP4 0.0.0.0\r\n");
+    s.push_str("a=mid:0\r\n");
+    s.push_str("a=rtcp-mux\r\n");
+    s.push_str(&format!("a=ice-ufrag:{}\r\n", blob.ice_ufrag));
+    s.push_str(&format!("a=ice-pwd:{}\r\n", blob.ice_pwd));
+    s.push_str(&format!("a=fingerprint:sha-256 {fp_hex}\r\n"));
+    s.push_str(&format!("a=setup:{}\r\n", blob.setup.as_sdp_str()));
+    s.push_str("a=sctp-port:5000\r\n");
+    for cand in &blob.candidates {
+        s.push_str(&format!(
+            "a=candidate:1 1 udp 1 {ip} {port} typ {typ} generation 0\r\n",
+            ip = cand.ip,
+            port = cand.port,
+            typ = cand.typ.as_sdp_str(),
+        ));
+    }
+    s.push_str("a=end-of-candidates\r\n");
+    s
+}
+
+/// Lowercase hex-encode each byte, separated by `:`, matching the
+/// `a=fingerprint:sha-256 ...` formatting WebRTC uses. Upper-case is
+/// conventional in SDP fingerprints; reconstructor matches that.
+fn colon_hex_upper(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push(':');
+        }
+        write!(&mut out, "{b:02X}").expect("writing into String never fails");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1162,6 +1682,22 @@ mod tests {
     const SAMPLE_ANSWER_SDP: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
                                      m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
                                      c=IN IP4 0.0.0.0\r\na=setup:passive\r\n";
+
+    /// Build a representative v2 blob used as the sample payload in
+    /// answer-plaintext tests. One srflx candidate, 4-char ufrag,
+    /// 22-char pwd — matches the post-PR-31 daemon output shape.
+    fn sample_blob() -> AnswerBlob {
+        AnswerBlob {
+            ice_ufrag: "abcd".to_string(),
+            ice_pwd: "Supercalifragilistic!2".to_string(),
+            setup: SetupRole::Passive,
+            candidates: vec![BlobCandidate {
+                typ: CandidateType::Srflx,
+                ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+                port: 51_820,
+            }],
+        }
+    }
 
     // ---------- label helpers ----------
 
@@ -1398,20 +1934,37 @@ mod tests {
         assert_eq!(dec, p);
     }
 
+    /// Hand-craft a v1 (legacy) answer plaintext (uncompressed + full
+    /// SDP) and confirm `parse_answer_plaintext` still decodes it into
+    /// an `AnswerPayload::V1Sdp`. New emitters never produce v1, but
+    /// decoders accept it for the duration of the rollout.
     #[test]
     fn answer_plaintext_accepts_v1_uncompressed_for_backcompat() {
         let daemon_pk = host_sk().public_key();
-        let p = AnswerPlaintext {
-            daemon_pk,
-            offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
-            answer_sdp: SAMPLE_ANSWER_SDP.to_string(),
-        };
-        let body = encode_answer_body(&p);
-        let mut v1 = Vec::with_capacity(1 + body.len());
-        v1.push(0x01);
-        v1.extend_from_slice(&body);
+        let answer_sdp = SAMPLE_ANSWER_SDP.to_string();
+        let offer_sdp_hash = hash_offer_sdp(SAMPLE_OFFER_SDP);
+
+        // Manually encode the v1 body shape.
+        let sdp_bytes = answer_sdp.as_bytes();
+        let mut v1_body = Vec::new();
+        v1_body.extend_from_slice(ANSWER_INNER_DOMAIN_V1);
+        v1_body.extend_from_slice(&daemon_pk.to_bytes());
+        v1_body.extend_from_slice(&offer_sdp_hash);
+        v1_body.extend_from_slice(&(sdp_bytes.len() as u32).to_be_bytes());
+        v1_body.extend_from_slice(sdp_bytes);
+
+        // Uncompressed tag + body.
+        let mut v1 = Vec::with_capacity(1 + v1_body.len());
+        v1.push(CompressionTag::Uncompressed as u8);
+        v1.extend_from_slice(&v1_body);
+
         let dec = parse_answer_plaintext(&v1).unwrap();
-        assert_eq!(dec, p);
+        assert_eq!(dec.daemon_pk, daemon_pk);
+        assert_eq!(dec.offer_sdp_hash, offer_sdp_hash);
+        match dec.answer {
+            AnswerPayload::V1Sdp(s) => assert_eq!(s, answer_sdp),
+            AnswerPayload::V2Blob(_) => panic!("expected V1Sdp"),
+        }
     }
 
     #[test]
@@ -1420,11 +1973,166 @@ mod tests {
         let p = AnswerPlaintext {
             daemon_pk,
             offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
-            answer_sdp: SAMPLE_ANSWER_SDP.to_string(),
+            answer: AnswerPayload::V2Blob(sample_blob()),
         };
-        let enc = encode_answer_plaintext(&p);
+        let enc = encode_answer_plaintext(&p).unwrap();
         let dec = parse_answer_plaintext(&enc).unwrap();
         assert_eq!(dec, p);
+    }
+
+    #[test]
+    fn answer_blob_roundtrips_all_fields() {
+        let blob = AnswerBlob {
+            ice_ufrag: "abcd".to_string(),
+            ice_pwd: "0123456789abcdefghij!@".to_string(),
+            setup: SetupRole::Active,
+            candidates: vec![
+                BlobCandidate {
+                    typ: CandidateType::Host,
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                    port: 12345,
+                },
+                BlobCandidate {
+                    typ: CandidateType::Srflx,
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+                    port: 51_820,
+                },
+                BlobCandidate {
+                    typ: CandidateType::Relay,
+                    ip: std::net::IpAddr::V6(std::net::Ipv6Addr::from([
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ])),
+                    port: 3478,
+                },
+            ],
+        };
+        let enc = encode_answer_blob(&blob).unwrap();
+        let dec = parse_answer_blob(&enc).unwrap();
+        assert_eq!(dec, blob);
+    }
+
+    #[test]
+    fn answer_blob_parses_zero_candidates() {
+        let blob = AnswerBlob {
+            ice_ufrag: "abcd".to_string(),
+            ice_pwd: "0123456789abcdefghij!@".to_string(),
+            setup: SetupRole::Passive,
+            candidates: vec![],
+        };
+        let enc = encode_answer_blob(&blob).unwrap();
+        let dec = parse_answer_blob(&enc).unwrap();
+        assert_eq!(dec, blob);
+    }
+
+    #[test]
+    fn answer_blob_rejects_unknown_version() {
+        let mut enc = encode_answer_blob(&sample_blob()).unwrap();
+        enc[0] = 0xFF;
+        assert!(matches!(
+            parse_answer_blob(&enc),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn answer_blob_rejects_reserved_flag_bits() {
+        let mut enc = encode_answer_blob(&sample_blob()).unwrap();
+        enc[1] |= 0b1000_0000;
+        assert!(matches!(
+            parse_answer_blob(&enc),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn answer_blob_rejects_oversize_candidate_count() {
+        let too_many = AnswerBlob {
+            ice_ufrag: "abcd".to_string(),
+            ice_pwd: "0123456789abcdefghij!@".to_string(),
+            setup: SetupRole::Passive,
+            candidates: (0..(MAX_BLOB_CANDIDATES + 1) as u8)
+                .map(|i| BlobCandidate {
+                    typ: CandidateType::Host,
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, i)),
+                    port: 1000 + i as u16,
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            encode_answer_blob(&too_many),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn answer_blob_rejects_short_ufrag() {
+        let bad = AnswerBlob {
+            ice_ufrag: "ab".to_string(),
+            ice_pwd: "0123456789abcdefghij!@".to_string(),
+            setup: SetupRole::Passive,
+            candidates: vec![],
+        };
+        assert!(matches!(
+            encode_answer_blob(&bad),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn answer_body_fits_in_single_fragment_with_main_record() {
+        // Seal a representative blob alongside the main record and
+        // assert the resulting BEP44 packet fits the 1000-byte cap with
+        // exactly one answer fragment — the whole point of the compact
+        // blob design.
+        let sk = host_sk();
+        let signed = SignedRecord::sign(sample_record(1_700_000_000), &sk).unwrap();
+        let client_pk = client_sk().public_key();
+        let daemon_pk = sk.public_key();
+        let salt = [0x33u8; SALT_LEN];
+
+        let plaintext = AnswerPlaintext {
+            daemon_pk,
+            offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
+            answer: AnswerPayload::V2Blob(sample_blob()),
+        };
+        let mut rng = deterministic_rng();
+        let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, 1).unwrap();
+
+        let expected_total = entry.sealed.len().div_ceil(MAX_FRAGMENT_PAYLOAD_BYTES);
+        assert_eq!(
+            expected_total, 1,
+            "compact blob should fit in a single fragment"
+        );
+
+        let packet = encode_with_answers(&signed, &sk, std::slice::from_ref(&entry)).unwrap();
+        assert!(
+            packet.encoded_packet().len() <= BEP44_MAX_V_BYTES,
+            "packet must fit BEP44 cap, got {}",
+            packet.encoded_packet().len()
+        );
+    }
+
+    #[test]
+    fn legacy_v1_answer_still_decodes_via_parse_answer_body() {
+        let daemon_pk = host_sk().public_key();
+        let answer_sdp = SAMPLE_ANSWER_SDP.to_string();
+        let sdp_bytes = answer_sdp.as_bytes();
+        let offer_sdp_hash = hash_offer_sdp(SAMPLE_OFFER_SDP);
+
+        let mut v1_body = Vec::new();
+        v1_body.extend_from_slice(ANSWER_INNER_DOMAIN_V1);
+        v1_body.extend_from_slice(&daemon_pk.to_bytes());
+        v1_body.extend_from_slice(&offer_sdp_hash);
+        v1_body.extend_from_slice(&(sdp_bytes.len() as u32).to_be_bytes());
+        v1_body.extend_from_slice(sdp_bytes);
+
+        let dec = parse_answer_body(&v1_body).unwrap();
+        assert_eq!(dec.daemon_pk, daemon_pk);
+        assert_eq!(dec.offer_sdp_hash, offer_sdp_hash);
+        match dec.answer {
+            AnswerPayload::V1Sdp(s) => assert_eq!(s, answer_sdp),
+            AnswerPayload::V2Blob(_) => panic!("expected V1Sdp"),
+        }
     }
 
     // ---------- seal / open ----------
@@ -1468,7 +2176,7 @@ mod tests {
         let plaintext = AnswerPlaintext {
             daemon_pk,
             offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
-            answer_sdp: SAMPLE_ANSWER_SDP.to_string(),
+            answer: AnswerPayload::V2Blob(sample_blob()),
         };
         let mut rng = deterministic_rng();
         let entry =
@@ -1510,7 +2218,7 @@ mod tests {
         let plaintext = AnswerPlaintext {
             daemon_pk,
             offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
-            answer_sdp: SAMPLE_ANSWER_SDP.to_string(),
+            answer: AnswerPayload::V2Blob(sample_blob()),
         };
         let mut rng = deterministic_rng();
         let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, 17).unwrap();
@@ -1606,7 +2314,7 @@ mod tests {
         let plaintext = AnswerPlaintext {
             daemon_pk: sk.public_key(),
             offer_sdp_hash: hash_offer_sdp(SAMPLE_OFFER_SDP),
-            answer_sdp: SAMPLE_ANSWER_SDP.to_string(),
+            answer: AnswerPayload::V2Blob(sample_blob()),
         };
         let mut rng = deterministic_rng();
         let entry = AnswerEntry::seal(&mut rng, &client_pk, &salt, &plaintext, 1).unwrap();

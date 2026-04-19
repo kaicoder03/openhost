@@ -143,12 +143,20 @@ async fn dialer_reassembles_fragmented_answer_from_wire() {
     // two records and still fit alongside the main `_openhost`
     // packet inside the BEP44 1000-byte cap.
     let sample_offer_sdp = "v=0\r\na=setup:active\r\n";
-    let sample_answer_sdp =
-        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=setup:passive\r\n";
+    let sample_blob = openhost_pkarr::AnswerBlob {
+        ice_ufrag: "abcd".to_string(),
+        ice_pwd: "0123456789abcdefghij!@".to_string(),
+        setup: openhost_pkarr::SetupRole::Passive,
+        candidates: vec![openhost_pkarr::BlobCandidate {
+            typ: openhost_pkarr::CandidateType::Srflx,
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+            port: 51_820,
+        }],
+    };
     let plaintext = openhost_pkarr::AnswerPlaintext {
         daemon_pk,
         offer_sdp_hash: openhost_pkarr::hash_offer_sdp(sample_offer_sdp),
-        answer_sdp: sample_answer_sdp.to_string(),
+        answer: openhost_pkarr::AnswerPayload::V2Blob(sample_blob.clone()),
     };
     let mut rng = rand::rngs::OsRng;
     let now_secs = std::time::SystemTime::now()
@@ -192,24 +200,26 @@ async fn dialer_reassembles_fragmented_answer_from_wire() {
         "wire-reassembled sealed bytes must byte-match the queued AnswerEntry",
     );
     let opened = reassembled.open(&client_sk).expect("answer opens");
-    assert_eq!(opened.answer_sdp, sample_answer_sdp);
+    match opened.answer {
+        openhost_pkarr::AnswerPayload::V2Blob(got) => assert_eq!(got, sample_blob),
+        openhost_pkarr::AnswerPayload::V1Sdp(s) => panic!("expected V2Blob, got V1 SDP: {s}"),
+    }
     assert_eq!(opened.daemon_pk, daemon_pk);
 
     app.shutdown().await;
 }
 
 /// End-to-end: the daemon produces a sealed answer for the dialer's
-/// offer, fragments it into `_answer-<client-hash>-<idx>` records, AND
-/// lands those fragments on the wire inside the BEP44 1000-byte budget.
+/// offer, fragments it into `_answer-<client-hash>-<idx>` records,
+/// lands those fragments on the wire inside the BEP44 1000-byte
+/// budget, AND the dial completes successfully (compact-answer-blob
+/// PR).
 ///
-/// `dial()` itself still returns `PollAnswerTimeout` in this in-process
-/// test because no routable ICE candidate pair exists between the two
-/// peers inside the same process (DTLS never starts). PR #25's real
-/// promise — the answer fits in one pkarr packet — is checked by
-/// resolving the daemon's packet from the memory net AFTER the dial
-/// attempt and confirming the fragment records are present. Before
-/// PR #25 this would have shown ZERO fragment records because
-/// `encode_with_answers` evicted them at encode time.
+/// Pre-compact-blob, `dial()` returned `PollAnswerTimeout` because the
+/// sealed answer routinely blew past the BEP44 cap and was evicted by
+/// `encode_with_answers`. With the compact blob, the sealed +
+/// fragmented answer fits with ~300 bytes of headroom and the full
+/// dial chain (ICE + DTLS + channel binding) runs to completion.
 #[tokio::test]
 async fn daemon_produces_sealed_answer_for_dialer_offer() {
     let _ = tracing_subscriber::fmt()
@@ -251,21 +261,9 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
         .build()
         .expect("dialer builds");
 
-    let outcome = dialer.dial().await;
-    match outcome {
-        Err(openhost_client::ClientError::PollAnswerTimeout(_)) => {
-            // Expected while real webrtc-rs answer sizes exceed the
-            // BEP44 cap even with fragmentation. See module docs.
-        }
-        Ok(_) => panic!(
-            "dial unexpectedly succeeded — the residual BEP44-size gap \
-             post-PR#15 appears to have closed on this configuration. \
-             Retire this test (or upgrade it to a full HTTP round-trip \
-             assertion) rather than letting it keep passing without \
-             checking what actually works."
-        ),
-        Err(other) => panic!("expected PollAnswerTimeout; got {other:?}"),
-    }
+    let _session = dialer.dial().await.expect(
+        "dial must complete end-to-end now that the compact answer blob closes the BEP44 gap",
+    );
 
     let expected_hash =
         openhost_core::crypto::allowlist_hash(&app.state().salt(), &client_pk.to_bytes());
@@ -281,28 +279,23 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
         });
     let opened = entry.open(&client_sk).expect("answer opens");
     assert_eq!(opened.daemon_pk, daemon_pk);
-    assert!(
-        opened.answer_sdp.contains("a=setup:passive"),
-        "answer SDP must assert a=setup:passive; got: {}",
-        opened.answer_sdp
-    );
+    match &opened.answer {
+        openhost_pkarr::AnswerPayload::V2Blob(blob) => {
+            assert_eq!(
+                blob.setup,
+                openhost_pkarr::SetupRole::Passive,
+                "daemon answer blob must assert passive setup role"
+            );
+        }
+        openhost_pkarr::AnswerPayload::V1Sdp(s) => {
+            panic!("daemon must emit v2 compact blobs, got v1 SDP: {s}")
+        }
+    }
 
-    // PR #25 partially closed the residual BEP44 gap: real webrtc-rs
-    // answers seal to ~493 bytes, and a single fragment at
-    // MAX_FRAGMENT_PAYLOAD_BYTES=500 needs ~714 wire bytes (40 bytes
-    // RR overhead + 667 bytes multi-string TXT rdata). Combined with
-    // the ~295-byte main record baseline, that totals ~1009 bytes —
-    // **9 bytes over** the BEP44 1000-byte cap. The encoder evicts
-    // the answer; the wire still has only the main record.
-    //
-    // Closing the last 9 bytes requires either stripping redundant
-    // lines from the webrtc-rs answer SDP before sealing (~20-byte
-    // win, plausible) or moving to trickle-ICE (skeleton answer +
-    // separate per-candidate records). Both are tracked as follow-up
-    // work in ROADMAP.md. This test documents the remaining gap by
-    // verifying the DAEMON queued the answer (PR #15 + PR #22 +
-    // PR #25 infrastructure all ran) AND that the published packet
-    // does NOT yet carry the fragments.
+    // Compact-blob PR closed the residual BEP44 gap: sealed answer
+    // drops from ~900B to ~220B sealed, with ~300B headroom in the
+    // 1000-byte packet. The daemon's latest published packet now
+    // carries the answer fragments for this client.
     let pk_bytes = daemon_pk.to_bytes();
     let pkarr_pk = pkarr::PublicKey::try_from(&pk_bytes).expect("pk");
     let resolver = net.as_resolve();
@@ -315,10 +308,6 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
         "daemon's signed packet exceeded the BEP44 1000-byte cap: got {}",
         packet.encoded_packet().len(),
     );
-    // Once a future PR closes the last handful of bytes (SDP
-    // stripping or trickle-ICE), this expectation flips from
-    // `is_none()` → `is_some()` and the test upgrades to a full
-    // wire-level round-trip assertion.
     let wire_entry = openhost_pkarr::decode_answer_fragments_from_packet(
         &packet,
         &app.state().salt(),
@@ -326,10 +315,8 @@ async fn daemon_produces_sealed_answer_for_dialer_offer() {
     )
     .expect("packet is well-formed");
     assert!(
-        wire_entry.is_none(),
-        "expected the answer to still be evicted pre-SDP-stripping; if this \
-         starts returning Some(_), the gap is closed — retire this assertion \
-         and assert byte equality against the SharedState snapshot instead",
+        wire_entry.is_some(),
+        "compact answer blob should fit on the wire alongside the main record",
     );
 
     app.shutdown().await;

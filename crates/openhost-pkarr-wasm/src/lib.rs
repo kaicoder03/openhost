@@ -160,11 +160,25 @@ pub fn seal_offer(
     .map_err(|e| to_js_err(&e))
 }
 
-/// Open an answer ciphertext with the client's 32-byte secret key.
-/// Returns an [`OpenedAnswer`][core::OpenedAnswer]-shaped JS object.
+/// Open an answer ciphertext with the client's 32-byte secret key and
+/// return a reconstructed SDP ready for
+/// `RTCPeerConnection.setRemoteDescription`. Handles both v1 and v2
+/// answer shapes transparently — see [`core::open_answer`] for the
+/// format description.
+///
+/// `host_dtls_fp_hex` is the lowercase-hex 64-char encoding of the
+/// host's SHA-256 DTLS certificate fingerprint, derived from the
+/// already-resolved pkarr `_openhost` record on the JS side
+/// (`record.dtls_fingerprint_hex`). Ignored for legacy v1 answers;
+/// required for v2.
 #[wasm_bindgen]
-pub fn open_answer(client_sk_bytes: &[u8], sealed_base64url: &str) -> Result<JsValue, JsError> {
-    let out = core::open_answer(client_sk_bytes, sealed_base64url).map_err(|e| to_js_err(&e))?;
+pub fn open_answer(
+    client_sk_bytes: &[u8],
+    sealed_base64url: &str,
+    host_dtls_fp_hex: &str,
+) -> Result<JsValue, JsError> {
+    let out = core::open_answer(client_sk_bytes, sealed_base64url, host_dtls_fp_hex)
+        .map_err(|e| to_js_err(&e))?;
     to_js(&out)
 }
 
