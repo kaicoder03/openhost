@@ -28,6 +28,7 @@ use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
+use hyper::upgrade::Upgraded;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
@@ -75,6 +76,29 @@ pub struct ForwardResponse {
     pub head_bytes: Vec<u8>,
     /// Response body. May be empty for 204 / 304 etc.
     pub body: Bytes,
+}
+
+/// A successful upstream WebSocket upgrade. The listener emits
+/// `head_bytes` as the `RESPONSE_HEAD` frame (`HTTP/1.1 101 Switching
+/// Protocols`) and then tunnels raw bytes between the openhost data
+/// channel and `upstream` (a bidirectional TCP socket hyper hands off
+/// after the 101).
+pub struct WebSocketUpgrade {
+    /// `HTTP/1.1 101 ...\r\n<headers>\r\n\r\n` bytes.
+    pub head_bytes: Vec<u8>,
+    /// Raw socket hyper yielded via `hyper::upgrade::on(response)`.
+    pub upstream: Upgraded,
+}
+
+/// What a successful `Forwarder::forward` produced: either a plain
+/// HTTP response the listener frames + re-emits, or a WebSocket
+/// upgrade the listener tunnels byte-for-byte.
+pub enum ForwardOutcome {
+    /// Plain HTTP round-trip.
+    Response(ForwardResponse),
+    /// `Upgrade: websocket` on an allow-listed path succeeded. The
+    /// listener emits the 101 head + spawns the byte-tunnel tasks.
+    WebSocket(WebSocketUpgrade),
 }
 
 /// The daemon's localhost forwarder.
@@ -148,11 +172,17 @@ impl Forwarder {
     /// payload verbatim (HTTP/1.1 request line + headers, terminated by
     /// `\r\n\r\n`); `body` is the concatenation of any `REQUEST_BODY`
     /// frames between HEAD and END.
+    ///
+    /// Returns [`ForwardOutcome::Response`] for plain HTTP round-trips
+    /// and [`ForwardOutcome::WebSocket`] when the request is
+    /// `Upgrade: websocket` on an allow-listed path AND the upstream
+    /// negotiates a 101. Non-WebSocket requests and rejected upgrades
+    /// always take the `Response` path.
     pub async fn forward(
         &self,
         head_payload: &[u8],
         body: Bytes,
-    ) -> Result<ForwardResponse, ForwardError> {
+    ) -> Result<ForwardOutcome, ForwardError> {
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -160,12 +190,24 @@ impl Forwarder {
         }
 
         let (method, path, mut headers) = parse_request_head(head_payload)?;
-        sanitize_request_headers(
-            &mut headers,
-            &self.host_override,
-            self.websockets.as_ref(),
-            &path,
-        )?;
+
+        // WebSocket-upgrade branch. Allow-listed path + `Upgrade:
+        // websocket` → preserve the upgrade headers and ride hyper's
+        // upgrade API. Anything else falls through to the plain-HTTP
+        // path below.
+        if is_websocket_upgrade(&headers) {
+            match self.websockets.as_ref() {
+                Some(cfg) if cfg.is_allowed(&path) => {
+                    return self
+                        .forward_websocket(method, path, headers, body)
+                        .await
+                        .map(ForwardOutcome::WebSocket);
+                }
+                _ => return Err(ForwardError::WebSocketUnsupported),
+            }
+        }
+
+        sanitize_request_headers(&mut headers, &self.host_override)?;
 
         // Build the outbound URI by combining the target origin with the
         // request path. The path comes from the client verbatim; no
@@ -222,11 +264,69 @@ impl Forwarder {
             .to_bytes();
 
         let head_bytes = encode_response_head(parts.status, parts.headers, collected.len())?;
-        Ok(ForwardResponse {
+        Ok(ForwardOutcome::Response(ForwardResponse {
             head_bytes,
             body: collected,
+        }))
+    }
+
+    /// WebSocket upgrade branch of [`Self::forward`]. Preserves the
+    /// `Upgrade` / `Connection` / `Sec-WebSocket-*` headers the upstream
+    /// needs to complete the handshake, sends the request, and on a
+    /// 101 Switching Protocols response hands off the raw TCP socket
+    /// via `hyper::upgrade::on`. A non-101 response is treated as a
+    /// handshake failure and surfaced as `UpstreamResponse`.
+    async fn forward_websocket(
+        &self,
+        method: Method,
+        path: String,
+        mut headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<WebSocketUpgrade, ForwardError> {
+        sanitize_websocket_request_headers(&mut headers, &self.host_override)?;
+        let target_uri = combine_target_and_path(&self.target, &path)?;
+        let mut req_builder = Request::builder().method(method).uri(target_uri);
+        if let Some(req_headers) = req_builder.headers_mut() {
+            *req_headers = headers;
+        }
+        let req = req_builder
+            .body(Full::new(body))
+            .map_err(|e| ForwardError::HeadParse(header_error_reason(&e)))?;
+
+        let response = self
+            .client
+            .request(req)
+            .await
+            .map_err(|e| ForwardError::UpstreamUnreachable(e.to_string()))?;
+
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            return Err(ForwardError::UpstreamResponse(
+                "websocket upstream did not return 101 Switching Protocols",
+            ));
+        }
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let upgraded = hyper::upgrade::on(response)
+            .await
+            .map_err(|e| ForwardError::UpstreamUnreachable(format!("upgrade failed: {e}")))?;
+
+        let head_bytes = encode_websocket_response_head(status, headers)?;
+        Ok(WebSocketUpgrade {
+            head_bytes,
+            upstream: upgraded,
         })
     }
+}
+
+/// Fast-path check for `Upgrade: websocket` on an inbound request.
+/// Case-insensitive; allows extra whitespace around the token.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
 }
 
 /// Hand-rolled strict HTTP/1.1 request head parser. Accepts:
@@ -296,40 +396,15 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
     Ok((method, path, headers))
 }
 
-/// Strip hop-by-hop + provenance headers, reject or defer websocket
-/// upgrades based on the configured allowlist, and pin `Host` to the
-/// configured override.
-///
-/// WebSocket decision tree (spec §4.2):
-/// - `Upgrade: websocket` + path on `websockets.allowed_paths` →
-///   [`ForwardError::WebSocketPending`]. Scope-B daemons can't tunnel
-///   yet, but the operator's config is correct and the log line tells
-///   them so.
-/// - `Upgrade: websocket` + no allowlist, or path not on the
-///   allowlist → [`ForwardError::WebSocketUnsupported`]. The operator
-///   needs to update their config, or the upstream is asking for an
-///   upgrade that shouldn't be forwarded in the first place.
+/// Strip hop-by-hop + provenance headers and pin `Host` to the
+/// configured override. Plain-HTTP path only; `Forwarder::forward`
+/// routes `Upgrade: websocket` requests to
+/// [`sanitize_websocket_request_headers`] via `forward_websocket`
+/// before this runs.
 fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
-    websockets: Option<&WebSocketConfig>,
-    request_path: &str,
 ) -> Result<(), ForwardError> {
-    // Classify websocket upgrades BEFORE stripping `Upgrade` as
-    // hop-by-hop. Keeps both branches reachable: config absent =>
-    // unconditional reject; config present => allowlist check.
-    if let Some(upgrade) = headers.get(http::header::UPGRADE) {
-        let v = upgrade.to_str().unwrap_or("").trim();
-        if v.eq_ignore_ascii_case("websocket") {
-            return match websockets {
-                Some(cfg) if cfg.is_allowed(request_path) => Err(ForwardError::WebSocketPending {
-                    path: request_path.to_string(),
-                }),
-                _ => Err(ForwardError::WebSocketUnsupported),
-            };
-        }
-    }
-
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -343,6 +418,59 @@ fn sanitize_request_headers(
     headers.insert(http::header::HOST, host_value);
 
     Ok(())
+}
+
+/// WebSocket variant of [`sanitize_request_headers`] — same
+/// hop-by-hop + provenance cleanup, but keeps `Upgrade` and
+/// `Connection` on the outbound request so the upstream can finish
+/// the RFC 6455 handshake. Every `Sec-WebSocket-*` header is passed
+/// through unchanged (Key, Version, Protocol, Extensions).
+fn sanitize_websocket_request_headers(
+    headers: &mut HeaderMap,
+    host_override: &str,
+) -> Result<(), ForwardError> {
+    for name in HOP_BY_HOP_HEADERS {
+        if *name == "connection" || *name == "upgrade" {
+            continue;
+        }
+        headers.remove(*name);
+    }
+    for name in PROVENANCE_HEADERS {
+        headers.remove(*name);
+    }
+    let host_value = HeaderValue::from_str(host_override).map_err(|_| {
+        ForwardError::HeadParse("configured host_override is not a valid header value")
+    })?;
+    headers.insert(http::header::HOST, host_value);
+    Ok(())
+}
+
+/// Re-encode an upstream WebSocket 101 response head into the bytes
+/// the listener emits as `RESPONSE_HEAD`. Keeps `Connection`,
+/// `Upgrade`, and every `Sec-WebSocket-*` header so the openhost
+/// client can validate `Sec-WebSocket-Accept` just like it would
+/// against a normal WS server.
+fn encode_websocket_response_head(
+    status: StatusCode,
+    mut headers: HeaderMap,
+) -> Result<Vec<u8>, ForwardError> {
+    for name in HOP_BY_HOP_HEADERS {
+        if *name == "connection" || *name == "upgrade" {
+            continue;
+        }
+        headers.remove(*name);
+    }
+    let reason = status.canonical_reason().unwrap_or("Switching Protocols");
+    let mut out = Vec::with_capacity(128 + headers.len() * 64);
+    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    for (name, value) in &headers {
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    Ok(out)
 }
 
 /// Build `http://<target-authority><path>` for the outbound request.
@@ -474,7 +602,7 @@ mod tests {
     #[test]
     fn sanitize_strips_all_hop_by_hop_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
         for name in HOP_BY_HOP_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -486,7 +614,7 @@ mod tests {
     #[test]
     fn sanitize_strips_all_provenance_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
         for name in PROVENANCE_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -498,7 +626,7 @@ mod tests {
     #[test]
     fn sanitize_preserves_benign_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
         assert_eq!(
             h.get("x-custom").map(|v| v.to_str().unwrap()),
             Some("keep-me")
@@ -508,7 +636,7 @@ mod tests {
     #[test]
     fn sanitize_pins_host() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
         assert_eq!(
             h.get(http::header::HOST).map(|v| v.to_str().unwrap()),
             Some("127.0.0.1:8080"),
@@ -518,74 +646,90 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_websocket_upgrade() {
+    fn sanitize_strips_websocket_upgrade_header_on_plain_http_path() {
+        // After PR #26 the WebSocket decision moved UP into
+        // `Forwarder::forward`; `sanitize_request_headers` handles
+        // plain-HTTP only. If a request with `Upgrade: websocket`
+        // somehow reaches this function (e.g. a test bypassing the
+        // classifier), the header is stripped as hop-by-hop per
+        // RFC 7230 §6.1. The upstream never sees it.
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        let err = sanitize_request_headers(&mut h, "x", None, "/").unwrap_err();
-        assert!(matches!(err, ForwardError::WebSocketUnsupported));
+        sanitize_request_headers(&mut h, "x").unwrap();
+        assert!(!h.contains_key(http::header::UPGRADE));
     }
 
-    fn ws_cfg(paths: &[&str]) -> WebSocketConfig {
-        WebSocketConfig {
-            allowed_paths: paths.iter().map(|s| s.to_string()).collect(),
-        }
+    // The PR #26 decision tree (allow-listed WS → upgrade;
+    // denied/no-config → WebSocketUnsupported; plain HTTP → continue)
+    // now lives in `Forwarder::forward` itself and is tested via the
+    // `websocket.rs` integration test which drives a real
+    // tokio-tungstenite echo upstream. The sanitizer functions below
+    // are the header-level primitives — `sanitize_request_headers`
+    // for plain-HTTP, `sanitize_websocket_request_headers` for the
+    // upgrade path — both now parameter-free beyond headers + host.
+
+    #[test]
+    fn is_websocket_upgrade_matches_case_insensitively() {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("WebSocket"));
+        assert!(is_websocket_upgrade(&h));
     }
 
     #[test]
-    fn sanitize_websocket_with_matching_allowlist_returns_pending() {
+    fn is_websocket_upgrade_false_for_other_upgrades() {
         let mut h = HeaderMap::new();
-        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        let cfg = ws_cfg(&["/ws"]);
-        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/ws").unwrap_err();
-        assert!(matches!(
-            err,
-            ForwardError::WebSocketPending { ref path } if path == "/ws"
-        ));
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
+        assert!(!is_websocket_upgrade(&h));
     }
 
     #[test]
-    fn sanitize_websocket_strips_query_before_matching() {
+    fn is_websocket_upgrade_false_when_header_absent() {
+        assert!(!is_websocket_upgrade(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn sanitize_websocket_preserves_connection_and_upgrade() {
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        let cfg = ws_cfg(&["/ws"]);
-        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/ws?client=abc").unwrap_err();
-        assert!(
-            matches!(err, ForwardError::WebSocketPending { ref path } if path == "/ws?client=abc"),
-            "path in the error message preserves the query string for operator log clarity; \
-             the ALLOWLIST match strips it, not the error payload",
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Upgrade"),
+        );
+        h.insert(
+            HeaderName::from_static("sec-websocket-key"),
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        h.insert(
+            HeaderName::from_static("sec-websocket-version"),
+            HeaderValue::from_static("13"),
+        );
+        sanitize_websocket_request_headers(&mut h, "upstream.local").unwrap();
+        assert!(h.contains_key(http::header::UPGRADE));
+        assert!(h.contains_key(http::header::CONNECTION));
+        assert!(h.contains_key("sec-websocket-key"));
+        assert!(h.contains_key("sec-websocket-version"));
+        assert_eq!(
+            h.get(http::header::HOST).map(|v| v.to_str().unwrap()),
+            Some("upstream.local")
         );
     }
 
     #[test]
-    fn sanitize_websocket_wildcard_matches_any_path() {
+    fn sanitize_websocket_still_strips_other_hop_by_hop() {
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        let cfg = ws_cfg(&["*"]);
-        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/anything/deeply/nested")
-            .unwrap_err();
-        assert!(matches!(err, ForwardError::WebSocketPending { .. }));
-    }
-
-    #[test]
-    fn sanitize_websocket_outside_allowlist_is_unsupported() {
-        let mut h = HeaderMap::new();
-        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        let cfg = ws_cfg(&["/ws"]);
-        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/elsewhere").unwrap_err();
-        assert!(matches!(err, ForwardError::WebSocketUnsupported));
-    }
-
-    #[test]
-    fn sanitize_websocket_with_empty_config_option_is_unsupported() {
-        // Belt-and-braces: even with Some(&cfg) where cfg.allowed_paths
-        // is empty, no path can match. Config::validate rejects this
-        // upstream, but the sanitizer should fail-closed if a caller
-        // somehow constructs one.
-        let mut h = HeaderMap::new();
-        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        let cfg = ws_cfg(&[]);
-        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/ws").unwrap_err();
-        assert!(matches!(err, ForwardError::WebSocketUnsupported));
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Upgrade"),
+        );
+        h.insert(http::header::TE, HeaderValue::from_static("trailers"));
+        h.insert(
+            http::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        sanitize_websocket_request_headers(&mut h, "x").unwrap();
+        assert!(!h.contains_key(http::header::TE));
+        assert!(!h.contains_key(http::header::TRANSFER_ENCODING));
     }
 
     #[test]
@@ -596,7 +740,7 @@ mod tests {
         // just strip it as hop-by-hop so the upstream never sees it.
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
-        sanitize_request_headers(&mut h, "x", None, "/").unwrap();
+        sanitize_request_headers(&mut h, "x").unwrap();
         assert!(!h.contains_key(http::header::UPGRADE));
     }
 

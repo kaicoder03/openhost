@@ -21,7 +21,7 @@ use crate::channel_binding::{
     EXPORTER_SECRET_LEN,
 };
 use crate::error::ListenerError;
-use crate::forward::{ForwardResponse, Forwarder};
+use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
@@ -450,6 +450,13 @@ async fn wire_frame_loop(
     let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
+    // `Some(tx)` during an active WebSocket tunnel; `None` otherwise.
+    // Incoming `WsFrame` frames push their payload into `tx`, which the
+    // tunnel's upstream-writer task reads and relays to the upgraded
+    // TCP socket. Arc'd so dispatch_frame can hold a short read lock
+    // per frame without serialising the whole tunnel.
+    let ws_tunnel: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>> =
+        Arc::new(Mutex::new(None));
     // Notified by `handle_auth_client` on success OR on terminal failure
     // so the timeout task exits early instead of sleeping its full budget
     // after binding has already resolved.
@@ -526,6 +533,7 @@ async fn wire_frame_loop(
         let binder = Arc::clone(&binder);
         let dtls_transport = Arc::clone(&dtls_transport);
         let dc = Arc::clone(&dc_handler);
+        let ws_tunnel = Arc::clone(&ws_tunnel);
         let forwarder = forwarder.clone();
         Box::pin(async move {
             let mut buf = buffer.lock().await;
@@ -542,6 +550,7 @@ async fn wire_frame_loop(
                             &binder,
                             &dtls_transport,
                             &request,
+                            &ws_tunnel,
                             forwarder.as_deref(),
                         )
                         .await;
@@ -578,12 +587,13 @@ enum FrameOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_frame(
     frame: &Frame,
-    dc: &RTCDataChannel,
+    dc: &Arc<RTCDataChannel>,
     binding: &Arc<Mutex<BindingState>>,
     binding_done: &Arc<Notify>,
     binder: &ChannelBinder,
     dtls_transport: &RTCDtlsTransport,
     request: &Arc<Mutex<RequestInProgress>>,
+    ws_tunnel: &Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
     forwarder: Option<&Forwarder>,
 ) -> FrameOutcome {
     // Look up binding state, then release the lock before awaiting
@@ -694,9 +704,19 @@ async fn dispatch_frame(
             };
             match forwarder {
                 Some(fwd) => match fwd.forward(&head, body.freeze()).await {
-                    Ok(resp) => {
+                    Ok(ForwardOutcome::Response(resp)) => {
                         if let Err(err) = emit_response(dc, resp).await {
                             tracing::warn!(?err, "openhostd: failed to emit response frames");
+                        }
+                    }
+                    Ok(ForwardOutcome::WebSocket(upgrade)) => {
+                        let ws_tunnel = Arc::clone(ws_tunnel);
+                        if let Err(err) = start_websocket_tunnel(dc, upgrade, ws_tunnel).await {
+                            tracing::warn!(
+                                ?err,
+                                "openhostd: failed to start websocket tunnel; replying 502"
+                            );
+                            let _ = emit_stub_502(dc).await;
                         }
                     }
                     Err(err) => {
@@ -710,6 +730,35 @@ async fn dispatch_frame(
                 }
             }
             FrameOutcome::Continue
+        }
+        FrameType::WsFrame => {
+            let tx_opt = ws_tunnel.lock().await.clone();
+            match tx_opt {
+                Some(tx) => {
+                    if tx.send(Bytes::from(frame.payload.clone())).is_err() {
+                        // Upstream tunnel task dropped the receiver →
+                        // the upgraded TCP socket closed. Tear the DC
+                        // down so the client notices.
+                        tracing::info!("openhostd: websocket upstream closed; tearing down DC");
+                        return FrameOutcome::Teardown;
+                    }
+                    FrameOutcome::Continue
+                }
+                None => {
+                    tracing::warn!("openhostd: WS_FRAME before websocket upgrade; tearing down");
+                    let _ = send_error_frame(dc, "WS_FRAME before upgrade").await;
+                    FrameOutcome::Teardown
+                }
+            }
+        }
+        FrameType::WsUpgrade => {
+            // WS_UPGRADE is reserved but unused in this release —
+            // upgrades are driven by REQUEST_HEAD's `Upgrade:
+            // websocket` header. Receiving it from a client is a
+            // protocol violation.
+            tracing::warn!("openhostd: unexpected WS_UPGRADE frame; tearing down");
+            let _ = send_error_frame(dc, "WS_UPGRADE frames are reserved").await;
+            FrameOutcome::Teardown
         }
         FrameType::Ping => {
             let pong = Frame::new(FrameType::Pong, Vec::new()).expect("Pong is empty");
@@ -733,11 +782,8 @@ async fn dispatch_frame(
         FrameType::Pong => FrameOutcome::Continue,
         // Response frames coming from the CLIENT side are protocol
         // violations; REQUEST_* is the only direction we accept.
-        FrameType::ResponseHead
-        | FrameType::ResponseBody
-        | FrameType::ResponseEnd
-        | FrameType::WsUpgrade
-        | FrameType::WsFrame => {
+        // WsUpgrade + WsFrame are handled by their own arms above.
+        FrameType::ResponseHead | FrameType::ResponseBody | FrameType::ResponseEnd => {
             tracing::warn!(
                 ?frame.frame_type,
                 "openhostd: client sent unexpected frame type; tearing down"
@@ -872,6 +918,89 @@ async fn handle_auth_client(
 /// browser limits and also matches the "openhost frames are self-
 /// contained" contract the spec implies.
 ///
+/// Start a WebSocket tunnel after a successful upstream 101. Emits
+/// the 101 head as `RESPONSE_HEAD`, wires an mpsc channel into the
+/// listener's per-DC `ws_tunnel` slot, and spawns two detached
+/// tasks: one copies bytes from the upgraded upstream socket into
+/// `WsFrame` frames on the DC, and one pulls bytes received as
+/// `WsFrame` out of the mpsc channel and writes them to the socket.
+/// Returns once both tasks are spawned; the tasks run until either
+/// side closes.
+async fn start_websocket_tunnel(
+    dc: &Arc<RTCDataChannel>,
+    upgrade: WebSocketUpgrade,
+    ws_tunnel: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
+) -> Result<(), webrtc::Error> {
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Emit the 101 first so the client transitions to WS mode before
+    // any WsFrame arrives.
+    send_frame(
+        dc,
+        Frame::new(FrameType::ResponseHead, upgrade.head_bytes)
+            .expect("response head is well-formed"),
+    )
+    .await?;
+
+    // hyper's `Upgraded` implements hyper::rt::{Read, Write}. Wrap it
+    // in TokioIo so we can use tokio's AsyncRead/AsyncWrite surface.
+    let upstream = TokioIo::new(upgrade.upstream);
+    let (mut upstream_r, mut upstream_w) = tokio::io::split(upstream);
+
+    // Arm the ws_tunnel slot so inbound WsFrame routes to us.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    *ws_tunnel.lock().await = Some(tx);
+
+    // Upstream → client: read bytes, wrap in WsFrame, send on DC.
+    let dc_upstream = Arc::clone(dc);
+    let ws_tunnel_up = Arc::clone(&ws_tunnel);
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match upstream_r.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let frame = match Frame::new(FrameType::WsFrame, buf[..n].to_vec()) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!(?e, "openhostd: ws_frame build failed; closing tunnel");
+                            break;
+                        }
+                    };
+                    let mut wire = Vec::with_capacity(n + 5);
+                    frame.encode(&mut wire);
+                    if dc_upstream.send(&Bytes::from(wire)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(?err, "openhostd: ws upstream read error; closing tunnel");
+                    break;
+                }
+            }
+        }
+        // Upstream closed → clear the slot + close the DC so the
+        // client stops trying to send further WsFrame.
+        *ws_tunnel_up.lock().await = None;
+        let _ = dc_upstream.close().await;
+    });
+
+    // Client → upstream: receive bytes via mpsc, write to socket.
+    let ws_tunnel_down = Arc::clone(&ws_tunnel);
+    tokio::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            if upstream_w.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = upstream_w.shutdown().await;
+        *ws_tunnel_down.lock().await = None;
+    });
+
+    Ok(())
+}
+
 /// Body chunks are bounded by [`MAX_PAYLOAD_LEN`] (16 MiB − 1) per
 /// the wire codec; larger upstream bodies get split into multiple
 /// `RESPONSE_BODY` frames.
