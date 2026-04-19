@@ -48,7 +48,10 @@ cargo build --release --features cli -p openhost-client
 The full workspace suite is fast — under ten seconds on a warm machine for everything except the integration tests that spin up a real WebRTC stack.
 
 ```bash
-# Unit + integration tests.
+# Unit + integration tests. --all-features compiles every cargo feature
+# across the workspace (including `nostr` on openhost-pkarr and
+# `test-fakes` on openhost-client); the real-network tests stay #[ignore]
+# so they don't actually hit public substrates from this command.
 cargo test --workspace --all-features --no-fail-fast
 
 # Lints — CI fails on any warning.
@@ -64,7 +67,8 @@ A handful of tests are gated behind `--features real-network` and `#[ignore]`. T
 
 ```bash
 cargo test -p openhost-daemon --features real-network -- --ignored
-cargo test -p openhost-pkarr --features real-network -- --ignored
+cargo test -p openhost-pkarr  --features real-network -- --ignored
+cargo test -p openhost-client --features real-network -- --ignored
 ```
 
 ### Documentation site
