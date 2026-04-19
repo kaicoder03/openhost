@@ -23,6 +23,8 @@ brew install --HEAD https://raw.githubusercontent.com/kaicoder03/openhost/main/d
 
 `--HEAD` bypasses the `version` + `url` + `sha256` pinning and builds/downloads from the URL directly. Drop the flag once the SHA256 placeholders in `openhost.rb` have been filled in with real values against a tagged release.
 
+> **No checksum verification on the `--HEAD` path.** `--HEAD` installs whatever `raw.githubusercontent.com` returns; the artifact is not integrity-checked against a pinned SHA256. Only install via this command from a branch + raw URL you trust (the main repo, a known contributor's fork, etc.). For untrusted sources use the tapped install, which does verify the `sha256` in the formula.
+
 ## Maintainer notes: setting up the tap repo
 
 These are one-time steps for a project maintainer after the first binary release (v0.3.0+) is live.
@@ -52,6 +54,8 @@ These are one-time steps for a project maintainer after the first binary release
    ```
 
    Replace each `"0000…0000"` placeholder in `Formula/openhost.rb` with the matching checksum, bump the `version` line to the release tag (minus the `v` prefix), then commit + push the tap repo.
+
+   > **Keep the loop's `v0.3.0` and the formula's `version` in lockstep.** The `curl` URL above hardcodes `v0.3.0`; when releasing v0.3.1 or later, edit both the loop tag and the `version` line in `openhost.rb` to the new tag. Mismatches produce a formula pinned to one version that downloads a different one — a silent checksum failure at install time.
 
 4. **Verify.** From a clean shell:
 
