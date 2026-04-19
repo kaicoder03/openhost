@@ -166,19 +166,28 @@ pub const OFFER_TXT_TTL: u32 = 30;
 const FRAGMENT_VERSION: u8 = 0x01;
 const FRAGMENT_HEADER_LEN: usize = 5;
 
-/// Maximum payload bytes per fragment. Sized so that each fragment's
-/// `base64url(header || payload)` fits comfortably inside a single DNS
-/// TXT character-string (the 255-byte limit in RFC 1035 §3.3.14) while
-/// leaving room to pack multiple fragments alongside the main record
-/// inside BEP44's 1000-byte packet cap.
-pub const MAX_FRAGMENT_PAYLOAD_BYTES: usize = 180;
+/// Maximum payload bytes per fragment. Bumped from 180 → 500 in PR #25:
+/// real webrtc-rs answers seal to ~450 bytes, which at 180-byte fragments
+/// forced a 3-fragment encoding whose combined DNS-RR overhead tipped the
+/// BEP44 1000-byte packet over the cap. At 500, the common case is a
+/// single fragment whose base64url value is ~670 chars; the fragment's
+/// TXT record carries it as multiple DNS character-strings per RFC 1035
+/// §3.3.14 (each ≤ 255 bytes). Decoders concatenate character-strings
+/// before base64url-decoding, so the on-wire change is transparent.
+pub const MAX_FRAGMENT_PAYLOAD_BYTES: usize = 500;
 
 /// Maximum number of fragments per answer. Bounded by the `u8`
 /// `chunk_total` field on the wire (so 255 is both the hard ceiling
-/// and `u8::MAX`). At [`MAX_FRAGMENT_PAYLOAD_BYTES`] = 180 this caps
-/// the sealed ciphertext per answer at 45,900 bytes — well past
+/// and `u8::MAX`). At [`MAX_FRAGMENT_PAYLOAD_BYTES`] = 500 this caps
+/// the sealed ciphertext per answer at 127,500 bytes — well past
 /// anything a plausible WebRTC answer produces.
 pub const MAX_FRAGMENT_TOTAL: u8 = 255;
+
+/// DNS TXT character-string ceiling per RFC 1035 §3.3.14. The
+/// `simple-dns` crate (via `pkarr`) enforces this on every string a
+/// caller appends to a `TXT` rdata; values longer than this must be
+/// split into multiple strings within the same RR.
+const DNS_CHARACTER_STRING_MAX: usize = 255;
 
 fn encode_fragment(idx: u8, total: u8, payload: &[u8]) -> Vec<u8> {
     debug_assert!(payload.len() <= MAX_FRAGMENT_PAYLOAD_BYTES);
@@ -594,17 +603,56 @@ fn build_packet(
 ) -> Result<SignedPacket> {
     let mut builder = SignedPacket::builder().timestamp(ts).txt(
         Name::new_unchecked(OPENHOST_TXT_NAME),
-        TXT::try_from(main_txt).map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?,
+        build_multi_string_txt(main_txt)?,
         OPENHOST_TXT_TTL,
     );
     for (name, value) in records {
         builder = builder.txt(
             Name::new_unchecked(name),
-            TXT::try_from(value.as_str()).map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?,
+            build_multi_string_txt(value)?,
             OFFER_TXT_TTL,
         );
     }
     Ok(builder.sign(keypair)?)
+}
+
+/// Build a DNS TXT rdata from an arbitrary-length ASCII value, splitting
+/// it across multiple character-strings as needed (each ≤ 255 bytes per
+/// RFC 1035 §3.3.14). Used by every writer of `_openhost` and
+/// `_answer-*` fragment TXTs so values larger than one DNS character-
+/// string (e.g. post-PR-25 answer fragments at `MAX_FRAGMENT_PAYLOAD_BYTES
+/// = 500`) encode correctly.
+///
+/// Callers MUST pass an ASCII value (typically a base64url string).
+/// Non-ASCII inputs would split at byte boundaries that straddle
+/// code-points and the decoder would see mojibake. Debug builds assert
+/// the invariant.
+fn build_multi_string_txt(value: &str) -> Result<TXT<'static>> {
+    debug_assert!(
+        value.is_ascii(),
+        "build_multi_string_txt expects ASCII; multi-byte UTF-8 would be split mid-code-point"
+    );
+    // `simple_dns::TXT::with_string` borrows the input string for the
+    // lifetime of the returned TXT. To hand back a `TXT<'static>` we
+    // collect every chunk into an owned `Vec<String>` that outlives
+    // the loop's borrows, then call `into_owned()` at the end to
+    // internalise those borrows.
+    let chunks: Vec<String> = value
+        .as_bytes()
+        .chunks(DNS_CHARACTER_STRING_MAX)
+        .map(|c| {
+            core::str::from_utf8(c)
+                .expect("caller guaranteed ASCII")
+                .to_string()
+        })
+        .collect();
+    let mut txt = TXT::new();
+    for s in &chunks {
+        txt = txt
+            .with_string(s)
+            .map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?;
+    }
+    Ok(txt.into_owned())
 }
 
 /// Look for an `_offer-<host-hash>` TXT inside `packet` and return it
@@ -1293,23 +1341,32 @@ mod tests {
     fn encode_evicts_oldest_when_overflow() {
         let sk = host_sk();
         let signed = reference_signed();
-        let daemon_pk = sk.public_key();
         let salt = [0x33u8; SALT_LEN];
 
         // Two entries, each small enough that ONE fits alongside the
         // main record, but not both. The oldest MUST be evicted; the
         // fresher MUST survive.
-        let medium_sdp = "v=0\r\n".to_string() + &"a=candidate: UDP ".repeat(9);
+        //
+        // Constructs the AnswerEntry directly with synthetic large
+        // `sealed` payloads to keep the test independent of zlib's
+        // compression ratio on whatever sample SDP we happened to
+        // pick. Each entry's sealed ciphertext is 450 bytes of
+        // high-entropy pseudorandom content — just under
+        // MAX_FRAGMENT_PAYLOAD_BYTES = 500, so one answer fragments
+        // into a single RR, and two of them exceed the BEP44 budget
+        // with the main `_openhost` record.
         let mut entries = Vec::new();
         for (i, seed_byte) in [(0u64, 0x10u8), (1u64, 0x11u8)] {
             let pk = SigningKey::from_bytes(&[seed_byte; 32]).public_key();
-            let plaintext = AnswerPlaintext {
-                daemon_pk,
-                offer_sdp_hash: hash_offer_sdp(&medium_sdp),
-                answer_sdp: medium_sdp.clone(),
-            };
+            let client_hash = allowlist_hash(&salt, &pk.to_bytes());
             let mut rng = StdRng::from_seed([seed_byte; 32]);
-            entries.push(AnswerEntry::seal(&mut rng, &pk, &salt, &plaintext, i).unwrap());
+            let mut sealed = vec![0u8; 450];
+            rand::RngCore::fill_bytes(&mut rng, &mut sealed);
+            entries.push(AnswerEntry {
+                client_hash,
+                sealed,
+                created_at: i,
+            });
         }
 
         let packet = encode_with_answers(&signed, &sk, &entries).unwrap();
@@ -1392,8 +1449,11 @@ mod tests {
     /// decode_fragment.
     #[test]
     fn multi_fragment_answer_reassembles() {
-        // 420 raw bytes → 3 fragments (180 + 180 + 60).
-        let sealed = (0u8..=u8::MAX).cycle().take(420).collect::<Vec<u8>>();
+        // At MAX_FRAGMENT_PAYLOAD_BYTES = 500, a single fragment now
+        // holds up to 500 raw bytes, so to exercise multi-fragment
+        // reassembly we need a larger synthetic payload. 1300 raw
+        // bytes → 3 fragments (500 + 500 + 300).
+        let sealed = (0u8..=u8::MAX).cycle().take(1300).collect::<Vec<u8>>();
         let fragments = split_into_fragments(&sealed).unwrap();
         assert_eq!(fragments.len(), 3);
         let mut decoded: Vec<DecodedFragment> = fragments
