@@ -239,4 +239,4 @@ The first tagged release. Daemon + client + pkarr integration + WebRTC + channel
 
 [Unreleased]: https://github.com/kaicoder03/openhost/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/kaicoder03/openhost/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/kaicoder03/openhost/releases/tag/v0.1.0
+[0.1.0]: https://github.com/kaicoder03/openhost/tree/v0.1.0
