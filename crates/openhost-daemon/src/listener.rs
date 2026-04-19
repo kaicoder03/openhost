@@ -89,6 +89,25 @@ fn pc_key(pc: &Arc<RTCPeerConnection>) -> PcKey {
     Arc::as_ptr(pc) as PcKey
 }
 
+/// Bundled STUN servers used to discover the daemon's server-
+/// reflexive (srflx) ICE candidate. Without at least one STUN server
+/// in `RTCConfiguration.ice_servers`, webrtc-rs produces only
+/// `host`-type candidates — i.e. the local LAN / VPC address — which
+/// is useless for dials from outside the local network. The list is
+/// hardcoded so operators on a fresh daemon don't have to know this.
+/// Prefer Cloudflare over Google for privacy; fall back to Google so
+/// a single relay outage doesn't break ICE entirely.
+fn default_stun_servers() -> Vec<webrtc::ice_transport::ice_server::RTCIceServer> {
+    // One STUN server, not two — each STUN binding response produces
+    // its own `srflx` candidate line, and the sealed answer record's
+    // BEP44 1000-byte `v` cap doesn't have headroom for duplicates.
+    // Cloudflare's STUN is preferred over Google for privacy.
+    vec![webrtc::ice_transport::ice_server::RTCIceServer {
+        urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
+        ..Default::default()
+    }]
+}
+
 /// The daemon's passive WebRTC peer.
 ///
 /// Holds a single `webrtc::api::API` so every inbound offer shares one
@@ -148,6 +167,27 @@ impl PassivePeer {
         // §3.1 says the daemon MUST be passive.
         let mut engine = SettingEngine::default();
         engine.set_answering_dtls_role(DTLSRole::Server)?;
+        // Filter ICE candidate gathering:
+        //   - interface name NOT in {docker0, docker*, br-*, veth*, tap*}.
+        //     These are local bridges with per-host-only routability;
+        //     gathering them crowds out the real LAN interface and
+        //     produces answers that no remote peer can connect to.
+        //   - IP NOT IPv6 link-local (fe80::/10) — scope-required,
+        //     can't be bound raw, and adds ~60-100 bytes of SDP each.
+        engine.set_interface_filter(Box::new(|iface: &str| {
+            !(iface.starts_with("docker")
+                || iface.starts_with("br-")
+                || iface.starts_with("veth")
+                || iface.starts_with("tap"))
+        }));
+        // IPv4-only on the answer side too — mirror client filter
+        // (webrtc_helpers.rs). Multi-family candidate sets blow out
+        // the BEP44 1000-byte `v` cap on the fragmented answer record
+        // and get silently evicted. Revisit when fragmentation has
+        // more headroom (e.g. offer/answer move off the main packet).
+        engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| {
+            matches!(ip, std::net::IpAddr::V4(_))
+        }));
 
         let api = APIBuilder::new().with_setting_engine(engine).build();
 
@@ -243,6 +283,7 @@ impl PassivePeer {
     ) -> Result<String, ListenerError> {
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
+            ice_servers: default_stun_servers(),
             ..Default::default()
         };
         let pc = Arc::new(self.api.new_peer_connection(config).await?);
@@ -288,13 +329,34 @@ impl PassivePeer {
                 "local description missing after set_local_description",
             ))?;
 
+        // Drop component-2 (RTCP) candidate lines — SCTP data
+        // channels use `a=rtcp-mux` so component 2 is never sent and
+        // the line just bloats the sealed answer record against BEP44's
+        // 1000-byte `v` cap. This halves the per-candidate overhead
+        // (a 5-candidate answer drops from 10 lines to 5) without
+        // breaking any ICE topology.
+        let trimmed_sdp: String = local_desc
+            .sdp
+            .lines()
+            .filter(|line| {
+                if let Some(rest) = line.strip_prefix("a=candidate:") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    parts.get(1).copied() != Some("2")
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            + "\r\n";
+
         // Keep the PC alive so the DTLS handshake can complete after we
         // return the answer SDP. The prune hook wired above will remove
         // this entry on Closed / Failed / Disconnected.
         let key = pc_key(&pc);
         self.active.lock().await.insert(key, pc);
 
-        Ok(local_desc.sdp)
+        Ok(trimmed_sdp)
     }
 }
 

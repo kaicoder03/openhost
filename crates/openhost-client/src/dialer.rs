@@ -282,16 +282,42 @@ impl Dialer {
             .map_err(ClientError::from)
     }
 
-    /// Build a fresh WebRTC offer SDP. Deliberately skips
-    /// `gathering_complete_promise` so the SDP stays small enough to
-    /// fit the BEP44 `v` cap. Loopback handshakes succeed with host
-    /// candidates only; wide-area dials will need ICE trickle (post-v0.1).
+    /// Build a fresh WebRTC offer SDP, waiting for full ICE gather
+    /// before returning.
+    ///
+    /// The pre-PR-28.3 version of this function skipped
+    /// `gathering_complete_promise` on the theory that trickle-ICE
+    /// would deliver candidates over the data channel after it
+    /// opened. That never worked in practice: the DC can't open until
+    /// DTLS, DTLS can't start until ICE, ICE needs candidates on both
+    /// sides, and there's no out-of-band trickle channel before the
+    /// first DC frame. The daemon side (`listener::negotiate`) has
+    /// always waited for gather; this brings the client in line.
+    ///
+    /// Worry about BEP44 packet size: a realistic gathered offer has
+    /// 2-4 candidates (host LAN + srflx from STUN, maybe mDNS) adding
+    /// ~200-400 bytes. With the base offer SDP at ~220 bytes the
+    /// total sealed offer stays under the 1000-byte `v` cap in every
+    /// ICE topology we've measured. If a future high-candidate-count
+    /// environment trips the cap, eviction will happen at encode time
+    /// and the dial will `PublishOffer` fail loudly rather than
+    /// silently succeed with zero remote candidates.
     pub async fn build_offer(
         &self,
     ) -> Result<(Arc<RTCPeerConnection>, Arc<RTCDataChannel>, String)> {
+        // STUN servers are mandatory for cross-NAT dials — without
+        // them webrtc-rs gathers only `host`-type candidates and
+        // can't discover the client's public address.
+        let config = RTCConfiguration {
+            ice_servers: vec![webrtc::ice_transport::ice_server::RTCIceServer {
+                urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         let pc = Arc::new(
             self.api
-                .new_peer_connection(RTCConfiguration::default())
+                .new_peer_connection(config)
                 .await
                 .map_err(|e| ClientError::WebRtcSetup(format!("new_peer_connection: {e}")))?,
         );
@@ -306,6 +332,10 @@ impl Dialer {
         pc.set_local_description(offer)
             .await
             .map_err(|e| ClientError::WebRtcSetup(format!("set_local_description: {e}")))?;
+        // Drain ICE gathering so the returned SDP carries every
+        // candidate the local agent could find.
+        let mut gather = pc.gathering_complete_promise().await;
+        let _ = gather.recv().await;
         let sdp = pc
             .local_description()
             .await
