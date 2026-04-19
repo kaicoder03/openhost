@@ -23,9 +23,9 @@ use crate::channel_binding::{
 use crate::error::ListenerError;
 use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
 use crate::publish::SharedState;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
-use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
+use openhost_core::wire::{Frame, FrameType, FRAME_HEADER_LEN, MAX_PAYLOAD_LEN};
 use openhost_pkarr::BindingMode;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -595,7 +595,7 @@ async fn wire_frame_loop(
     forwarder: Option<Arc<Forwarder>>,
     binding_mode: BindingMode,
 ) {
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::new()));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
     // `Some(tx)` during an active WebSocket tunnel; `None` otherwise.
@@ -635,9 +635,7 @@ async fn wire_frame_loop(
                     let mut s = binding.lock().await;
                     *s = BindingState::AwaitingAuthClient { nonce };
                 }
-                let frame = Frame::new(FrameType::AuthNonce, nonce.to_vec())
-                    .expect("32-byte nonce always fits the frame cap");
-                if let Err(err) = send_frame(&dc, frame).await {
+                if let Err(err) = send_frame(&dc, FrameType::AuthNonce, &nonce).await {
                     tracing::warn!(?err, "openhostd: failed to send AuthNonce; closing DC");
                     *binding.lock().await = BindingState::Failed;
                     binding_done.notify_waiters();
@@ -689,7 +687,7 @@ async fn wire_frame_loop(
             loop {
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                        buf.advance(consumed);
                         let outcome = dispatch_frame(
                             &frame,
                             &dc,
@@ -913,10 +911,7 @@ async fn dispatch_frame(
             FrameOutcome::Teardown
         }
         FrameType::Ping => {
-            let pong = Frame::new(FrameType::Pong, Vec::new()).expect("Pong is empty");
-            let mut out = Vec::with_capacity(5);
-            pong.encode(&mut out);
-            if let Err(err) = dc.send(&Bytes::from(out)).await {
+            if let Err(err) = send_frame(dc, FrameType::Pong, &[]).await {
                 tracing::warn!(?err, "openhostd: failed to send Pong");
             }
             FrameOutcome::Continue
@@ -1042,13 +1037,7 @@ async fn handle_auth_client(
         }
     };
 
-    if let Err(err) = send_frame(
-        dc,
-        Frame::new(FrameType::AuthHost, host_sig.to_vec())
-            .expect("64-byte host signature fits the frame cap"),
-    )
-    .await
-    {
+    if let Err(err) = send_frame(dc, FrameType::AuthHost, &host_sig).await {
         tracing::warn!(?err, "openhostd: failed to send AuthHost; tearing down");
         *binding.lock().await = BindingState::Failed;
         binding_done.notify_waiters();
@@ -1130,12 +1119,7 @@ async fn start_websocket_tunnel(
 
     // Emit the 101 first so the client transitions to WS mode before
     // any WsFrame arrives.
-    send_frame(
-        dc,
-        Frame::new(FrameType::ResponseHead, upgrade.head_bytes)
-            .expect("response head is well-formed"),
-    )
-    .await?;
+    send_frame(dc, FrameType::ResponseHead, &upgrade.head_bytes).await?;
 
     // hyper's `Upgraded` implements hyper::rt::{Read, Write}. Wrap it
     // in TokioIo so we can use tokio's AsyncRead/AsyncWrite surface.
@@ -1155,16 +1139,10 @@ async fn start_websocket_tunnel(
             match upstream_r.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let frame = match Frame::new(FrameType::WsFrame, buf[..n].to_vec()) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            tracing::warn!(?e, "openhostd: ws_frame build failed; closing tunnel");
-                            break;
-                        }
-                    };
-                    let mut wire = Vec::with_capacity(n + 5);
-                    frame.encode(&mut wire);
-                    if dc_upstream.send(&Bytes::from(wire)).await.is_err() {
+                    if send_frame(&dc_upstream, FrameType::WsFrame, &buf[..n])
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1199,35 +1177,32 @@ async fn start_websocket_tunnel(
 /// the wire codec; larger upstream bodies get split into multiple
 /// `RESPONSE_BODY` frames.
 async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(), webrtc::Error> {
-    send_frame(
-        dc,
-        Frame::new(FrameType::ResponseHead, resp.head_bytes).expect("response head is well-formed"),
-    )
-    .await?;
+    send_frame(dc, FrameType::ResponseHead, &resp.head_bytes).await?;
 
     let body = resp.body;
     let mut offset = 0;
     while offset < body.len() {
         let end = (offset + MAX_PAYLOAD_LEN).min(body.len());
         let slice = body.slice(offset..end);
-        let body_frame = Frame::new(FrameType::ResponseBody, slice.to_vec())
-            .expect("chunk length bounded by MAX_PAYLOAD_LEN");
-        send_frame(dc, body_frame).await?;
+        send_frame(dc, FrameType::ResponseBody, &slice).await?;
         offset = end;
     }
 
-    send_frame(
-        dc,
-        Frame::new(FrameType::ResponseEnd, Vec::new()).expect("ResponseEnd empty"),
-    )
-    .await?;
+    send_frame(dc, FrameType::ResponseEnd, &[]).await?;
     Ok(())
 }
 
 /// Encode one frame and send it as its own data-channel message.
-async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<(), webrtc::Error> {
-    let mut buf = Vec::with_capacity(5 + frame.payload.len());
-    frame.encode(&mut buf);
+async fn send_frame(
+    dc: &RTCDataChannel,
+    frame_type: FrameType,
+    payload: &[u8],
+) -> Result<(), webrtc::Error> {
+    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    buf.push(frame_type.as_u8());
+    let len = u32::try_from(payload.len()).expect("length fits in u32");
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(payload);
     dc.send(&Bytes::from(buf)).await?;
     Ok(())
 }
@@ -1236,17 +1211,8 @@ async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<(), webrtc::Err
 /// no forwarder is configured AND as the fallback when the forwarder
 /// errors (upstream unreachable, body too large, etc.).
 async fn emit_stub_502(dc: &RTCDataChannel) -> Result<(), webrtc::Error> {
-    send_frame(
-        dc,
-        Frame::new(FrameType::ResponseHead, RESPONSE_502_HEAD.to_vec())
-            .expect("502 head payload is well-formed"),
-    )
-    .await?;
-    send_frame(
-        dc,
-        Frame::new(FrameType::ResponseEnd, Vec::new()).expect("ResponseEnd has empty payload"),
-    )
-    .await?;
+    send_frame(dc, FrameType::ResponseHead, RESPONSE_502_HEAD).await?;
+    send_frame(dc, FrameType::ResponseEnd, &[]).await?;
     Ok(())
 }
 
@@ -1254,12 +1220,7 @@ async fn emit_stub_502(dc: &RTCDataChannel) -> Result<(), webrtc::Error> {
 /// effort — failure is logged by the caller but doesn't prevent
 /// teardown.
 async fn send_error_frame(dc: &RTCDataChannel, reason: &str) -> Result<(), webrtc::Error> {
-    send_frame(
-        dc,
-        Frame::new(FrameType::Error, reason.as_bytes().to_vec())
-            .expect("error diagnostic is well-formed"),
-    )
-    .await
+    send_frame(dc, FrameType::Error, reason.as_bytes()).await
 }
 
 #[cfg(test)]
@@ -1308,12 +1269,15 @@ mod tests {
 
     #[test]
     fn response_502_frame_pair_encodes_and_decodes() {
-        let head = Frame::new(FrameType::ResponseHead, RESPONSE_502_HEAD.to_vec()).unwrap();
-        let end = Frame::new(FrameType::ResponseEnd, Vec::new()).unwrap();
-
         let mut wire = Vec::new();
-        head.encode(&mut wire);
-        end.encode(&mut wire);
+        // Manually encode frames to test the decoder compatibility with
+        // our manual encoding in `send_frame`.
+        wire.push(FrameType::ResponseHead.as_u8());
+        wire.extend_from_slice(&(RESPONSE_502_HEAD.len() as u32).to_le_bytes());
+        wire.extend_from_slice(RESPONSE_502_HEAD);
+
+        wire.push(FrameType::ResponseEnd.as_u8());
+        wire.extend_from_slice(&0u32.to_le_bytes());
 
         let (decoded_head, consumed_head) = Frame::try_decode(&wire).unwrap().unwrap();
         assert_eq!(decoded_head.frame_type, FrameType::ResponseHead);
