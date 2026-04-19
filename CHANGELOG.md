@@ -8,6 +8,19 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #27, Homebrew tap infrastructure)
+
+- **New `distribution/homebrew/openhost.rb`** — Homebrew formula that installs the three openhost binaries (`openhostd`, `openhost-dial`, `openhost-resolve`) on macOS (Apple Silicon + Intel) and Linux x86_64. Uses `on_macos` / `on_linux` + `on_arm` / `on_intel` blocks to pick the matching GitHub Releases tarball produced by `.github/workflows/release.yml`. `test do` block asserts `#{bin}/openhostd --version`, `#{bin}/openhost-dial --version`, and `#{bin}/openhost-resolve --version` each emit the expected version string. Each platform's `sha256` is a 64-zero placeholder documented as TBD — a maintainer fills them in against the first tagged v0.3.0+ release using `shasum -a 256` on each downloaded archive (procedure in the companion README).
+- **New `distribution/homebrew/README.md`** — operator-facing doc covering the post-tap `brew tap kaicoder03/openhost && brew install openhost` workflow, a pre-tap-creation `brew install --HEAD <raw-url>` fallback, and a "Maintainer notes: setting up the tap repo" section with step-by-step commands to create `github.com/kaicoder03/homebrew-openhost`, copy `openhost.rb` into `Formula/openhost.rb`, compute per-platform SHA256s, commit, and verify. Flags that the SHA256 update is manual today and that automating it via a tap-update workflow is a future maintainer-only PR.
+- **`distribution/README.md`** — new `## Homebrew` section between `launchd` and `Security note`, plus a row in the top-level artifact table referencing `homebrew/openhost.rb`. Surfaces the one-line `brew tap … && brew install openhost` command and links out to `homebrew/README.md` for setup details.
+- **`site/src/content/docs/guides/install.md`** — the "Homebrew" subsection (previously: "Coming soon — the tap is blocked on the first automated release firing") now documents the real `brew tap` + `brew install` commands, the `--HEAD`-from-raw-URL fallback for pre-tap testing, and a pointer at `distribution/homebrew/README.md` for maintainer details.
+
+### Out of scope for PR #27
+
+- **The `kaicoder03/homebrew-openhost` tap repo itself.** PR #27 lands the formula source + documentation; creating the companion public repo, copying the formula in, and filling in real SHA256 values after the first v0.3.0 release artifact is published is a manual maintainer step (documented in `distribution/homebrew/README.md`).
+- **Automated tap-update workflow.** A future maintainer-only PR can add a second GitHub Actions workflow that, on each successful `release.yml` run, computes the SHA256 for each platform archive, edits `Formula/openhost.rb` in the tap repo, and opens a PR. For now the bump is manual — a ~2-minute loop per release.
+- **macOS code signing / notarization.** Homebrew-installed binaries remain unsigned; operators clear the Gatekeeper quarantine attribute on first run. Paid-dev-cert signing is tracked separately in the ROADMAP.
+
 ### Added (PR #26, WebSocket bidirectional tunnel)
 
 - **Full daemon-side WebSocket tunnel.** PR #24's policy layer (`[forward.websockets] allowed_paths`) is now backed by a real implementation: an allow-listed `Upgrade: websocket` request is forwarded upstream with all its WS headers preserved; on a 101 the daemon takes ownership of the upgraded TCP socket via `hyper::upgrade::on(response)` and spawns two bidirectional byte-copy tasks that shuttle payloads between the openhost data channel (wrapped in `0x21 WS_FRAME` frames) and the upstream socket.

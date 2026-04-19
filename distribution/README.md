@@ -8,6 +8,7 @@ Service-manager files and other artifacts that help operators run the daemon in 
 |---|---|
 | [`systemd/openhostd.service`](systemd/openhostd.service) | Linux systemd unit with resource limits and basic sandboxing. |
 | [`launchd/com.openhost.openhostd.plist`](launchd/com.openhost.openhostd.plist) | macOS launchd property list (user or system agent). |
+| [`homebrew/openhost.rb`](homebrew/openhost.rb) | Homebrew formula for macOS (aarch64/x86_64) + Linux x86_64. |
 
 A Homebrew tap (`kaicoder03/homebrew-openhost`) is planned once at least one tagged release has produced binary artifacts via `.github/workflows/release.yml`. That workflow landed in PR #23; the first release it runs against will be the trigger for the tap.
 
@@ -79,6 +80,18 @@ rm ~/Library/LaunchAgents/com.openhost.openhostd.plist
 ### System daemon
 
 Same file, but install to `/Library/LaunchDaemons/` with owner `root:wheel` and load with `sudo launchctl load`. Edit the plist's `UserName` key first.
+
+## Homebrew
+
+The formula at [`homebrew/openhost.rb`](homebrew/openhost.rb) installs the three binaries (`openhostd`, `openhost-dial`, `openhost-resolve`) on macOS (Apple Silicon + Intel) and Linux x86_64, pulling the matching tarball from GitHub Releases.
+
+Once the tap repo exists:
+
+```bash
+brew tap kaicoder03/openhost && brew install openhost
+```
+
+The tap repo at `kaicoder03/homebrew-openhost` does **not** exist yet — a maintainer creates it and copies `homebrew/openhost.rb` into `Formula/openhost.rb` before the next tagged release. See [`homebrew/README.md`](homebrew/README.md) for the full setup procedure, the pre-tap testing command (`brew install --HEAD <raw-url>`), and the per-release SHA256 update steps.
 
 ## Security note
 
