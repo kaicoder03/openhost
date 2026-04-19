@@ -29,6 +29,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 /// Domain-separation salt for the allowlist-salt derivation. Stable across
 /// openhost protocol versions so a daemon rebooted on the same identity
@@ -73,8 +74,8 @@ impl SharedState {
     /// is derived deterministically from `identity` via HKDF-SHA256 (see
     /// the struct-level doc for the scheme).
     pub fn new(identity: &SigningKey, dtls_fp: [u8; DTLS_FINGERPRINT_LEN]) -> Self {
-        let seed = identity.to_bytes();
-        let hk = Hkdf::<Sha256>::new(Some(ALLOW_SALT_HKDF_SALT), &seed);
+        let seed = Zeroizing::new(identity.to_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(ALLOW_SALT_HKDF_SALT), seed.as_ref());
         let mut salt = [0u8; SALT_LEN];
         hk.expand(&[], &mut salt)
             .expect("HKDF expansion to 32 bytes cannot fail");
