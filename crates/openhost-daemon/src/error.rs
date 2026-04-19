@@ -185,11 +185,24 @@ pub enum ForwardError {
         cap: usize,
     },
 
-    /// Request asserts `Upgrade: websocket`; per spec §4 line 162,
-    /// websockets are gated by explicit per-path config and this PR
-    /// doesn't ship that gating yet.
-    #[error("Upgrade: websocket is not supported by this daemon (gating is a future PR)")]
+    /// Request asserts `Upgrade: websocket` but no `[forward.websockets]`
+    /// allowlist is configured, or the target path is not on it. Operators
+    /// who want to allow WebSocket upgrades per spec §4.2 must add the
+    /// path (or `"*"`) to `forward.websockets.allowed_paths`.
+    #[error("Upgrade: websocket rejected — target path not on forward.websockets.allowed_paths")]
     WebSocketUnsupported,
+
+    /// Request asserts `Upgrade: websocket` AND the target path IS on
+    /// the configured allowlist, but the daemon version at hand hasn't
+    /// shipped the actual tunnel yet. Scope-B groundwork in PR #24;
+    /// PR #25 implements the bidirectional byte proxy. Operators who
+    /// see this error in the log can stop checking their config and
+    /// wait for the next release.
+    #[error("Upgrade: websocket for path {path:?} is allow-listed but the tunnel implementation is pending (tracked in ROADMAP.md)")]
+    WebSocketPending {
+        /// The request path the client attempted to upgrade on.
+        path: String,
+    },
 
     /// Upstream refused the connection, timed out, or returned an
     /// unrecoverable protocol error.

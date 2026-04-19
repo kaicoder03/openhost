@@ -46,6 +46,7 @@ fn test_config(dir: &TempDir, upstream_port: u16) -> Config {
             target: Some(format!("http://127.0.0.1:{upstream_port}")),
             host_override: None,
             max_body_bytes: 1024 * 1024,
+            websockets: None,
         }),
         log: LogConfig::default(),
         pairing: Default::default(),

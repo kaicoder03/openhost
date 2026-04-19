@@ -22,7 +22,7 @@
 //! binary framing), and `Content-Length` rewritten to match the
 //! buffered body length.
 
-use crate::config::ForwardConfig;
+use crate::config::{ForwardConfig, WebSocketConfig};
 use crate::error::ForwardError;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
@@ -91,6 +91,9 @@ pub struct Forwarder {
     /// [`ForwardError::BodyTooLarge`] before any upstream bytes are
     /// sent.
     max_body_bytes: usize,
+    /// Optional WebSocket tunnel allowlist. `None` preserves the
+    /// pre-PR-24 behaviour of rejecting every `Upgrade: websocket`.
+    websockets: Option<WebSocketConfig>,
 }
 
 impl Forwarder {
@@ -131,6 +134,7 @@ impl Forwarder {
             host_override,
             client,
             max_body_bytes: cfg.max_body_bytes,
+            websockets: cfg.websockets.clone(),
         }))
     }
 
@@ -156,7 +160,12 @@ impl Forwarder {
         }
 
         let (method, path, mut headers) = parse_request_head(head_payload)?;
-        sanitize_request_headers(&mut headers, &self.host_override)?;
+        sanitize_request_headers(
+            &mut headers,
+            &self.host_override,
+            self.websockets.as_ref(),
+            &path,
+        )?;
 
         // Build the outbound URI by combining the target origin with the
         // request path. The path comes from the client verbatim; no
@@ -287,17 +296,37 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
     Ok((method, path, headers))
 }
 
-/// Strip hop-by-hop + provenance headers, reject websocket upgrades,
-/// and pin `Host` to the configured override.
+/// Strip hop-by-hop + provenance headers, reject or defer websocket
+/// upgrades based on the configured allowlist, and pin `Host` to the
+/// configured override.
+///
+/// WebSocket decision tree (spec §4.2):
+/// - `Upgrade: websocket` + path on `websockets.allowed_paths` →
+///   [`ForwardError::WebSocketPending`]. Scope-B daemons can't tunnel
+///   yet, but the operator's config is correct and the log line tells
+///   them so.
+/// - `Upgrade: websocket` + no allowlist, or path not on the
+///   allowlist → [`ForwardError::WebSocketUnsupported`]. The operator
+///   needs to update their config, or the upstream is asking for an
+///   upgrade that shouldn't be forwarded in the first place.
 fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
+    websockets: Option<&WebSocketConfig>,
+    request_path: &str,
 ) -> Result<(), ForwardError> {
-    // Reject websocket upgrades BEFORE stripping `Upgrade`.
+    // Classify websocket upgrades BEFORE stripping `Upgrade` as
+    // hop-by-hop. Keeps both branches reachable: config absent =>
+    // unconditional reject; config present => allowlist check.
     if let Some(upgrade) = headers.get(http::header::UPGRADE) {
         let v = upgrade.to_str().unwrap_or("").trim();
         if v.eq_ignore_ascii_case("websocket") {
-            return Err(ForwardError::WebSocketUnsupported);
+            return match websockets {
+                Some(cfg) if cfg.is_allowed(request_path) => Err(ForwardError::WebSocketPending {
+                    path: request_path.to_string(),
+                }),
+                _ => Err(ForwardError::WebSocketUnsupported),
+            };
         }
     }
 
@@ -445,7 +474,7 @@ mod tests {
     #[test]
     fn sanitize_strips_all_hop_by_hop_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
         for name in HOP_BY_HOP_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -457,7 +486,7 @@ mod tests {
     #[test]
     fn sanitize_strips_all_provenance_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
         for name in PROVENANCE_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -469,7 +498,7 @@ mod tests {
     #[test]
     fn sanitize_preserves_benign_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
         assert_eq!(
             h.get("x-custom").map(|v| v.to_str().unwrap()),
             Some("keep-me")
@@ -479,7 +508,7 @@ mod tests {
     #[test]
     fn sanitize_pins_host() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        sanitize_request_headers(&mut h, "127.0.0.1:8080", None, "/").unwrap();
         assert_eq!(
             h.get(http::header::HOST).map(|v| v.to_str().unwrap()),
             Some("127.0.0.1:8080"),
@@ -492,7 +521,70 @@ mod tests {
     fn sanitize_rejects_websocket_upgrade() {
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        let err = sanitize_request_headers(&mut h, "x").unwrap_err();
+        let err = sanitize_request_headers(&mut h, "x", None, "/").unwrap_err();
+        assert!(matches!(err, ForwardError::WebSocketUnsupported));
+    }
+
+    fn ws_cfg(paths: &[&str]) -> WebSocketConfig {
+        WebSocketConfig {
+            allowed_paths: paths.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn sanitize_websocket_with_matching_allowlist_returns_pending() {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        let cfg = ws_cfg(&["/ws"]);
+        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/ws").unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::WebSocketPending { ref path } if path == "/ws"
+        ));
+    }
+
+    #[test]
+    fn sanitize_websocket_strips_query_before_matching() {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        let cfg = ws_cfg(&["/ws"]);
+        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/ws?client=abc").unwrap_err();
+        assert!(
+            matches!(err, ForwardError::WebSocketPending { ref path } if path == "/ws?client=abc"),
+            "path in the error message preserves the query string for operator log clarity; \
+             the ALLOWLIST match strips it, not the error payload",
+        );
+    }
+
+    #[test]
+    fn sanitize_websocket_wildcard_matches_any_path() {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        let cfg = ws_cfg(&["*"]);
+        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/anything/deeply/nested")
+            .unwrap_err();
+        assert!(matches!(err, ForwardError::WebSocketPending { .. }));
+    }
+
+    #[test]
+    fn sanitize_websocket_outside_allowlist_is_unsupported() {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        let cfg = ws_cfg(&["/ws"]);
+        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/elsewhere").unwrap_err();
+        assert!(matches!(err, ForwardError::WebSocketUnsupported));
+    }
+
+    #[test]
+    fn sanitize_websocket_with_empty_config_option_is_unsupported() {
+        // Belt-and-braces: even with Some(&cfg) where cfg.allowed_paths
+        // is empty, no path can match. Config::validate rejects this
+        // upstream, but the sanitizer should fail-closed if a caller
+        // somehow constructs one.
+        let mut h = HeaderMap::new();
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        let cfg = ws_cfg(&[]);
+        let err = sanitize_request_headers(&mut h, "x", Some(&cfg), "/ws").unwrap_err();
         assert!(matches!(err, ForwardError::WebSocketUnsupported));
     }
 
@@ -504,7 +596,7 @@ mod tests {
         // just strip it as hop-by-hop so the upstream never sees it.
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
-        sanitize_request_headers(&mut h, "x").unwrap();
+        sanitize_request_headers(&mut h, "x", None, "/").unwrap();
         assert!(!h.contains_key(http::header::UPGRADE));
     }
 
@@ -581,6 +673,7 @@ mod tests {
             target: None,
             host_override: None,
             max_body_bytes: 1024,
+            websockets: None,
         };
         assert!(Forwarder::from_config(&cfg).unwrap().is_none());
     }
@@ -591,6 +684,7 @@ mod tests {
             target: Some("https://example.com".into()),
             host_override: None,
             max_body_bytes: 1024,
+            websockets: None,
         };
         // `Forwarder` isn't `Debug`, so `unwrap_err()` won't compile —
         // pattern-match the `Result` instead.
@@ -604,6 +698,7 @@ mod tests {
             target: Some("not a url".into()),
             host_override: None,
             max_body_bytes: 1024,
+            websockets: None,
         };
         let result = Forwarder::from_config(&cfg);
         assert!(matches!(result, Err(ForwardError::TargetParse(_))));
@@ -615,6 +710,7 @@ mod tests {
             target: Some("http://127.0.0.1:8080".into()),
             host_override: None,
             max_body_bytes: 1024,
+            websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
         assert_eq!(fwd.host_override, "127.0.0.1:8080");
@@ -626,6 +722,7 @@ mod tests {
             target: Some("http://127.0.0.1:8080".into()),
             host_override: Some("my-service.local".into()),
             max_body_bytes: 1024,
+            websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
         assert_eq!(fwd.host_override, "my-service.local");

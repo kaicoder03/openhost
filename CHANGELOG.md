@@ -8,6 +8,20 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #24, WebSocket allowlist policy layer)
+
+- **New `[forward.websockets]` config section** with `allowed_paths: Vec<String>`. Each entry is an exact path match against the request URI (query string stripped); a single-entry `"*"` wildcard is accepted for development. Omitting the section preserves v0.2 behaviour (every `Upgrade: websocket` rejected). A present-but-empty `allowed_paths` is rejected at `Config::validate` time.
+- **Three-way WebSocket decision tree in the forwarder.** `sanitize_request_headers` now takes the websocket config + request path and classifies inbound upgrade requests:
+  - Path on the allowlist → **new `ForwardError::WebSocketPending { path }`** variant. The operator's config is correct; the daemon version at hand just hasn't shipped the tunnel implementation yet. The error message names the path so operators can distinguish "config is good, wait for the tunnel release" from "config is wrong".
+  - Path absent OR no allowlist configured → `ForwardError::WebSocketUnsupported` (existing). Message updated to cite `forward.websockets.allowed_paths` so operators know where to configure the fix.
+  - Anything else → normal HTTP forward (unchanged).
+- **Spec §4.2** added — documents the policy surface, conformance requirements for the daemon, and explicitly marks `0x20 WS_UPGRADE` and `0x21 WS_FRAME` as reserved for the tunnel implementation (policy-only daemons **MUST NOT** emit them).
+- 5 new unit tests in `forward::tests`: matching allowlist returns pending; query-string stripping before match; wildcard matches any path; path outside allowlist is unsupported; present-but-empty config fails closed.
+
+### Out of scope (deferred to a follow-up PR)
+
+Bidirectional WebSocket tunnel — hyper upgrade path on the forwarder, listener `WebSocket` state machine, `tokio-tungstenite`-backed integration test, client `OpenhostSession::upgrade_websocket()` ergonomic API. Operators can land their `[forward.websockets]` config against this release; the tunnel lands when the follow-up PR merges, with no config-schema changes required.
+
 ### Added (PR #23, distributable binaries)
 
 - **New `.github/workflows/release.yml`** — fires on `v*` tag push (or `workflow_dispatch` for backfills). Builds `openhostd`, `openhost-dial`, `openhost-resolve` on native GitHub runners for Linux x86_64, macOS aarch64, macOS x86_64, and Windows x86_64; strips, packs (`.tar.gz` / `.zip`), and uploads to the matching GitHub release via `softprops/action-gh-release`. Release body is sliced out of the matching `## [X.Y.Z]` section of `CHANGELOG.md` by a small awk filter; `fail_on_unmatched_files: true` guards against a silent no-op on a misconfigured glob.
