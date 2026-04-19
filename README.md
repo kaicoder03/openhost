@@ -74,6 +74,10 @@ Reports of vulnerabilities: **please use GitHub's private Security Advisories** 
 
 The threat model is documented in [`spec/04-security.md`](spec/04-security.md). **openhost is pre-audit software: `v0.1.0` has shipped but no third-party security review has taken place. Do not use it to expose services you cannot afford to have compromised.**
 
+## Contributing
+
+Bug reports, docs, new examples, and protocol clarifications are all welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev setup, test commands, PR cadence, and what makes a bug report actionable.
+
 ## License
 
 Dual-licensed under either of:

@@ -8,6 +8,17 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #20, CONTRIBUTING.md)
+
+- **New root-level `CONTRIBUTING.md`.** Covers: what contributions are welcome and what needs discussion first; dev setup (Rust 1.90 toolchain, pnpm for site); the three test commands we gate on (`cargo test --workspace --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all --check`) plus the opt-in `--features real-network` suite; the five-step plan → implement → self-review → fix-all → merge PR cadence; how to propose a spec change (issue first for non-trivial changes, `spec/**` is markdown-linted); a concrete "filing good bug reports" checklist (`openhost-resolve --json`, debug-level daemon log, client stderr) linking the bug-report issue template; and a security-report pointer at GitHub Private Security Advisories.
+- `README.md` gains a `Contributing` section immediately above `License` linking the new doc.
+
+### Verification (PR #20)
+
+- `cargo check --workspace` clean (no code changes).
+- Every referenced path exists: `PULL_REQUEST_TEMPLATE.md`, both issue templates, `SECURITY.md`, `ROADMAP.md`, `CHANGELOG.md`, `spec/04-security.md`, `rust-toolchain.toml`.
+- GitHub Discussions is **not** silently claimed to exist; document notes honestly that it's not enabled and directs readers at issues with the `question` label instead.
+
 ### Added (PR #19, README Quickstart + worked examples)
 
 - `README.md` gains a **Quickstart** section — four copy-paste commands that clone, build, run, and dial — plus a link to the fuller [site Quickstart guide](https://kaicoder03.github.io/openhost/guides/quickstart/). The Repository-layout table now names the three worked examples we actually ship.
