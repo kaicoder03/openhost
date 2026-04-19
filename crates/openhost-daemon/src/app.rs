@@ -378,7 +378,14 @@ async fn build_listener(
     state: Arc<SharedState>,
     forwarder: Option<Arc<Forwarder>>,
 ) -> Result<Arc<PassivePeer>> {
-    let peer = PassivePeer::new(cert.certificate.clone(), identity, state, forwarder).await?;
+    let peer = PassivePeer::new(
+        cert.certificate.clone(),
+        cert.fingerprint_sha256,
+        identity,
+        state,
+        forwarder,
+    )
+    .await?;
     Ok(Arc::new(peer))
 }
 

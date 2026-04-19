@@ -75,19 +75,32 @@ fn daemon_config(
     }
 }
 
+/// Synthetic v3 offer blob for negative-path tests that never need
+/// the daemon to actually parse the SDP. Real-path tests derive the
+/// blob from a live webrtc-rs SDP via [`real_client_offer_sdp`].
+fn synthetic_offer_blob() -> openhost_pkarr::OfferBlob {
+    openhost_pkarr::OfferBlob {
+        ice_ufrag: "abcd".to_string(),
+        ice_pwd: "0123456789abcdefghij!@".to_string(),
+        setup: openhost_pkarr::SetupRole::Active,
+        binding_mode: openhost_pkarr::BindingMode::Exporter,
+        client_dtls_fp: [0xCDu8; openhost_pkarr::DTLS_FP_LEN],
+        candidates: vec![],
+    }
+}
+
 /// Build a pkarr `SignedPacket` under the client's key carrying a
-/// `_offer-<host-hash>` TXT that seals `offer_sdp` to `daemon_pk`.
+/// `_offer-<host-hash>` TXT that seals the given `offer_blob` to
+/// `daemon_pk`. Post-compact-offer-blob: the helper takes a blob so
+/// negative-path tests can ship a synthetic blob without needing a
+/// full webrtc-rs SDP.
 async fn build_client_offer_packet(
     client_sk: &SigningKey,
     daemon_pk: &openhost_core::identity::PublicKey,
-    offer_sdp: &str,
+    offer_blob: openhost_pkarr::OfferBlob,
     ts_secs: u64,
 ) -> SignedPacket {
-    let plaintext = OfferPlaintext {
-        client_pk: client_sk.public_key(),
-        offer_sdp: offer_sdp.to_string(),
-        binding_mode: openhost_pkarr::BindingMode::Exporter,
-    };
+    let plaintext = OfferPlaintext::new_v3(client_sk.public_key(), offer_blob);
     let mut rng = OsRng;
     let offer = OfferRecord::seal(&mut rng, daemon_pk, &plaintext).unwrap();
     let txt_value = URL_SAFE_NO_PAD.encode(&offer.sealed);
@@ -175,7 +188,15 @@ async fn daemon_polls_scripted_offer_and_publishes_answer() -> DaemonResult<()> 
     // Stash the client's offer under its pkarr zone.
     let daemon_pk = app.identity().public_key();
     let offer_sdp = real_client_offer_sdp().await;
-    let packet = build_client_offer_packet(&client_sk, &daemon_pk, &offer_sdp, 1_700_000_000).await;
+    let client_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp).expect("fp");
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+        &offer_sdp,
+        &client_fp,
+        openhost_pkarr::BindingMode::Exporter,
+    )
+    .expect("blob");
+    let packet =
+        build_client_offer_packet(&client_sk, &daemon_pk, offer_blob.clone(), 1_700_000_000).await;
     resolver.set_packet(&client_pk, &packet);
 
     // Wait until the daemon pushes an answer entry into SharedState.
@@ -203,9 +224,12 @@ async fn daemon_polls_scripted_offer_and_publishes_answer() -> DaemonResult<()> 
     let entry = got.expect("answer entry should appear in SharedState within 10 s");
     let opened = entry.open(&client_sk).expect("answer opens");
     assert_eq!(opened.daemon_pk, daemon_pk);
+    // v3 offers: both sides hash the canonical reconstructed SDP, not
+    // the browser's raw SDP. Reuse the blob we already built.
+    let canonical_sdp = openhost_pkarr::offer_blob_to_sdp(&offer_blob);
     assert_eq!(
         opened.offer_sdp_hash,
-        openhost_pkarr::hash_offer_sdp(&offer_sdp)
+        openhost_pkarr::hash_offer_sdp(&canonical_sdp)
     );
     match &opened.answer {
         openhost_pkarr::AnswerPayload::V2Blob(blob) => {
@@ -251,7 +275,14 @@ async fn daemon_does_not_double_process_same_offer() -> DaemonResult<()> {
 
     let daemon_pk = app.identity().public_key();
     let offer_sdp = real_client_offer_sdp().await;
-    let packet = build_client_offer_packet(&client_sk, &daemon_pk, &offer_sdp, 1_700_000_000).await;
+    let client_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp).expect("fp");
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+        &offer_sdp,
+        &client_fp,
+        openhost_pkarr::BindingMode::Exporter,
+    )
+    .expect("blob");
+    let packet = build_client_offer_packet(&client_sk, &daemon_pk, offer_blob, 1_700_000_000).await;
     resolver.set_packet(&client_pk, &packet);
 
     // Let the poller tick a few times with the same offer.
@@ -290,9 +321,16 @@ async fn daemon_ignores_offer_sealed_to_different_daemon() -> DaemonResult<()> {
     .expect("app builds");
 
     // Seal to the wrong recipient — our daemon can't decrypt it.
-    let offer_sdp = "v=0\r\na=setup:active\r\n";
-    let packet =
-        build_client_offer_packet(&client_sk, &other_daemon_pk, offer_sdp, 1_700_000_000).await;
+    // The blob content is irrelevant: the daemon never reaches the
+    // unseal step because the sealed-box recipient mismatch aborts
+    // processing earlier.
+    let packet = build_client_offer_packet(
+        &client_sk,
+        &other_daemon_pk,
+        synthetic_offer_blob(),
+        1_700_000_000,
+    )
+    .await;
     resolver.set_packet(&client_pk, &packet);
 
     // Wait a few poll cycles. No answer should ever appear.
@@ -339,16 +377,13 @@ async fn daemon_rejects_inner_outer_client_pk_mismatch() -> DaemonResult<()> {
     .expect("app builds");
 
     let daemon_pk = app.identity().public_key();
-    let offer_sdp = "v=0\r\na=setup:active\r\n";
 
     // Build the offer plaintext claiming client_pk_b and seal it to the
     // daemon. Then publish under client_pk_a's BEP44 zone (so the
-    // outer signer is A).
-    let plaintext = OfferPlaintext {
-        client_pk: client_pk_b,
-        offer_sdp: offer_sdp.to_string(),
-        binding_mode: openhost_pkarr::BindingMode::Exporter,
-    };
+    // outer signer is A). The sealed plaintext never gets as far as
+    // webrtc — the daemon rejects on the inner/outer pubkey mismatch
+    // check before unseal — so a synthetic blob suffices.
+    let plaintext = OfferPlaintext::new_v3(client_pk_b, synthetic_offer_blob());
     let mut rng = OsRng;
     let offer = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();
     let txt_value = URL_SAFE_NO_PAD.encode(&offer.sealed);
@@ -400,8 +435,15 @@ async fn daemon_skips_offer_not_in_watched_list() -> DaemonResult<()> {
     .expect("app builds");
 
     let daemon_pk = app.identity().public_key();
-    let offer_sdp = "v=0\r\na=setup:active\r\n";
-    let packet = build_client_offer_packet(&client_sk, &daemon_pk, offer_sdp, 1_700_000_000).await;
+    // Unwatched client — daemon never polls for this pubkey, so the
+    // blob content is irrelevant.
+    let packet = build_client_offer_packet(
+        &client_sk,
+        &daemon_pk,
+        synthetic_offer_blob(),
+        1_700_000_000,
+    )
+    .await;
     resolver.set_packet(&client_pk, &packet);
 
     tokio::time::sleep(Duration::from_secs(2)).await;

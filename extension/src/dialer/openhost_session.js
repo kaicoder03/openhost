@@ -203,8 +203,8 @@ export async function dialOhUrl(ohUrl, opts = {}) {
 
   // 6. Apply answer + wait for DTLS Connected.
   await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-  await waitForPcConnected(pc, opts.connectTimeoutMs ?? 10_000);
-  await waitForDcOpen(dc, opts.connectTimeoutMs ?? 10_000);
+  await waitForPcConnected(pc, opts.connectTimeoutMs ?? 45_000);
+  await waitForDcOpen(dc, opts.connectTimeoutMs ?? 45_000);
 
   // 7. Channel-binding handshake.
   const nonceFrame = await reader.next(opts.bindingTimeoutMs ?? 10_000);
@@ -296,17 +296,28 @@ async function readRemoteCertDer(pc) {
 
 async function publishOfferPacket(clientPkZ, packetBytes) {
   let lastErr;
+  let successes = 0;
+  // Publish to EVERY relay in parallel-ish so the daemon (which may
+  // resolve from a different relay set) has a chance to see the
+  // packet on whichever relay it polls. Returning after the first
+  // ok is what we used to do; it left the other relays without the
+  // record and broke cross-relay rendezvous.
   for (const r of RELAYS) {
     try {
       const resp = await fetch(`${r}/${clientPkZ}`, {
         method: "PUT", body: packetBytes,
         headers: { "Content-Type": "application/pkarr.org.relays.v1+octet" },
       });
-      if (resp.ok) return;
+      if (resp.ok) {
+        successes += 1;
+        continue;
+      }
       lastErr = new Error(`${r} → ${resp.status}`);
     } catch (e) { lastErr = e; }
   }
-  throw new Error(`all relays rejected offer publish: ${lastErr?.message ?? "unknown"}`);
+  if (successes === 0) {
+    throw new Error(`all relays rejected offer publish: ${lastErr?.message ?? "unknown"}`);
+  }
 }
 
 async function pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed, hostDtlsFpHex, timeoutMs }) {

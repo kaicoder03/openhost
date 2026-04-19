@@ -241,14 +241,29 @@ impl Dialer {
         // full peer connection until process exit.
         let mut teardown = Some(PeerConnectionGuard::new(Arc::clone(&pc), Arc::clone(&dc)));
 
-        // Stage 3: seal + publish the offer.
-        self.publish_offer(&daemon_pk, &offer_sdp).await?;
+        // Stage 3: seal + publish the offer as a v3 compact blob.
+        // Canonical SDP (reconstructed from the blob) is what both
+        // sides hash for answer binding, so we compute it here and
+        // thread the same string into publish + hash.
+        let client_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp)
+            .map_err(|e| ClientError::PublishOffer(format!("client DTLS fp: {e}")))?;
+        let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+            &offer_sdp,
+            &client_fp,
+            openhost_pkarr::BindingMode::Exporter,
+        )
+        .map_err(|e| ClientError::PublishOffer(format!("offer→blob: {e}")))?;
+        let canonical_offer_sdp = openhost_pkarr::offer_blob_to_sdp(&offer_blob);
+        self.publish_offer_blob(&daemon_pk, offer_blob).await?;
 
         // Stage 4: poll for the daemon's answer. The host's DTLS
         // fingerprint (already verified under the outer BEP44 signature
         // on `signed`) is threaded through so the v2 compact-blob
-        // branch can reconstruct a complete SDP locally.
-        let offer_hash = hash_offer_sdp(&offer_sdp);
+        // branch can reconstruct a complete SDP locally. The daemon
+        // hashes its reconstructed offer SDP; we hash ours — both
+        // forms are byte-identical because `offer_blob_to_sdp` is
+        // deterministic over the shared blob.
+        let offer_hash = hash_offer_sdp(&canonical_offer_sdp);
         let answer_sdp = self
             .poll_answer(
                 &daemon_pk,
@@ -354,10 +369,16 @@ impl Dialer {
         Ok((pc, dc, sdp))
     }
 
-    /// Seal `offer_sdp` to the daemon + publish a pkarr packet under
-    /// the client's own Ed25519 pubkey carrying the `_offer-<host-hash>`
-    /// TXT.
-    pub async fn publish_offer(&mut self, daemon_pk: &PublicKey, offer_sdp: &str) -> Result<()> {
+    /// Seal a [`OfferBlob`] to the daemon + publish a pkarr packet
+    /// under the client's own Ed25519 pubkey carrying the
+    /// `_offer-<host-hash>` TXT. Compact-offer-blob PR: v3 offers
+    /// replace the full-SDP seal with a ~130-byte binary blob so
+    /// Chrome-sized SDPs fit under BEP44's 1000-byte packet cap.
+    pub async fn publish_offer_blob(
+        &mut self,
+        daemon_pk: &PublicKey,
+        offer_blob: openhost_pkarr::OfferBlob,
+    ) -> Result<()> {
         // CLI dialers advertise `Exporter` unconditionally. CertFp is
         // the browser-only variant from `spec/04-security.md §4.1`; a
         // CLI that silently downgraded to CertFp would reduce its
@@ -368,11 +389,9 @@ impl Dialer {
         // a weaker binding than the spec mandates.
         const CLI_BINDING_MODE: openhost_pkarr::BindingMode = openhost_pkarr::BindingMode::Exporter;
         assert_cli_binding_mode(CLI_BINDING_MODE)?;
-        let plaintext = OfferPlaintext {
-            client_pk: self.identity.public_key(),
-            offer_sdp: offer_sdp.to_string(),
-            binding_mode: CLI_BINDING_MODE,
-        };
+        let mut blob = offer_blob;
+        blob.binding_mode = CLI_BINDING_MODE;
+        let plaintext = OfferPlaintext::new_v3(self.identity.public_key(), blob);
         let mut rng = rand::rngs::OsRng;
         let offer = OfferRecord::seal(&mut rng, daemon_pk, &plaintext)
             .map_err(|e| ClientError::PublishOffer(format!("seal: {e}")))?;
@@ -456,17 +475,25 @@ impl Dialer {
                             ));
                         }
                         if &opened.offer_sdp_hash != expected_offer_hash {
-                            return Err(ClientError::AnswerBindingMismatch(
-                                "offer_sdp_hash mismatches the offer we published",
-                            ));
+                            // Stale answer from a prior dial attempt
+                            // (pkarr cache lag). Keep polling — the
+                            // daemon's newer publish for THIS offer
+                            // will eventually arrive. An adversary
+                            // cannot replay a mismatched answer past
+                            // the poll window because the window is
+                            // bounded by `dial_timeout`.
+                            tracing::debug!(
+                                "dialer: answer hash mismatch (stale from prior attempt); polling again"
+                            );
+                        } else {
+                            let sdp = match opened.answer {
+                                openhost_pkarr::AnswerPayload::V2Blob(blob) => {
+                                    openhost_pkarr::answer_blob_to_sdp(&blob, host_dtls_fp)
+                                }
+                                openhost_pkarr::AnswerPayload::V1Sdp(s) => s,
+                            };
+                            return Ok(sdp);
                         }
-                        let sdp = match opened.answer {
-                            openhost_pkarr::AnswerPayload::V2Blob(blob) => {
-                                openhost_pkarr::answer_blob_to_sdp(&blob, host_dtls_fp)
-                            }
-                            openhost_pkarr::AnswerPayload::V1Sdp(s) => s,
-                        };
-                        return Ok(sdp);
                     }
                     Ok(None) => {
                         // Main record is present but no `_answer.*`

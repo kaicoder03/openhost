@@ -75,19 +75,30 @@ fn build_config(
     }
 }
 
+/// Synthetic v3 offer blob for negative-path tests that never need
+/// the daemon to actually parse the SDP.
+fn synthetic_offer_blob() -> openhost_pkarr::OfferBlob {
+    openhost_pkarr::OfferBlob {
+        ice_ufrag: "abcd".to_string(),
+        ice_pwd: "0123456789abcdefghij!@".to_string(),
+        setup: openhost_pkarr::SetupRole::Active,
+        binding_mode: openhost_pkarr::BindingMode::Exporter,
+        client_dtls_fp: [0xCDu8; openhost_pkarr::DTLS_FP_LEN],
+        candidates: vec![],
+    }
+}
+
 /// Build a pkarr `SignedPacket` under the client's key containing an
-/// `_offer-<host-hash>` TXT sealed to the daemon.
+/// `_offer-<host-hash>` TXT sealed to the daemon. Post-compact-offer
+/// the helper takes an [`openhost_pkarr::OfferBlob`] so negative-path
+/// tests can ship a synthetic blob without a full webrtc-rs SDP.
 async fn build_offer_packet(
     client_sk: &SigningKey,
     daemon_pk: &PublicKey,
-    offer_sdp: &str,
+    offer_blob: openhost_pkarr::OfferBlob,
     ts_secs: u64,
 ) -> SignedPacket {
-    let plaintext = OfferPlaintext {
-        client_pk: client_sk.public_key(),
-        offer_sdp: offer_sdp.to_string(),
-        binding_mode: openhost_pkarr::BindingMode::Exporter,
-    };
+    let plaintext = OfferPlaintext::new_v3(client_sk.public_key(), offer_blob);
     let mut rng = OsRng;
     let offer = OfferRecord::seal(&mut rng, daemon_pk, &plaintext).unwrap();
     let txt_value = URL_SAFE_NO_PAD.encode(&offer.sealed);
@@ -152,7 +163,14 @@ async fn authorized_client_offer_is_processed() -> DaemonResult<()> {
 
     let daemon_pk = app.identity().public_key();
     let offer_sdp = real_client_offer_sdp().await;
-    let packet = build_offer_packet(&client_sk, &daemon_pk, &offer_sdp, 1_700_000_000).await;
+    let client_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp).expect("fp");
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+        &offer_sdp,
+        &client_fp,
+        openhost_pkarr::BindingMode::Exporter,
+    )
+    .expect("blob");
+    let packet = build_offer_packet(&client_sk, &daemon_pk, offer_blob, 1_700_000_000).await;
     resolver.set_packet(&client_pk, &packet);
 
     // Wait until an answer lands in SharedState. (The BEP44 encoder may
@@ -201,8 +219,14 @@ async fn unauthorized_client_offer_is_skipped() -> DaemonResult<()> {
     .expect("app builds");
 
     let daemon_pk = app.identity().public_key();
-    let offer_sdp = "v=0\r\na=setup:active\r\n";
-    let packet = build_offer_packet(&client_sk, &daemon_pk, offer_sdp, 1_700_000_000).await;
+    // Not-paired client — daemon never reaches handle_offer.
+    let packet = build_offer_packet(
+        &client_sk,
+        &daemon_pk,
+        synthetic_offer_blob(),
+        1_700_000_000,
+    )
+    .await;
     resolver.set_packet(&client_pk, &packet);
 
     // Wait a few poll cycles. No answer should ever be queued.
@@ -249,7 +273,14 @@ async fn enforce_disabled_preserves_pr7a_behavior() -> DaemonResult<()> {
 
     let daemon_pk = app.identity().public_key();
     let offer_sdp = real_client_offer_sdp().await;
-    let packet = build_offer_packet(&client_sk, &daemon_pk, &offer_sdp, 1_700_000_000).await;
+    let client_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp).expect("fp");
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+        &offer_sdp,
+        &client_fp,
+        openhost_pkarr::BindingMode::Exporter,
+    )
+    .expect("blob");
+    let packet = build_offer_packet(&client_sk, &daemon_pk, offer_blob, 1_700_000_000).await;
     resolver.set_packet(&client_pk, &packet);
 
     let expected_hash =
@@ -307,7 +338,15 @@ async fn rate_limit_caps_burst_of_distinct_offers() -> DaemonResult<()> {
     // sees a distinct packet).
     for i in 0..5 {
         let offer_sdp = real_client_offer_sdp().await;
-        let pkt = build_offer_packet(&client_sk, &daemon_pk, &offer_sdp, base_ts + i).await;
+        let client_fp =
+            openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp).expect("fp");
+        let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+            &offer_sdp,
+            &client_fp,
+            openhost_pkarr::BindingMode::Exporter,
+        )
+        .expect("blob");
+        let pkt = build_offer_packet(&client_sk, &daemon_pk, offer_blob, base_ts + i).await;
         resolver.set_packet(&client_pk, &pkt);
         tokio::time::sleep(Duration::from_millis(1200)).await;
     }

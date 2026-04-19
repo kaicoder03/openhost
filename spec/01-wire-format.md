@@ -195,37 +195,84 @@ offer_plaintext = compression_tag || body
       Other values MUST be rejected as malformed.
 
   body =
-    // Choose ONE of the two shapes below based on the leading domain
-    // separator. v2 (PR #28.3+) adds a trailing `binding_mode` byte
-    // so clients can advertise browser-only channel binding.
+    // Choose ONE of the three shapes below based on the leading domain
+    // separator. v3 (compact-offer-blob PR) replaces the full SDP with
+    // a ~130-byte binary blob so Chrome-generated SDPs (~1100 bytes
+    // raw) fit alongside DNS + pkarr overhead under BEP44's 1000-byte
+    // packet cap. Symmetric to the v2 answer-blob on the answer side.
 
-    v1 legacy shape (pre-PR-28.3; still accepted on decode):
+    v1 legacy shape (pre-PR-28.3; decode-only):
          "openhost-offer-inner1"      (21 bytes)
        || client_pk                   (32 bytes)
        || sdp_len                     (u32 big-endian)
        || offer_sdp_utf8              (sdp_len bytes)
 
-    v2 shape (PR #28.3+; all new encoders MUST emit this form):
+    v2 legacy shape (PR #28.3 through pre-compact-offer-blob;
+                     decode-only in post-rollout daemons/clients):
          "openhost-offer-inner2"      (21 bytes)
        || client_pk                   (32 bytes)
        || sdp_len                     (u32 big-endian)
        || offer_sdp_utf8              (sdp_len bytes)
        || binding_mode                (u8; see §7.6 for semantics)
+
+    v3 shape (compact-offer-blob PR; all new encoders MUST emit this):
+         "openhost-offer-inner3"      (21 bytes)
+       || client_pk                   (32 bytes)
+       || blob_len                    (u16 big-endian; ≤ 512)
+       || offer_blob                  (blob_len bytes; structure below)
 ```
 
-**Binding mode byte** (v2 only). One of:
+The `offer_blob` carries only the fields the daemon cannot derive
+from protocol invariants. The daemon reconstructs a syntactically
+complete SDP at consumption time using a fixed template plus these
+fields:
 
-- `0x01 = Exporter` — client will drive channel binding via the RFC
-  5705 DTLS exporter. The original CLI-to-CLI path.
-- `0x02 = CertFp` — client will drive channel binding via SHA-256
-  over the host's DTLS certificate DER. Mandatory when the client is a
-  browser (browsers do not expose the RFC 5705 exporter on
-  `RTCDtlsTransport`). See `spec/04-security.md §7.6`.
-- Other values MUST be rejected as malformed.
+```
+  offer_blob =
+      version         : u8 (0x01)
+      flags           : u8
+                         bits 0-1: setup_role (0=Active, 1=Passive, 2=Actpass; 3 reserved)
+                         bit   2 : binding_mode (0=Exporter, 1=CertFp)
+                         bits 3-7: reserved, MUST be 0
+      ufrag_len       : u8 (4..=32 per RFC 8445 §5.3)
+      ufrag           : <ufrag_len> ASCII bytes
+      pwd_len         : u8 (22..=32 per RFC 8445 §5.3)
+      pwd             : <pwd_len> ASCII bytes
+      client_dtls_fp  : 32 bytes (SHA-256 of client DTLS cert DER)
+      cand_count      : u8 (0..=8)
+      candidates[]    : cand_count entries of:
+                          typ    : u8  (0=host, 1=srflx, 2=prflx, 3=relay)
+                          family : u8  (4=IPv4, 6=IPv6)
+                          addr   : 4 or 16 bytes
+                          port   : u16 big-endian
+```
+
+Setup-role `Passive` in an offer is rejected on both encode and
+decode — it would flip the DTLS roles against §3.1. IPv4-only is
+enforced on the emitter today (mirrors the PR #31 candidate-hygiene
+filters on the answer side).
+
+**Binding mode byte (v2) / binding_mode flag bit (v3).** One of:
+
+- `0x01 / bit=0 = Exporter` — client will drive channel binding via
+  the RFC 5705 DTLS exporter. The original CLI-to-CLI path.
+- `0x02 / bit=1 = CertFp` — client will drive channel binding via
+  SHA-256 over the **host's** DTLS certificate DER. Mandatory when
+  the client is a browser (browsers do not expose the RFC 5705
+  exporter on `RTCDtlsTransport`). See `spec/04-security.md §7.6`.
+- v2: other byte values MUST be rejected as malformed.
 
 v1 bodies carry no explicit binding byte and decode as if
-`binding_mode = 0x01 Exporter`. This preserves the pre-PR-28.3
+`binding_mode = Exporter`. This preserves the pre-PR-28.3
 CLI-to-CLI semantics verbatim.
+
+**Client DTLS fingerprint carriage (v3).** Unlike the answer side
+(where the host's DTLS fingerprint is pinned under the outer BEP44
+signature on the main `_openhost` record), clients have no persistent
+pkarr record to pin their fingerprint to. The v3 offer blob therefore
+carries a 32-byte `client_dtls_fp` directly. Integrity is provided by
+the sealed-box ciphertext to the daemon plus the client's Ed25519
+signature on the enclosing BEP44 packet.
 
 v0.1+ encoders **MUST** emit `compression_tag = 0x02`. v0.1+ decoders
 **MUST** accept both `0x01` and `0x02` for backward compatibility

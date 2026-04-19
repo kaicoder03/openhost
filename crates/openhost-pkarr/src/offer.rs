@@ -116,6 +116,13 @@ pub const OFFER_INNER_DOMAIN: &[u8] = OFFER_INNER_DOMAIN_V1;
 /// can advertise cert-fingerprint binding (see [`BindingMode`]).
 pub const OFFER_INNER_DOMAIN_V2: &[u8] = b"openhost-offer-inner2";
 
+/// Domain separator for the v3 offer inner plaintext body
+/// (compact-offer-blob PR). v3 replaces the full SDP with a binary
+/// [`OfferBlob`] so Chrome-generated SDPs (~1100 bytes raw) fit
+/// alongside the DNS and pkarr overhead in BEP44's 1000-byte packet
+/// cap. Symmetric to `openhost-answer-inner2` on the answer side.
+pub const OFFER_INNER_DOMAIN_V3: &[u8] = b"openhost-offer-inner3";
+
 /// Domain separator for the v1 answer inner plaintext body. Still
 /// accepted on decode (legacy daemons publishing full SDPs); new
 /// encoders emit v2 via [`ANSWER_INNER_DOMAIN_V2`].
@@ -180,10 +187,17 @@ impl BindingMode {
     }
 }
 
-/// DTLS `a=setup:` role carried in the v2 answer blob. Restricted to
-/// the two values the daemon actually emits (`active` when the daemon
-/// answered a browser offer that picked `actpass`, `passive` in every
-/// other case). `holdconn` and `actpass` are rejected on decode.
+/// DTLS `a=setup:` role carried inside a compact offer / answer blob.
+///
+/// Valid values per blob type:
+///
+/// - **Answer blob** ([`AnswerBlob`]): only `Active` or `Passive`.
+///   The daemon always picks a concrete role; `Actpass` in an answer
+///   SDP is a spec violation and the encoder rejects it.
+/// - **Offer blob** ([`OfferBlob`]): `Active` (CLI convention) or
+///   `Actpass` (browser convention — Chrome emits `a=setup:actpass`
+///   on every offer so the answerer picks). `Passive` in an offer
+///   flips the DTLS roles against spec and is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SetupRole {
@@ -191,16 +205,20 @@ pub enum SetupRole {
     Active = 0,
     /// `a=setup:passive` — the side that waits for DTLS ClientHello.
     Passive = 1,
+    /// `a=setup:actpass` — either role is acceptable; answerer picks.
+    /// Valid in offers only.
+    Actpass = 2,
 }
 
 impl SetupRole {
-    /// SDP-textual form (`"active"` or `"passive"`) used when
-    /// reconstructing the minimal SDP on the client side.
+    /// SDP-textual form (`"active"`, `"passive"`, or `"actpass"`) used
+    /// when reconstructing the minimal SDP on the consumer side.
     #[must_use]
     pub fn as_sdp_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Passive => "passive",
+            Self::Actpass => "actpass",
         }
     }
 }
@@ -312,6 +330,87 @@ pub enum AnswerPayload {
 
 /// Version byte at the front of the v2 answer blob body.
 const ANSWER_BLOB_VERSION: u8 = 0x01;
+
+/// Compact binary representation of a WebRTC offer. Replaces the full
+/// SDP in v3 offer records. Symmetric to [`AnswerBlob`]: carries only
+/// the fields the daemon cannot derive from its own state. The
+/// daemon reconstructs a minimal valid SDP from these fields at
+/// consumption time.
+///
+/// Wire layout (inside the v3 offer body, after the 21-byte domain,
+/// 32-byte `client_pk`, and a `u16` blob length prefix):
+///
+/// ```text
+/// version         : u8 (0x01)
+/// flags           : u8
+///                    bits 0-1: setup_role (0=Active, 1=Passive, 2=Actpass; 3 reserved)
+///                    bit   2 : binding_mode (0=Exporter, 1=CertFp)
+///                    bits 3-7: reserved, MUST be 0
+/// ufrag_len       : u8 (MIN_ICE_UFRAG_LEN..=MAX_ICE_UFRAG_LEN)
+/// ufrag           : <ufrag_len> ASCII bytes
+/// pwd_len         : u8 (MIN_ICE_PWD_LEN..=MAX_ICE_PWD_LEN)
+/// pwd             : <pwd_len> ASCII bytes
+/// client_dtls_fp  : 32 bytes (SHA-256 of client DTLS cert DER)
+/// cand_count      : u8 (0..=MAX_BLOB_CANDIDATES)
+/// candidates[]    : cand_count entries of:
+///                     typ    : u8   (CandidateType)
+///                     family : u8   (4 | 6)
+///                     addr   : 4 or 16 bytes
+///                     port   : u16 big-endian
+/// ```
+///
+/// Unlike the answer side, the client's DTLS fingerprint IS carried
+/// in the blob. The answer side can pin its fingerprint via the
+/// long-lived pkarr `_openhost` record signed under the outer BEP44
+/// signature, but clients have no equivalent persistent record, so
+/// the fingerprint piggybacks on the offer. Integrity is provided by
+/// the sealed-box addressed to the daemon (any modification of the
+/// ciphertext causes unseal to fail) plus the client's Ed25519
+/// signature on the enclosing BEP44 packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferBlob {
+    /// ICE ufrag — MUST be 4..=32 ASCII bytes (RFC 8445 §5.3).
+    pub ice_ufrag: String,
+    /// ICE pwd — MUST be 22..=32 ASCII bytes (RFC 8445 §5.3).
+    pub ice_pwd: String,
+    /// DTLS `a=setup:` role the client advertises. CLI offers emit
+    /// `Active`; browser offers emit `Actpass`. `Passive` is rejected
+    /// on encode — it would flip the DTLS roles against spec §3.1.
+    pub setup: SetupRole,
+    /// Channel-binding mode the client will use post-DTLS. Browser
+    /// offers always emit `CertFp`; CLI offers emit `Exporter` unless
+    /// a future config flag opts into `CertFp`.
+    pub binding_mode: BindingMode,
+    /// SHA-256 of the client's DTLS certificate DER. Required so the
+    /// daemon can verify the incoming DTLS handshake terminates at the
+    /// same client whose Ed25519 key signed the BEP44 outer packet.
+    pub client_dtls_fp: [u8; DTLS_FP_LEN],
+    /// Post-gather-complete candidate list. Length bounded by
+    /// [`MAX_BLOB_CANDIDATES`].
+    pub candidates: Vec<BlobCandidate>,
+}
+
+/// Plaintext offer payload carried inside an [`OfferPlaintext`].
+/// v1 and v2 full-SDP shapes stay decode-only; all v3+ emitters MUST
+/// produce [`OfferPayload::V3Blob`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfferPayload {
+    /// Legacy v1 / v2 offer body: a full SDP string. Decode-only in
+    /// post-compact-offer-blob daemons; retained so CLI clients
+    /// dialing a pre-rollout host still round-trip.
+    LegacySdp(String),
+    /// v3 offer body: compact binary blob (see [`OfferBlob`]).
+    V3Blob(OfferBlob),
+}
+
+/// Version byte at the front of the v3 offer blob body.
+const OFFER_BLOB_VERSION: u8 = 0x01;
+
+/// Ceiling on the offer blob byte length. A fully-packed blob with
+/// 8 IPv4 candidates, 32-byte ufrag, 32-byte pwd, and 32-byte DTLS
+/// fingerprint weighs ~170 bytes; 512 gives ~3× headroom while
+/// bounding decoder work.
+pub const MAX_OFFER_BLOB_LEN: usize = 512;
 
 /// Ceiling on the blob byte length carried in the `u16` length prefix.
 /// A fully-packed blob with 8 IPv4 candidates, a 32-byte ufrag, and a
@@ -523,25 +622,40 @@ pub struct OfferPlaintext {
     /// The offering client's Ed25519 pubkey. MUST match the outer BEP44
     /// signer; cross-checked on decode.
     pub client_pk: PublicKey,
-    /// SDP offer text (UTF-8).
-    pub offer_sdp: String,
+    /// Carried offer, either the legacy v1/v2 full-SDP form
+    /// (decode-only) or the v3 compact binary blob (the only form new
+    /// emitters produce).
+    pub offer: OfferPayload,
     /// Channel-binding mode the client will use on the resulting data
     /// channel. v1 offer bodies on the wire carry no binding_mode byte
-    /// and decode with [`BindingMode::Exporter`]; v2 bodies (PR #28.3+)
-    /// carry it explicitly.
+    /// and decode with [`BindingMode::Exporter`]; v2 bodies carry it
+    /// explicitly; v3 bodies carry it inside the blob's flags byte.
     pub binding_mode: BindingMode,
 }
 
 impl OfferPlaintext {
-    /// Convenience constructor matching the pre-PR-28.3 field set;
-    /// `binding_mode` defaults to [`BindingMode::Exporter`], preserving
-    /// the CLI-to-CLI semantics that predated browser support.
+    /// Legacy-SDP constructor for tests and decode round-trips.
+    /// Stores the SDP as [`OfferPayload::LegacySdp`] so the encode
+    /// path will reject it (emitters must produce v3 blobs); use
+    /// [`OfferPlaintext::new_v3`] to build an emittable plaintext.
     #[must_use]
     pub fn new(client_pk: PublicKey, offer_sdp: String) -> Self {
         Self {
             client_pk,
-            offer_sdp,
+            offer: OfferPayload::LegacySdp(offer_sdp),
             binding_mode: BindingMode::Exporter,
+        }
+    }
+
+    /// v3-blob constructor — the form every post-compact-offer
+    /// emitter produces.
+    #[must_use]
+    pub fn new_v3(client_pk: PublicKey, blob: OfferBlob) -> Self {
+        let binding_mode = blob.binding_mode;
+        Self {
+            client_pk,
+            offer: OfferPayload::V3Blob(blob),
+            binding_mode,
         }
     }
 }
@@ -685,7 +799,7 @@ impl OfferRecord {
         daemon_pk: &PublicKey,
         plaintext: &OfferPlaintext,
     ) -> Result<Self> {
-        let inner = encode_offer_plaintext(plaintext);
+        let inner = encode_offer_plaintext(plaintext)?;
         let recipient = public_key_to_x25519(daemon_pk).map_err(PkarrError::Core)?;
         let sealed = sealed_box_seal(rng, &recipient, &inner);
         Ok(Self { sealed })
@@ -1073,46 +1187,264 @@ fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String
 // Inner plaintext encode / decode
 // ============================================================================
 
-/// Encode an offer body in the v2 shape (PR #28.3+).
+/// Encode an offer body. v3 (compact blob, `openhost-offer-inner3`)
+/// is the only shape emitters produce; v1/v2 are decode-only and
+/// [`encode_offer_body`] will panic in debug builds if handed a
+/// [`OfferPayload::LegacySdp`] — use [`OfferPlaintext::new_v3`].
 ///
-/// Wire layout:
+/// Wire layout for v3:
 ///
 /// ```text
-/// domain(OFFER_INNER_DOMAIN_V2) || client_pk(32B) ||
-/// sdp_len(u32 BE) || sdp || binding_mode(u8)
+/// domain(OFFER_INNER_DOMAIN_V3) || client_pk(32B) ||
+/// blob_len(u16 BE, ≤ MAX_OFFER_BLOB_LEN) || blob(blob_len bytes)
 /// ```
-///
-/// Decoders MUST accept both v1 and v2 shapes (see
-/// [`parse_offer_body`]); encoders MUST emit v2 so every offer
-/// advertises its binding mode explicitly.
-///
-/// The surrounding [`encode_offer_plaintext`] wraps the body with a
-/// compression tag byte — this function only produces the body.
-fn encode_offer_body(p: &OfferPlaintext) -> Vec<u8> {
-    let sdp = p.offer_sdp.as_bytes();
+fn encode_offer_body(p: &OfferPlaintext) -> Result<Vec<u8>> {
+    let blob = match &p.offer {
+        OfferPayload::V3Blob(b) => b,
+        OfferPayload::LegacySdp(_) => {
+            debug_assert!(
+                false,
+                "openhost-pkarr: emitters MUST produce v3 OfferBlob; LegacySdp is decode-only",
+            );
+            return Err(PkarrError::MalformedCanonical(
+                "encoders MUST emit v3 offer blobs — OfferPayload::LegacySdp is decode-only",
+            ));
+        }
+    };
+    let blob_bytes = encode_offer_blob(blob)?;
     let mut out =
-        Vec::with_capacity(OFFER_INNER_DOMAIN_V2.len() + PUBLIC_KEY_LEN + 4 + sdp.len() + 1);
-    out.extend_from_slice(OFFER_INNER_DOMAIN_V2);
+        Vec::with_capacity(OFFER_INNER_DOMAIN_V3.len() + PUBLIC_KEY_LEN + 2 + blob_bytes.len());
+    out.extend_from_slice(OFFER_INNER_DOMAIN_V3);
     out.extend_from_slice(&p.client_pk.to_bytes());
-    let len = u32::try_from(sdp.len())
-        .expect("SDP length bounded well below u32::MAX by BEP44 1000-byte cap");
+    let len = u16::try_from(blob_bytes.len()).expect("blob_bytes ≤ MAX_OFFER_BLOB_LEN < u16::MAX");
     out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(sdp);
-    out.push(p.binding_mode.as_u8());
-    out
+    out.extend_from_slice(&blob_bytes);
+    Ok(out)
 }
 
-/// Parse an offer body. Accepts v1 (`openhost-offer-inner1`, no
-/// binding_mode byte — defaults to [`BindingMode::Exporter`]) and v2
-/// (`openhost-offer-inner2`, trailing binding_mode byte required).
+/// Serialise an [`OfferBlob`] to its on-wire byte form. Validates
+/// RFC 8445 §5.3 ufrag/pwd length bounds, setup-role validity for
+/// offers, and the per-blob candidate ceiling.
+pub fn encode_offer_blob(b: &OfferBlob) -> Result<Vec<u8>> {
+    let ufrag_bytes = b.ice_ufrag.as_bytes();
+    if ufrag_bytes.len() < MIN_ICE_UFRAG_LEN || ufrag_bytes.len() > MAX_ICE_UFRAG_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "OfferBlob ice_ufrag length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    if !b.ice_ufrag.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "OfferBlob ice_ufrag must be ASCII",
+        ));
+    }
+    let pwd_bytes = b.ice_pwd.as_bytes();
+    if pwd_bytes.len() < MIN_ICE_PWD_LEN || pwd_bytes.len() > MAX_ICE_PWD_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "OfferBlob ice_pwd length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    if !b.ice_pwd.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "OfferBlob ice_pwd must be ASCII",
+        ));
+    }
+    if b.candidates.len() > MAX_BLOB_CANDIDATES {
+        return Err(PkarrError::MalformedCanonical(
+            "OfferBlob candidates exceed MAX_BLOB_CANDIDATES",
+        ));
+    }
+
+    // Setup-role bits 0-1 of the flags byte. `Passive` is a spec
+    // violation for offers (it flips DTLS roles); the encoder refuses
+    // to emit it so a bug upstream becomes a loud error rather than
+    // silently broken negotiation.
+    let setup_bits: u8 = match b.setup {
+        SetupRole::Active => 0b00,
+        SetupRole::Actpass => 0b10,
+        SetupRole::Passive => return Err(PkarrError::MalformedCanonical(
+            "OfferBlob setup_role must not be Passive (would flip DTLS roles against spec §3.1)",
+        )),
+    };
+    let binding_bit: u8 = match b.binding_mode {
+        BindingMode::Exporter => 0b000,
+        BindingMode::CertFp => 0b100,
+    };
+    let flags = setup_bits | binding_bit;
+
+    let mut out = Vec::with_capacity(80);
+    out.push(OFFER_BLOB_VERSION);
+    out.push(flags);
+    out.push(ufrag_bytes.len() as u8);
+    out.extend_from_slice(ufrag_bytes);
+    out.push(pwd_bytes.len() as u8);
+    out.extend_from_slice(pwd_bytes);
+    out.extend_from_slice(&b.client_dtls_fp);
+    out.push(b.candidates.len() as u8);
+    for cand in &b.candidates {
+        out.push(cand.typ as u8);
+        match cand.ip {
+            std::net::IpAddr::V4(v4) => {
+                out.push(4);
+                out.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                out.push(6);
+                out.extend_from_slice(&v6.octets());
+            }
+        }
+        out.extend_from_slice(&cand.port.to_be_bytes());
+    }
+    if out.len() > MAX_OFFER_BLOB_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "encoded OfferBlob exceeds MAX_OFFER_BLOB_LEN",
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse an [`OfferBlob`] from its on-wire byte form. Strict inverse
+/// of [`encode_offer_blob`]: unknown versions, reserved-flag-bits,
+/// candidate types, address families, or length bounds all produce
+/// [`PkarrError::MalformedCanonical`].
+pub fn parse_offer_blob(bytes: &[u8]) -> Result<OfferBlob> {
+    if bytes.len() > MAX_OFFER_BLOB_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "offer blob exceeds MAX_OFFER_BLOB_LEN",
+        ));
+    }
+    let mut r = InnerCursor::new(bytes);
+    let version = r.u8()?;
+    if version != OFFER_BLOB_VERSION {
+        return Err(PkarrError::MalformedCanonical("unknown offer-blob version"));
+    }
+    let flags = r.u8()?;
+    // Bits 3-7 are reserved and MUST be 0; anything else is a hard
+    // decode error so future encoder versions don't silently get
+    // ignored.
+    if flags & 0b1111_1000 != 0 {
+        return Err(PkarrError::MalformedCanonical(
+            "offer-blob reserved flag bits must be zero",
+        ));
+    }
+    let setup = match flags & 0b0000_0011 {
+        0b00 => SetupRole::Active,
+        0b01 => SetupRole::Passive,
+        0b10 => SetupRole::Actpass,
+        _ => {
+            return Err(PkarrError::MalformedCanonical(
+                "offer-blob reserved setup_role bit pattern",
+            ))
+        }
+    };
+    // Offer-blob invariant: setup MUST NOT be Passive (would flip DTLS
+    // roles). The encoder rejects it; the decoder does too so a rogue
+    // peer can't smuggle a malformed blob past us.
+    if matches!(setup, SetupRole::Passive) {
+        return Err(PkarrError::MalformedCanonical(
+            "offer-blob setup_role Passive is a spec violation",
+        ));
+    }
+    let binding_mode = if flags & 0b0000_0100 == 0 {
+        BindingMode::Exporter
+    } else {
+        BindingMode::CertFp
+    };
+
+    let ufrag_len = r.u8()? as usize;
+    if !(MIN_ICE_UFRAG_LEN..=MAX_ICE_UFRAG_LEN).contains(&ufrag_len) {
+        return Err(PkarrError::MalformedCanonical(
+            "offer-blob ice_ufrag length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    let ufrag_bytes = r.take(ufrag_len)?;
+    if !ufrag_bytes.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "offer-blob ice_ufrag must be ASCII",
+        ));
+    }
+    let ice_ufrag = core::str::from_utf8(ufrag_bytes)
+        .map_err(|_| PkarrError::MalformedCanonical("offer-blob ice_ufrag is not UTF-8"))?
+        .to_string();
+
+    let pwd_len = r.u8()? as usize;
+    if !(MIN_ICE_PWD_LEN..=MAX_ICE_PWD_LEN).contains(&pwd_len) {
+        return Err(PkarrError::MalformedCanonical(
+            "offer-blob ice_pwd length violates RFC 8445 §5.3 bounds",
+        ));
+    }
+    let pwd_bytes = r.take(pwd_len)?;
+    if !pwd_bytes.is_ascii() {
+        return Err(PkarrError::MalformedCanonical(
+            "offer-blob ice_pwd must be ASCII",
+        ));
+    }
+    let ice_pwd = core::str::from_utf8(pwd_bytes)
+        .map_err(|_| PkarrError::MalformedCanonical("offer-blob ice_pwd is not UTF-8"))?
+        .to_string();
+
+    let mut client_dtls_fp = [0u8; DTLS_FP_LEN];
+    client_dtls_fp.copy_from_slice(r.take(DTLS_FP_LEN)?);
+
+    let cand_count = r.u8()? as usize;
+    if cand_count > MAX_BLOB_CANDIDATES {
+        return Err(PkarrError::MalformedCanonical(
+            "offer-blob candidate count exceeds MAX_BLOB_CANDIDATES",
+        ));
+    }
+    let mut candidates = Vec::with_capacity(cand_count);
+    for _ in 0..cand_count {
+        let typ = CandidateType::from_u8(r.u8()?)?;
+        let family = r.u8()?;
+        let ip = match family {
+            4 => {
+                let b = r.take(4)?;
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+            }
+            6 => {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(arr))
+            }
+            _ => {
+                return Err(PkarrError::MalformedCanonical(
+                    "offer-blob candidate family must be 4 or 6",
+                ));
+            }
+        };
+        let port = r.u16_be()?;
+        candidates.push(BlobCandidate { typ, ip, port });
+    }
+    if !r.is_empty() {
+        return Err(PkarrError::MalformedCanonical(
+            "trailing bytes after offer blob",
+        ));
+    }
+    Ok(OfferBlob {
+        ice_ufrag,
+        ice_pwd,
+        setup,
+        binding_mode,
+        client_dtls_fp,
+        candidates,
+    })
+}
+
+/// Parse an offer body. Dispatches on the 21-byte domain-separator
+/// prefix: `openhost-offer-inner1` and `openhost-offer-inner2` yield
+/// [`OfferPayload::LegacySdp`] (full SDP, decode-only);
+/// `openhost-offer-inner3` yields [`OfferPayload::V3Blob`] with a
+/// compact binary blob.
 fn parse_offer_body(body: &[u8]) -> Result<OfferPlaintext> {
-    // Peek the domain to pick a parser.
     if body.len() < OFFER_INNER_DOMAIN_V1.len() {
         return Err(PkarrError::MalformedCanonical(
             "offer plaintext shorter than domain separator",
         ));
     }
     let domain = &body[..OFFER_INNER_DOMAIN_V1.len()];
+    if domain == OFFER_INNER_DOMAIN_V3 {
+        return parse_offer_body_v3(body);
+    }
     let is_v2 = domain == OFFER_INNER_DOMAIN_V2;
     let is_v1 = domain == OFFER_INNER_DOMAIN_V1;
     if !is_v1 && !is_v2 {
@@ -1122,7 +1454,6 @@ fn parse_offer_body(body: &[u8]) -> Result<OfferPlaintext> {
     }
 
     let mut r = InnerCursor::new(body);
-    // Consume the domain; we already validated it above.
     let _domain = r.take(OFFER_INNER_DOMAIN_V1.len())?;
     let mut pk_bytes = [0u8; PUBLIC_KEY_LEN];
     pk_bytes.copy_from_slice(r.take(PUBLIC_KEY_LEN)?);
@@ -1145,19 +1476,47 @@ fn parse_offer_body(body: &[u8]) -> Result<OfferPlaintext> {
     }
     Ok(OfferPlaintext {
         client_pk,
-        offer_sdp,
+        offer: OfferPayload::LegacySdp(offer_sdp),
         binding_mode,
     })
 }
 
-/// Encode a v2 (zlib-compressed) offer inner plaintext. v0.1+ default.
-fn encode_offer_plaintext(p: &OfferPlaintext) -> Vec<u8> {
-    let body = encode_offer_body(p);
+fn parse_offer_body_v3(body: &[u8]) -> Result<OfferPlaintext> {
+    let mut r = InnerCursor::new(body);
+    let _domain = r.take(OFFER_INNER_DOMAIN_V3.len())?;
+    let mut pk_bytes = [0u8; PUBLIC_KEY_LEN];
+    pk_bytes.copy_from_slice(r.take(PUBLIC_KEY_LEN)?);
+    let client_pk = PublicKey::from_bytes(&pk_bytes).map_err(PkarrError::Core)?;
+    let blob_len = r.u16_be()? as usize;
+    if blob_len > MAX_OFFER_BLOB_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "v3 offer blob_len exceeds MAX_OFFER_BLOB_LEN",
+        ));
+    }
+    let blob_bytes = r.take(blob_len)?;
+    let blob = parse_offer_blob(blob_bytes)?;
+    if !r.is_empty() {
+        return Err(PkarrError::MalformedCanonical(
+            "trailing bytes after v3 offer plaintext",
+        ));
+    }
+    let binding_mode = blob.binding_mode;
+    Ok(OfferPlaintext {
+        client_pk,
+        offer: OfferPayload::V3Blob(blob),
+        binding_mode,
+    })
+}
+
+/// Encode a zlib-compressed offer inner plaintext. The body emitted
+/// here is the v3 compact-blob form; v1/v2 are decode-only.
+fn encode_offer_plaintext(p: &OfferPlaintext) -> Result<Vec<u8>> {
+    let body = encode_offer_body(p)?;
     let compressed = zlib_compress(&body);
     let mut out = Vec::with_capacity(1 + compressed.len());
     out.push(CompressionTag::Zlib as u8);
     out.extend_from_slice(&compressed);
-    out
+    Ok(out)
 }
 
 /// Parse an offer inner plaintext. Accepts both `Uncompressed` (v1
@@ -1249,10 +1608,14 @@ pub fn encode_answer_blob(b: &AnswerBlob) -> Result<Vec<u8>> {
     out.push(ANSWER_BLOB_VERSION);
     // Flags byte: only bit 0 is allocated to setup_role (0=active, 1=passive);
     // remaining bits MUST be zero on the wire (enforced on decode).
-    let flags: u8 = match b.setup {
-        SetupRole::Active => 0b0000_0000,
-        SetupRole::Passive => 0b0000_0001,
-    };
+    let flags: u8 =
+        match b.setup {
+            SetupRole::Active => 0b0000_0000,
+            SetupRole::Passive => 0b0000_0001,
+            SetupRole::Actpass => return Err(PkarrError::MalformedCanonical(
+                "AnswerBlob setup_role must not be Actpass (answerer MUST pick a concrete role)",
+            )),
+        };
     out.push(flags);
     out.push(ufrag_bytes.len() as u8);
     out.extend_from_slice(ufrag_bytes);
@@ -1638,6 +2001,201 @@ pub fn answer_blob_to_sdp(blob: &AnswerBlob, dtls_fp: &[u8; DTLS_FP_LEN]) -> Str
     s
 }
 
+/// Extract an [`OfferBlob`] from a full SDP offer plus the client's
+/// DTLS fingerprint. Mirrors `sdp_to_answer_blob` in the daemon's
+/// listener crate, kept in this crate so both the CLI dialer and the
+/// browser-extension WASM call into one codec. Candidate-hygiene
+/// filters (IPv4 only, component-1 only, ≤[`MAX_BLOB_CANDIDATES`])
+/// apply here so both call sites emit the same byte-identical blob.
+///
+/// `client_dtls_fp` is the SHA-256 of the client's DTLS certificate
+/// DER. On webrtc-rs, obtain via
+/// `RTCCertificate::get_fingerprints()`. On Chrome, pull it out of
+/// the SDP itself (the `a=fingerprint:sha-256 <colon-hex>` line) —
+/// see `extract_client_dtls_fp_from_sdp`.
+///
+/// Returns a structural error if the SDP is missing required
+/// attributes or the fingerprint doesn't decode to 32 bytes.
+pub fn sdp_to_offer_blob(
+    sdp: &str,
+    client_dtls_fp: &[u8; DTLS_FP_LEN],
+    binding_mode: BindingMode,
+) -> Result<OfferBlob> {
+    let mut ice_ufrag: Option<String> = None;
+    let mut ice_pwd: Option<String> = None;
+    let mut setup: Option<SetupRole> = None;
+    let mut candidates: Vec<BlobCandidate> = Vec::new();
+
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("a=ice-ufrag:") {
+            ice_ufrag = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("a=ice-pwd:") {
+            ice_pwd = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("a=setup:") {
+            setup = Some(match rest.trim() {
+                "active" => SetupRole::Active,
+                "actpass" => SetupRole::Actpass,
+                // "passive" in an offer flips DTLS roles against
+                // spec §3.1 — refuse. "holdconn" is similarly invalid.
+                _ => {
+                    return Err(PkarrError::MalformedCanonical(
+                        "offer SDP a=setup must be active or actpass",
+                    ))
+                }
+            });
+        } else if let Some(rest) = line.strip_prefix("a=candidate:") {
+            if let Some(cand) = parse_sdp_candidate_line(rest) {
+                if candidates.len() < MAX_BLOB_CANDIDATES {
+                    candidates.push(cand);
+                }
+                // else silently drop — hygiene-trim only emits MAX,
+                // the daemon's reconstruction is happy with fewer.
+            }
+        }
+    }
+
+    Ok(OfferBlob {
+        ice_ufrag: ice_ufrag.ok_or(PkarrError::MalformedCanonical(
+            "offer SDP missing a=ice-ufrag",
+        ))?,
+        ice_pwd: ice_pwd.ok_or(PkarrError::MalformedCanonical(
+            "offer SDP missing a=ice-pwd",
+        ))?,
+        setup: setup.ok_or(PkarrError::MalformedCanonical("offer SDP missing a=setup"))?,
+        binding_mode,
+        client_dtls_fp: *client_dtls_fp,
+        candidates,
+    })
+}
+
+/// Extract the SHA-256 `a=fingerprint` value from an SDP. Browser
+/// callers need this to feed [`sdp_to_offer_blob`] — the browser
+/// doesn't surface `RTCCertificate`'s raw DER so we pull the hash
+/// from the SDP text itself, which the browser generates internally.
+pub fn extract_sha256_fingerprint_from_sdp(sdp: &str) -> Result<[u8; DTLS_FP_LEN]> {
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("a=fingerprint:") {
+            // Shape: "sha-256 AA:BB:CC:..." — we accept only sha-256.
+            let mut parts = rest.trim().split_ascii_whitespace();
+            match parts.next() {
+                Some(alg) if alg.eq_ignore_ascii_case("sha-256") => {}
+                _ => continue,
+            }
+            let hex_colon = parts.next().ok_or(PkarrError::MalformedCanonical(
+                "a=fingerprint line missing hex component",
+            ))?;
+            return parse_colon_hex(hex_colon);
+        }
+    }
+    Err(PkarrError::MalformedCanonical(
+        "offer SDP missing a=fingerprint:sha-256 line",
+    ))
+}
+
+fn parse_colon_hex(s: &str) -> Result<[u8; DTLS_FP_LEN]> {
+    let mut out = [0u8; DTLS_FP_LEN];
+    let mut idx = 0;
+    for byte_str in s.split(':') {
+        if idx >= DTLS_FP_LEN {
+            return Err(PkarrError::MalformedCanonical(
+                "DTLS fingerprint has more than 32 hex bytes",
+            ));
+        }
+        if byte_str.len() != 2 {
+            return Err(PkarrError::MalformedCanonical(
+                "DTLS fingerprint byte must be exactly 2 hex chars",
+            ));
+        }
+        out[idx] = u8::from_str_radix(byte_str, 16)
+            .map_err(|_| PkarrError::MalformedCanonical("DTLS fingerprint byte not hex"))?;
+        idx += 1;
+    }
+    if idx != DTLS_FP_LEN {
+        return Err(PkarrError::MalformedCanonical(
+            "DTLS fingerprint must be exactly 32 hex bytes",
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse the post-`a=candidate:` portion of one SDP candidate line
+/// into a [`BlobCandidate`]. Returns `None` if the candidate fails
+/// any hygiene filter (component ≠ 1, transport ≠ udp, IPv6,
+/// unknown type) so the caller can skip it rather than blowing up
+/// the whole blob. Private to this module — symmetric daemons have
+/// their own copy in `listener.rs`.
+fn parse_sdp_candidate_line(rest: &str) -> Option<BlobCandidate> {
+    let mut toks = rest.split_whitespace();
+    let _foundation = toks.next()?;
+    let component = toks.next()?;
+    if component != "1" {
+        return None;
+    }
+    let transport = toks.next()?;
+    if !transport.eq_ignore_ascii_case("udp") {
+        return None;
+    }
+    let _priority = toks.next()?;
+    let addr_s = toks.next()?;
+    let port_s = toks.next()?;
+    if toks.next() != Some("typ") {
+        return None;
+    }
+    let typ_s = toks.next()?;
+    let ip: std::net::IpAddr = addr_s.parse().ok()?;
+    let port: u16 = port_s.parse().ok()?;
+    // IPv4 only — matches the answer-side filter (PR #31 hygiene).
+    let std::net::IpAddr::V4(_) = ip else {
+        return None;
+    };
+    let typ = match typ_s {
+        "host" => CandidateType::Host,
+        "srflx" => CandidateType::Srflx,
+        "prflx" => CandidateType::Prflx,
+        "relay" => CandidateType::Relay,
+        _ => return None,
+    };
+    Some(BlobCandidate { typ, ip, port })
+}
+
+/// Reconstruct a minimal SDP offer from an [`OfferBlob`]. Symmetric
+/// to [`answer_blob_to_sdp`]: the daemon calls this after unsealing a
+/// v3 offer to feed webrtc-rs a syntactically complete offer SDP for
+/// `set_remote_description`. The client's DTLS fingerprint comes out
+/// of the blob directly (it was carried there because clients have
+/// no persistent pkarr record to pin it to).
+#[must_use]
+pub fn offer_blob_to_sdp(blob: &OfferBlob) -> String {
+    let fp_hex = colon_hex_upper(&blob.client_dtls_fp);
+    let mut s = String::with_capacity(512);
+    s.push_str("v=0\r\n");
+    s.push_str("o=- 1 1 IN IP4 0.0.0.0\r\n");
+    s.push_str("s=-\r\n");
+    s.push_str("t=0 0\r\n");
+    s.push_str("a=group:BUNDLE 0\r\n");
+    s.push_str("m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n");
+    s.push_str("c=IN IP4 0.0.0.0\r\n");
+    s.push_str("a=mid:0\r\n");
+    s.push_str("a=rtcp-mux\r\n");
+    s.push_str(&format!("a=ice-ufrag:{}\r\n", blob.ice_ufrag));
+    s.push_str(&format!("a=ice-pwd:{}\r\n", blob.ice_pwd));
+    s.push_str(&format!("a=fingerprint:sha-256 {fp_hex}\r\n"));
+    s.push_str(&format!("a=setup:{}\r\n", blob.setup.as_sdp_str()));
+    s.push_str("a=sctp-port:5000\r\n");
+    for cand in &blob.candidates {
+        s.push_str(&format!(
+            "a=candidate:1 1 udp 1 {ip} {port} typ {typ} generation 0\r\n",
+            ip = cand.ip,
+            port = cand.port,
+            typ = cand.typ.as_sdp_str(),
+        ));
+    }
+    s.push_str("a=end-of-candidates\r\n");
+    s
+}
+
 /// Lowercase hex-encode each byte, separated by `:`, matching the
 /// `a=fingerprint:sha-256 ...` formatting WebRTC uses. Upper-case is
 /// conventional in SDP fingerprints; reconstructor matches that.
@@ -1699,6 +2257,25 @@ mod tests {
         }
     }
 
+    /// Representative v3 offer blob. Browser-style setup (`actpass`),
+    /// CertFp binding, one srflx candidate. Keep in sync with
+    /// [`sample_blob`] so tests that exercise both sides use the same
+    /// wire shapes.
+    fn sample_offer_blob() -> OfferBlob {
+        OfferBlob {
+            ice_ufrag: "abcd".to_string(),
+            ice_pwd: "Supercalifragilistic!2".to_string(),
+            setup: SetupRole::Actpass,
+            binding_mode: BindingMode::CertFp,
+            client_dtls_fp: [0xABu8; DTLS_FP_LEN],
+            candidates: vec![BlobCandidate {
+                typ: CandidateType::Srflx,
+                ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
+                port: 45_678,
+            }],
+        }
+    }
+
     // ---------- label helpers ----------
 
     #[test]
@@ -1738,26 +2315,19 @@ mod tests {
     // ---------- plaintext roundtrip ----------
 
     #[test]
-    fn offer_plaintext_roundtrips() {
+    fn offer_plaintext_roundtrips_v3() {
         let client_pk = client_sk().public_key();
-        let p = OfferPlaintext {
-            client_pk,
-            offer_sdp: SAMPLE_OFFER_SDP.to_string(),
-            binding_mode: BindingMode::Exporter,
-        };
-        let enc = encode_offer_plaintext(&p);
+        let p = OfferPlaintext::new_v3(client_pk, sample_offer_blob());
+        let enc = encode_offer_plaintext(&p).unwrap();
         let dec = parse_offer_plaintext(&enc).unwrap();
         assert_eq!(dec, p);
     }
 
     #[test]
     fn offer_plaintext_rejects_unknown_compression_tag() {
-        let p = OfferPlaintext {
-            client_pk: client_sk().public_key(),
-            offer_sdp: "v=0".to_string(),
-            binding_mode: BindingMode::Exporter,
-        };
-        let mut enc = encode_offer_plaintext(&p);
+        let client_pk = client_sk().public_key();
+        let p = OfferPlaintext::new_v3(client_pk, sample_offer_blob());
+        let mut enc = encode_offer_plaintext(&p).unwrap();
         enc[0] = 0xFF;
         assert!(matches!(
             parse_offer_plaintext(&enc),
@@ -1767,15 +2337,11 @@ mod tests {
 
     #[test]
     fn offer_plaintext_rejects_truncated_zlib_body() {
-        // Truncating a v2 blob inside the zlib stream fails
-        // decompression. (v1-truncation is still covered by the v1
-        // back-compat test below.)
-        let p = OfferPlaintext {
-            client_pk: client_sk().public_key(),
-            offer_sdp: "v=0".to_string(),
-            binding_mode: BindingMode::Exporter,
-        };
-        let enc = encode_offer_plaintext(&p);
+        // Truncating a compressed offer inside the zlib stream fails
+        // decompression.
+        let client_pk = client_sk().public_key();
+        let p = OfferPlaintext::new_v3(client_pk, sample_offer_blob());
+        let enc = encode_offer_plaintext(&p).unwrap();
         assert!(matches!(
             parse_offer_plaintext(&enc[..5]),
             Err(PkarrError::MalformedCanonical(_))
@@ -1784,16 +2350,14 @@ mod tests {
 
     /// Hand-craft a legacy v1 *body* (the pre-PR-28.3 shape: v1 domain
     /// separator, no trailing `binding_mode` byte) wrapped in the
-    /// Uncompressed compression tag, and confirm the new v2-aware
-    /// decoder accepts it with `binding_mode = Exporter` as the
-    /// documented default. Locks the legacy wire layout against
-    /// accidental encoder breakage.
+    /// Uncompressed compression tag, and confirm the v3-aware decoder
+    /// accepts it as [`OfferPayload::LegacySdp`] with
+    /// `binding_mode = Exporter` as the documented default. Locks the
+    /// legacy wire layout against accidental decoder breakage.
     #[test]
     fn offer_plaintext_accepts_v1_uncompressed_body_for_backcompat() {
         let client_pk = client_sk().public_key();
         let sdp = SAMPLE_OFFER_SDP.as_bytes();
-        // Handroll the v1 body verbatim — do NOT route through
-        // encode_offer_body, which now emits v2.
         let mut body =
             Vec::with_capacity(OFFER_INNER_DOMAIN_V1.len() + PUBLIC_KEY_LEN + 4 + sdp.len());
         body.extend_from_slice(OFFER_INNER_DOMAIN_V1);
@@ -1807,7 +2371,10 @@ mod tests {
 
         let dec = parse_offer_plaintext(&wrapped).unwrap();
         assert_eq!(dec.client_pk, client_pk);
-        assert_eq!(dec.offer_sdp, SAMPLE_OFFER_SDP);
+        match dec.offer {
+            OfferPayload::LegacySdp(s) => assert_eq!(s, SAMPLE_OFFER_SDP),
+            OfferPayload::V3Blob(_) => panic!("expected LegacySdp"),
+        }
         assert_eq!(
             dec.binding_mode,
             BindingMode::Exporter,
@@ -1815,18 +2382,33 @@ mod tests {
         );
     }
 
-    /// v2 bodies MUST round-trip both binding modes byte-for-byte.
+    /// v2 bodies (pre-compact-offer-blob, full SDP + trailing
+    /// binding_mode byte) MUST still decode as [`OfferPayload::LegacySdp`]
+    /// for the rollout window.
     #[test]
-    fn offer_plaintext_v2_roundtrips_both_binding_modes() {
+    fn offer_plaintext_accepts_v2_body_for_backcompat() {
         for mode in [BindingMode::Exporter, BindingMode::CertFp] {
-            let p = OfferPlaintext {
-                client_pk: client_sk().public_key(),
-                offer_sdp: SAMPLE_OFFER_SDP.to_string(),
-                binding_mode: mode,
-            };
-            let enc = encode_offer_plaintext(&p);
-            let dec = parse_offer_plaintext(&enc).unwrap();
-            assert_eq!(dec, p, "roundtrip failed for {mode:?}");
+            let client_pk = client_sk().public_key();
+            let sdp = SAMPLE_OFFER_SDP.as_bytes();
+            let mut body = Vec::with_capacity(
+                OFFER_INNER_DOMAIN_V2.len() + PUBLIC_KEY_LEN + 4 + sdp.len() + 1,
+            );
+            body.extend_from_slice(OFFER_INNER_DOMAIN_V2);
+            body.extend_from_slice(&client_pk.to_bytes());
+            body.extend_from_slice(&u32::try_from(sdp.len()).unwrap().to_be_bytes());
+            body.extend_from_slice(sdp);
+            body.push(mode.as_u8());
+
+            let mut wrapped = Vec::with_capacity(1 + body.len());
+            wrapped.push(CompressionTag::Uncompressed as u8);
+            wrapped.extend_from_slice(&body);
+
+            let dec = parse_offer_plaintext(&wrapped).unwrap();
+            match dec.offer {
+                OfferPayload::LegacySdp(s) => assert_eq!(s, SAMPLE_OFFER_SDP),
+                OfferPayload::V3Blob(_) => panic!("v2 body must decode as LegacySdp"),
+            }
+            assert_eq!(dec.binding_mode, mode);
         }
     }
 
@@ -1857,6 +2439,125 @@ mod tests {
         ));
     }
 
+    // ---------- v3 offer-blob codec ----------
+
+    #[test]
+    fn offer_blob_roundtrips_all_fields() {
+        let blob = OfferBlob {
+            ice_ufrag: "abcd".to_string(),
+            ice_pwd: "0123456789abcdefghij!@".to_string(),
+            setup: SetupRole::Active,
+            binding_mode: BindingMode::Exporter,
+            client_dtls_fp: [0xABu8; DTLS_FP_LEN],
+            candidates: vec![
+                BlobCandidate {
+                    typ: CandidateType::Host,
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                    port: 12_345,
+                },
+                BlobCandidate {
+                    typ: CandidateType::Srflx,
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+                    port: 51_820,
+                },
+            ],
+        };
+        let enc = encode_offer_blob(&blob).unwrap();
+        let dec = parse_offer_blob(&enc).unwrap();
+        assert_eq!(dec, blob);
+    }
+
+    #[test]
+    fn offer_blob_roundtrips_browser_shape() {
+        // Browser default: actpass + CertFp.
+        let blob = sample_offer_blob();
+        let enc = encode_offer_blob(&blob).unwrap();
+        let dec = parse_offer_blob(&enc).unwrap();
+        assert_eq!(dec, blob);
+    }
+
+    #[test]
+    fn offer_blob_rejects_passive_setup_role() {
+        let mut blob = sample_offer_blob();
+        blob.setup = SetupRole::Passive;
+        assert!(matches!(
+            encode_offer_blob(&blob),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn offer_blob_rejects_unknown_version_byte() {
+        let mut enc = encode_offer_blob(&sample_offer_blob()).unwrap();
+        enc[0] = 0xFF;
+        assert!(matches!(
+            parse_offer_blob(&enc),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn offer_blob_rejects_reserved_flag_bits() {
+        let mut enc = encode_offer_blob(&sample_offer_blob()).unwrap();
+        // Set a reserved bit (3-7).
+        enc[1] |= 0b1000_0000;
+        assert!(matches!(
+            parse_offer_blob(&enc),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn offer_blob_rejects_oversize_candidate_count() {
+        let mut blob = sample_offer_blob();
+        blob.candidates = (0..(MAX_BLOB_CANDIDATES + 1) as u8)
+            .map(|i| BlobCandidate {
+                typ: CandidateType::Host,
+                ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, i)),
+                port: 1000 + i as u16,
+            })
+            .collect();
+        assert!(matches!(
+            encode_offer_blob(&blob),
+            Err(PkarrError::MalformedCanonical(_))
+        ));
+    }
+
+    #[test]
+    fn offer_body_fits_inside_bep44_packet_budget() {
+        // A v3 offer plaintext for a representative browser-style blob
+        // MUST seal + base64url + DNS-wrap to well under the BEP44
+        // 1000-byte cap. That's the entire point of this PR.
+        let client_pk = client_sk().public_key();
+        let p = OfferPlaintext::new_v3(client_pk, sample_offer_blob());
+        let enc = encode_offer_plaintext(&p).unwrap();
+        // Sealed ciphertext = plaintext + 48-byte libsodium overhead.
+        // Base64url = 4/3. Plus DNS overhead (~40-60 bytes).
+        let sealed_len = enc.len() + 48;
+        let b64_len = sealed_len.div_ceil(3) * 4;
+        let worst_case = b64_len + 128;
+        assert!(
+            worst_case < BEP44_MAX_V_BYTES,
+            "v3 offer packet worst-case {} exceeds BEP44 cap {}",
+            worst_case,
+            BEP44_MAX_V_BYTES,
+        );
+    }
+
+    #[test]
+    fn offer_blob_to_sdp_is_syntactically_valid() {
+        // Reconstructed SDP MUST contain the fields daemon-side
+        // webrtc-rs will parse from a remote offer.
+        let blob = sample_offer_blob();
+        let sdp = offer_blob_to_sdp(&blob);
+        assert!(sdp.contains("a=ice-ufrag:abcd"));
+        assert!(sdp.contains("a=ice-pwd:Supercalifragilistic!2"));
+        assert!(sdp.contains("a=setup:actpass"));
+        assert!(sdp.contains("a=fingerprint:sha-256 "));
+        assert!(sdp.contains("198.51.100.7 45678"));
+        assert!(sdp.ends_with("a=end-of-candidates\r\n"));
+    }
+
     #[test]
     fn binding_mode_try_from_rejects_unknown_bytes() {
         assert!(matches!(
@@ -1874,32 +2575,32 @@ mod tests {
         assert_eq!(BindingMode::try_from_u8(0x02).unwrap(), BindingMode::CertFp);
     }
 
-    /// Zlib compression MUST strictly shrink a realistic-sized SDP
-    /// (the main v0.1 motivation). Don't pin an exact ratio — flate2
-    /// output isn't byte-deterministic across backend versions.
+    /// v3 plaintext for a browser-sized offer MUST stay well below the
+    /// BEP44 packet-size ceiling even in the fully-packed worst case.
+    /// This is the invariant that the whole PR was built to enforce —
+    /// pre-v3 Chrome offers were hitting 1044-byte packets (above the
+    /// 1000-byte cap).
     #[test]
-    fn v2_encoding_is_smaller_than_v1_for_realistic_sdp() {
-        // ~500-byte SDP with multiple ICE candidates — representative
-        // of what the daemon's handle_offer produces after gather.
-        let mut sdp = String::from(SAMPLE_OFFER_SDP);
-        for i in 0..12 {
-            sdp.push_str(&format!(
-                "a=candidate:{i} 1 udp 2122260223 192.168.1.{i} 50000 typ host\r\n"
-            ));
-        }
-        let p = OfferPlaintext {
-            client_pk: client_sk().public_key(),
-            offer_sdp: sdp.clone(),
-            binding_mode: BindingMode::Exporter,
-        };
-        let v1_body = encode_offer_body(&p);
-        let v1_total = 1 + v1_body.len();
-        let v2 = encode_offer_plaintext(&p);
+    fn v3_offer_plaintext_stays_well_under_bep44_cap() {
+        let mut blob = sample_offer_blob();
+        // Fully pack the candidate list to exercise the worst case the
+        // encoder will actually produce (MAX_BLOB_CANDIDATES hygiene
+        // cap on the extraction side).
+        blob.candidates = (0..MAX_BLOB_CANDIDATES as u8)
+            .map(|i| BlobCandidate {
+                typ: CandidateType::Host,
+                ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, i)),
+                port: 50_000 + i as u16,
+            })
+            .collect();
+        let p = OfferPlaintext::new_v3(client_sk().public_key(), blob);
+        let enc = encode_offer_plaintext(&p).unwrap();
+        // Even with max candidates, the compressed plaintext fits in a
+        // fraction of the BEP44 budget.
         assert!(
-            v2.len() < v1_total,
-            "v2 compressed plaintext ({} bytes) must be strictly smaller than v1 ({})",
-            v2.len(),
-            v1_total,
+            enc.len() < 400,
+            "fully-packed v3 offer plaintext was {} bytes; expected < 400",
+            enc.len(),
         );
     }
 
@@ -1921,15 +2622,14 @@ mod tests {
         ));
     }
 
-    /// Empty SDP should still round-trip cleanly.
+    /// Zero-candidate v3 offer round-trips cleanly — matches the shape
+    /// of an offer produced before any ICE gather completes.
     #[test]
-    fn empty_offer_sdp_roundtrips_v2() {
-        let p = OfferPlaintext {
-            client_pk: client_sk().public_key(),
-            offer_sdp: String::new(),
-            binding_mode: BindingMode::Exporter,
-        };
-        let enc = encode_offer_plaintext(&p);
+    fn offer_plaintext_v3_zero_candidates_roundtrips() {
+        let mut blob = sample_offer_blob();
+        blob.candidates.clear();
+        let p = OfferPlaintext::new_v3(client_sk().public_key(), blob);
+        let enc = encode_offer_plaintext(&p).unwrap();
         let dec = parse_offer_plaintext(&enc).unwrap();
         assert_eq!(dec, p);
     }
@@ -2141,11 +2841,7 @@ mod tests {
     fn offer_seal_open_roundtrip() {
         let daemon_pk = host_sk().public_key();
         let daemon_sk = host_sk();
-        let plaintext = OfferPlaintext {
-            client_pk: client_sk().public_key(),
-            offer_sdp: SAMPLE_OFFER_SDP.to_string(),
-            binding_mode: BindingMode::Exporter,
-        };
+        let plaintext = OfferPlaintext::new_v3(client_sk().public_key(), sample_offer_blob());
         let mut rng = deterministic_rng();
         let record = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();
         let opened = record.open(&daemon_sk).unwrap();
@@ -2155,11 +2851,7 @@ mod tests {
     #[test]
     fn offer_open_with_wrong_key_fails() {
         let daemon_pk = host_sk().public_key();
-        let plaintext = OfferPlaintext {
-            client_pk: client_sk().public_key(),
-            offer_sdp: SAMPLE_OFFER_SDP.to_string(),
-            binding_mode: BindingMode::Exporter,
-        };
+        let plaintext = OfferPlaintext::new_v3(client_sk().public_key(), sample_offer_blob());
         let mut rng = deterministic_rng();
         let record = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();
         // Open with the client's key (which is not the recipient).
@@ -2601,11 +3293,7 @@ mod tests {
         let client_sk = client_sk();
         let daemon_pk = host_sk().public_key();
 
-        let plaintext = OfferPlaintext {
-            client_pk: client_sk.public_key(),
-            offer_sdp: SAMPLE_OFFER_SDP.to_string(),
-            binding_mode: BindingMode::Exporter,
-        };
+        let plaintext = OfferPlaintext::new_v3(client_sk.public_key(), sample_offer_blob());
         let mut rng = deterministic_rng();
         let offer = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext).unwrap();
 
