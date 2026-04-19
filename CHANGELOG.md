@@ -8,6 +8,21 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #19, README Quickstart + worked examples)
+
+- `README.md` gains a **Quickstart** section — four copy-paste commands that clone, build, run, and dial — plus a link to the fuller [site Quickstart guide](https://kaicoder03.github.io/openhost/guides/quickstart/). The Repository-layout table now names the three worked examples we actually ship.
+- **`examples/README.md`** — index of the service walkthroughs with a compatibility note (REST works today; WebSocket-dependent UIs don't, pending the Phase 3+ per-path WebSocket allowlist).
+- **`examples/personal-site/`** — `README.md` + complete `daemon.toml`. End-to-end working example against a `caddy file-server`-hosted static site on `127.0.0.1:8080`. Smallest viable walkthrough; no caveats.
+- **`examples/jellyfin/`** — `README.md` + `daemon.toml`. Exposes Jellyfin's REST API on `127.0.0.1:8096` and demonstrates authenticated requests via `X-Emby-Token`. Documents that the web UI loads but doesn't function fully (WebSocket progress reporting), and that direct-play streaming is partial-only at `v0.1.0`. `max_body_bytes = 32 MiB` to accommodate library listings and posters.
+- **`examples/home-assistant/`** — `README.md` + `daemon.toml`. Exposes Home Assistant's `/api/` on `127.0.0.1:8123` with `host_override = "127.0.0.1:8123"` so `http.trusted_proxies` is a non-issue. Concrete examples cover state reads and service calls (turn on a light from a second machine). Explicitly flags that Lovelace UI and Companion apps do not work at `v0.1.0` because they require WebSockets.
+
+### Verification (PR #19)
+
+- `cargo check --workspace` clean (no code changes).
+- Every `daemon.toml` parses against the `Config` schema at `crates/openhost-daemon/src/config.rs` (identity store tag `kind = "fs"`, `pkarr.offer_poll` subsection, `pairing` defaults).
+- Every `openhost-dial` / `openhostd` / `openhost-resolve` invocation in the walkthroughs uses flags that exist post-PR-16 / PR-17.
+- WebSocket incompatibility explicitly called out in both Jellyfin and Home Assistant walkthroughs so early testers don't waste time debugging a known limitation.
+
 ### Added (PR #18, site operator guides)
 
 - New **Guides** section under `site/src/content/docs/guides/` with three pages:

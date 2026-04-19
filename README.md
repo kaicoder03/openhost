@@ -19,6 +19,30 @@ A small daemon runs on your home server and publishes a signed DNS record, keyed
 
 See [`spec/00-overview.md`](spec/00-overview.md) for the full protocol.
 
+## Quickstart
+
+Bring up a local HTTP service, expose it over openhost, dial it from a second machine:
+
+```bash
+# Host machine: clone, build, start an upstream, run.
+git clone https://github.com/kaicoder03/openhost.git && cd openhost
+cargo build --release -p openhost-daemon
+cargo build --release --features cli -p openhost-client
+
+mkdir -p ~/sites && echo '<h1>hello</h1>' > ~/sites/index.html
+# Any local HTTP server will do; these examples assume port 8080.
+python3 -m http.server 8080 --bind 127.0.0.1 --directory ~/sites &
+
+mkdir -p ~/.config/openhost
+cp examples/personal-site/daemon.toml ~/.config/openhost/daemon.toml
+./target/release/openhostd run        # prints "openhostd: up pubkey=<zbase32>"
+
+# Client machine (after copying the same three binaries):
+openhost-dial oh://<zbase32-pubkey>/
+```
+
+The full walkthrough — including how to pair a persistent client identity and tighten the allowlist — is in the site's [Quickstart guide](https://kaicoder03.github.io/openhost/guides/quickstart/). Three service-specific examples live under [`examples/`](examples/).
+
 ## Repository layout
 
 | Path | Contents |
@@ -28,7 +52,7 @@ See [`spec/00-overview.md`](spec/00-overview.md) for the full protocol.
 | `site/` | Public website + docs (Astro + Starlight + Tailwind) |
 | `extension/` | Browser extension (M5+) |
 | `apple/` | iOS and macOS apps (M6/M7) |
-| `examples/` | Worked examples — Jellyfin, Home Assistant, personal sites |
+| `examples/` | Worked walkthroughs: `personal-site/`, `jellyfin/`, `home-assistant/`, plus a generic `daemon.toml` template |
 
 ## Building from source
 

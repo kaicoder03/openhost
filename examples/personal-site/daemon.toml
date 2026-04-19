@@ -1,0 +1,32 @@
+# openhostd configuration for exposing a static personal site.
+#
+# Matches the walkthrough in this directory's README. Copy to
+# ~/.config/openhost/daemon.toml and run `openhostd run`.
+
+[identity]
+store = { kind = "fs", path = "~/.config/openhost/identity.key" }
+
+[pkarr]
+# Empty falls back to the bundled relay list + Mainline DHT.
+relays = []
+republish_secs = 1800
+
+[pkarr.offer_poll]
+# Start permissive so the first dial from an unpaired client works.
+# Flip to true and populate `watched_clients` once you've paired your
+# device — see the README.
+enforce_allowlist = false
+poll_secs = 1
+watched_clients = []
+
+[dtls]
+cert_path = "~/.config/openhost/dtls.pem"
+rotate_secs = 86400
+
+[forward]
+# Point this at whatever local port `caddy file-server` is bound to.
+target = "http://127.0.0.1:8080"
+max_body_bytes = 16777216   # 16 MiB — plenty for any static asset.
+
+[log]
+level = "info"
