@@ -318,18 +318,20 @@ impl Dialer {
     /// the client's own Ed25519 pubkey carrying the `_offer-<host-hash>`
     /// TXT.
     pub async fn publish_offer(&mut self, daemon_pk: &PublicKey, offer_sdp: &str) -> Result<()> {
-        // CLI always advertises `Exporter`. A CLI that accepted
-        // `CertFp` from a browser-speaking daemon would silently
-        // downgrade its channel binding to the public-cert form; CLI
-        // code paths use `webrtc-rs` with RFC 5705 exporter support
-        // natively, so there's no reason to ever accept the downgrade.
-        // PR #28.3's CLI downgrade-rejection (see
-        // `crates/openhost-client/src/binding.rs`) enforces this on
-        // the answer-parse side.
+        // CLI dialers advertise `Exporter` unconditionally. CertFp is
+        // the browser-only variant from `spec/04-security.md §4.1`; a
+        // CLI that silently downgraded to CertFp would reduce its
+        // channel binding to a value the cert-pin alone already
+        // covers. The constant below is load-bearing — refactors that
+        // thread a runtime-chosen mode into this call site MUST route
+        // through [`assert_cli_binding_mode`] so the CLI cannot ship
+        // a weaker binding than the spec mandates.
+        const CLI_BINDING_MODE: openhost_pkarr::BindingMode = openhost_pkarr::BindingMode::Exporter;
+        assert_cli_binding_mode(CLI_BINDING_MODE)?;
         let plaintext = OfferPlaintext {
             client_pk: self.identity.public_key(),
             offer_sdp: offer_sdp.to_string(),
-            binding_mode: openhost_pkarr::BindingMode::Exporter,
+            binding_mode: CLI_BINDING_MODE,
         };
         let mut rng = rand::rngs::OsRng;
         let offer = OfferRecord::seal(&mut rng, daemon_pk, &plaintext)
@@ -595,4 +597,43 @@ async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<()> {
         .await
         .map_err(|e| ClientError::WebRtcSetup(format!("data channel send: {e}")))?;
     Ok(())
+}
+
+/// Spec §4.1 (`spec/04-security.md`) forbids CLI clients from
+/// advertising a channel-binding mode weaker than
+/// [`openhost_pkarr::BindingMode::Exporter`]. This is the one-line
+/// gate every CLI code path that constructs an `OfferPlaintext` MUST
+/// route through so a refactor can't silently ship a weaker binding.
+/// Browsers run a different code path (the WASM shim) and are NOT
+/// subject to this check — they're mandated to use `CertFp`.
+fn assert_cli_binding_mode(mode: openhost_pkarr::BindingMode) -> Result<()> {
+    match mode {
+        openhost_pkarr::BindingMode::Exporter => Ok(()),
+        other => Err(ClientError::ChannelBinding(
+            ClientBindingError::DowngradeRejected(other),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod downgrade_tests {
+    use super::*;
+
+    #[test]
+    fn cli_rejects_cert_fp_downgrade() {
+        let err = assert_cli_binding_mode(openhost_pkarr::BindingMode::CertFp)
+            .expect_err("CertFp must be refused on the CLI path");
+        assert!(matches!(
+            err,
+            ClientError::ChannelBinding(ClientBindingError::DowngradeRejected(
+                openhost_pkarr::BindingMode::CertFp,
+            ))
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_exporter() {
+        assert_cli_binding_mode(openhost_pkarr::BindingMode::Exporter)
+            .expect("Exporter is the CLI's only supported mode");
+    }
 }

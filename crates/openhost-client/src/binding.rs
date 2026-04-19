@@ -126,6 +126,15 @@ pub enum ClientBindingError {
     #[error("DTLS exporter failed: {0}")]
     Exporter(String),
 
+    /// CLI dialers advertise [`openhost_pkarr::BindingMode::Exporter`]
+    /// in their offer plaintext and MUST NOT negotiate down to the
+    /// `CertFp` variant a browser peer would use. If a future caller
+    /// mis-configures the dialer to emit a weaker binding this error
+    /// surfaces and the dial aborts. See `spec/04-security.md §4.1`
+    /// (channel-binding modes) and the negotiation rules there.
+    #[error("CLI dialer refused to advertise non-Exporter binding mode {0:?}")]
+    DowngradeRejected(openhost_pkarr::BindingMode),
+
     /// The exporter returned the wrong number of bytes.
     #[error("DTLS exporter returned {0} bytes, expected {EXPORTER_SECRET_LEN}")]
     ExporterLength(usize),
