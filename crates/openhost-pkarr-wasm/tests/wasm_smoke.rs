@@ -231,34 +231,58 @@ fn decode_answer_fragments_reassembles_published_fragments() {
 // Phase 4 browser-primitive smoke tests (PR #28.3)
 // ============================================================================
 
+/// Minimal but complete SDP offer carrying the attributes the v3
+/// compact-blob codec requires (ice-ufrag/pwd, setup, fingerprint).
+/// Used by the seal-offer roundtrip test below. Closer to what a
+/// real browser produces than the one-line synthetic strings used by
+/// pre-compact-offer tests.
+const SAMPLE_COMPLETE_OFFER_SDP: &str = "\
+v=0\r\n\
+o=- 1 1 IN IP4 0.0.0.0\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=mid:0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:0123456789abcdefghij!@\r\n\
+a=fingerprint:sha-256 AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89\r\n\
+a=setup:actpass\r\n\
+a=sctp-port:5000\r\n\
+a=candidate:1 1 udp 1 203.0.113.7 51820 typ srflx\r\n";
+
 #[test]
 fn seal_offer_roundtrips_via_daemon_open() {
     use openhost_pkarr::offer::OfferRecord;
+    use openhost_pkarr::OfferPayload;
 
     let daemon_sk = SigningKey::from_bytes(&SEED);
     let daemon_pk_z = daemon_sk.public_key().to_zbase32();
     let client_sk = SigningKey::from_bytes(&CLIENT_SEED);
     let client_pk_z = client_sk.public_key().to_zbase32();
 
-    let sealed = core::seal_offer(
-        &daemon_pk_z,
-        &client_pk_z,
-        "v=0\r\na=setup:active\r\n",
-        0x02,
-    )
-    .expect("seal ok");
+    let sealed = core::seal_offer(&daemon_pk_z, &client_pk_z, SAMPLE_COMPLETE_OFFER_SDP, 0x02)
+        .expect("seal ok");
 
     // Daemon-side open path: rebuild an OfferRecord from the sealed
-    // bytes and invoke AnswerPlaintext-style open through the CLI's
-    // existing unseal surface.
+    // bytes and invoke the existing unseal surface.
     let record = OfferRecord { sealed };
     let plain = record.open(&daemon_sk).expect("daemon opens sealed offer");
     assert_eq!(
         plain.client_pk.to_bytes(),
         client_sk.public_key().to_bytes()
     );
-    assert_eq!(plain.offer_sdp, "v=0\r\na=setup:active\r\n");
     assert_eq!(plain.binding_mode, openhost_pkarr::BindingMode::CertFp);
+    match plain.offer {
+        OfferPayload::V3Blob(blob) => {
+            assert_eq!(blob.ice_ufrag, "abcd");
+            assert_eq!(blob.ice_pwd, "0123456789abcdefghij!@");
+            assert_eq!(blob.setup, openhost_pkarr::SetupRole::Actpass);
+            assert_eq!(blob.binding_mode, openhost_pkarr::BindingMode::CertFp);
+            assert_eq!(blob.candidates.len(), 1);
+        }
+        OfferPayload::LegacySdp(s) => panic!("v3 seal path must produce V3Blob, got: {s}"),
+    }
 }
 
 #[test]
@@ -268,7 +292,7 @@ fn seal_offer_rejects_unknown_binding_mode() {
         .public_key()
         .to_zbase32();
     assert!(matches!(
-        core::seal_offer(&daemon_pk_z, &client_pk_z, "v=0\r\n", 0xFF),
+        core::seal_offer(&daemon_pk_z, &client_pk_z, SAMPLE_COMPLETE_OFFER_SDP, 0xFF),
         Err(core::Error::Pkarr(_))
     ));
 }

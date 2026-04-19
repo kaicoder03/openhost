@@ -149,6 +149,12 @@ pub fn decode_answer_fragments(
 /// Returns the raw sealed bytes; JS base64url-encodes them for the
 /// Pkarr relay PUT.
 ///
+/// Internally extracts the compact v3 offer blob from the raw SDP
+/// `RTCPeerConnection.createOffer()` produced — JS never sees the
+/// blob structure. The v3 blob reduces a Chrome-generated ~1100-byte
+/// SDP to a ~130-byte body so the sealed packet fits under BEP44's
+/// 1000-byte cap.
+///
 /// `binding_mode_u8` MUST be `0x02` (CertFp) for browser calls.
 #[wasm_bindgen]
 pub fn seal_offer(
@@ -164,6 +170,16 @@ pub fn seal_offer(
         binding_mode_u8,
     )
     .map_err(|e| to_js_err(&e))
+}
+
+/// Given a raw offer SDP, return the canonical reconstructed SDP the
+/// daemon will build from the extracted v3 blob. Use this on the JS
+/// side to compute an `offer_sdp_hash` that matches what the daemon
+/// will hash on its end — the answer's binding hash is over the
+/// reconstructed form, not the browser's raw SDP.
+#[wasm_bindgen]
+pub fn canonicalize_offer_sdp(offer_sdp: &str, binding_mode_u8: u8) -> Result<String, JsError> {
+    core::canonicalize_offer_sdp(offer_sdp, binding_mode_u8).map_err(|e| to_js_err(&e))
 }
 
 /// Open an answer ciphertext with the client's 32-byte secret key and

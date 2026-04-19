@@ -27,7 +27,6 @@ use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
@@ -283,6 +282,12 @@ mod sdp_blob_tests {
 pub struct PassivePeer {
     api: Arc<API>,
     certificate: RTCCertificate,
+    /// SHA-256 over the DER encoding of the daemon's own DTLS cert.
+    /// Used by the `CertFp` channel-binding path — both sides
+    /// (spec/04-security.md §4.1) MUST hash the *host's* cert, not the
+    /// remote peer's. On the daemon that means our own cert, not the
+    /// client's (which is what `get_remote_certificate()` returns).
+    local_dtls_fp: [u8; 32],
     #[allow(dead_code)] // read by future rotation-consistency checks
     state: Arc<SharedState>,
     active: Arc<Mutex<HashMap<PcKey, Arc<RTCPeerConnection>>>>,
@@ -315,6 +320,7 @@ impl PassivePeer {
     /// cloning is cheap.
     pub async fn new(
         certificate: RTCCertificate,
+        local_dtls_fp: [u8; 32],
         identity: Arc<SigningKey>,
         state: Arc<SharedState>,
         forwarder: Option<Arc<Forwarder>>,
@@ -358,6 +364,7 @@ impl PassivePeer {
         Ok(Self {
             api: Arc::new(api),
             certificate,
+            local_dtls_fp,
             state,
             active: Arc::new(Mutex::new(HashMap::new())),
             offer_timeout_secs: DEFAULT_OFFER_TIMEOUT_SECS,
@@ -463,6 +470,7 @@ impl PassivePeer {
             Arc::clone(&self.binding_timeout_secs),
             self.forwarder.clone(),
             binding_mode,
+            self.local_dtls_fp,
         );
         wire_dtls_state_observer(Arc::clone(&pc));
         wire_prune_on_terminal_state(Arc::clone(&pc), Arc::clone(&self.active));
@@ -605,6 +613,7 @@ fn wire_data_channel_handler(
     binding_timeout_secs: Arc<AtomicU64>,
     forwarder: Option<Arc<Forwarder>>,
     binding_mode: BindingMode,
+    local_dtls_fp: [u8; 32],
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let label = dc.label().to_string();
@@ -621,6 +630,7 @@ fn wire_data_channel_handler(
                 binding_timeout_secs,
                 forwarder,
                 binding_mode,
+                local_dtls_fp,
             )
             .await;
         })
@@ -676,6 +686,7 @@ async fn wire_frame_loop(
     binding_timeout_secs: Arc<AtomicU64>,
     forwarder: Option<Arc<Forwarder>>,
     binding_mode: BindingMode,
+    local_dtls_fp: [u8; 32],
 ) {
     let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
@@ -783,6 +794,7 @@ async fn wire_frame_loop(
                             &ws_tunnel,
                             forwarder.as_deref(),
                             binding_mode,
+                            &local_dtls_fp,
                         )
                         .await;
                         if let FrameOutcome::Teardown = outcome {
@@ -828,6 +840,7 @@ async fn dispatch_frame(
     ws_tunnel: &Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
     forwarder: Option<&Forwarder>,
     binding_mode: BindingMode,
+    local_dtls_fp: &[u8; 32],
 ) -> FrameOutcome {
     // Look up binding state, then release the lock before awaiting
     // webrtc I/O (the send + close paths below both await).
@@ -887,6 +900,7 @@ async fn dispatch_frame(
                 dtls_transport,
                 &nonce,
                 binding_mode,
+                local_dtls_fp,
             )
             .await;
         }
@@ -1077,21 +1091,23 @@ async fn handle_auth_client(
     dtls_transport: &RTCDtlsTransport,
     nonce: &[u8; AUTH_NONCE_LEN],
     binding_mode: BindingMode,
+    local_dtls_fp: &[u8; 32],
 ) -> FrameOutcome {
-    let binding_secret = match derive_binding_secret(dtls_transport, binding_mode).await {
-        Ok(bytes) => bytes,
-        Err(reason) => {
-            tracing::warn!(
-                ?binding_mode,
-                reason,
-                "openhostd: binding-secret derivation failed; tearing down"
-            );
-            let _ = send_error_frame(dc, reason).await;
-            *binding.lock().await = BindingState::Failed;
-            binding_done.notify_waiters();
-            return FrameOutcome::Teardown;
-        }
-    };
+    let binding_secret =
+        match derive_binding_secret(dtls_transport, binding_mode, local_dtls_fp).await {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                tracing::warn!(
+                    ?binding_mode,
+                    reason,
+                    "openhostd: binding-secret derivation failed; tearing down"
+                );
+                let _ = send_error_frame(dc, reason).await;
+                *binding.lock().await = BindingState::Failed;
+                binding_done.notify_waiters();
+                return FrameOutcome::Teardown;
+            }
+        };
 
     let client_pk = match binder.verify_client_sig(&binding_secret, nonce, &frame.payload) {
         Ok(pk) => pk,
@@ -1155,6 +1171,7 @@ async fn handle_auth_client(
 async fn derive_binding_secret(
     dtls_transport: &RTCDtlsTransport,
     binding_mode: BindingMode,
+    local_dtls_fp: &[u8; 32],
 ) -> Result<Vec<u8>, &'static str> {
     match binding_mode {
         BindingMode::Exporter => {
@@ -1168,20 +1185,18 @@ async fn derive_binding_secret(
             Ok(exporter)
         }
         BindingMode::CertFp => {
-            // `get_remote_certificate` returns the DER bytes cached by
-            // the fork's DTLS transport after the handshake. Empty if
-            // the handshake hasn't completed — which would be a
-            // protocol bug since AUTH_CLIENT is sent post-`Connected`.
-            let der = dtls_transport.get_remote_certificate().await;
-            if der.is_empty() {
-                return Err("remote DTLS certificate not available");
-            }
-            let mut hasher = Sha256::new();
-            hasher.update(&der);
-            // Exactly EXPORTER_SECRET_LEN (32) bytes — matches the
-            // HKDF-SHA256 IKM length the binder already uses in the
-            // exporter path, so downstream code stays identical.
-            Ok(hasher.finalize().to_vec())
+            // Spec/04-security.md §4.1 says both sides hash *the host's*
+            // DTLS cert (the one pinned in the Pkarr record). Browser
+            // peers hash the cert they see as "remote" — which is
+            // ours. To symmetrise, WE hash OUR OWN cert here, not the
+            // remote peer's cert. Using `get_remote_certificate()`
+            // (client's cert from the daemon's perspective) would give
+            // different bytes on each side and break AUTH_CLIENT
+            // verification. Fixed in the compact-offer-blob PR — was
+            // latent since PR #28.3 because the pre-compact-offer
+            // dial path could not reach the binding step from a real
+            // browser.
+            Ok(local_dtls_fp.to_vec())
         }
     }
 }

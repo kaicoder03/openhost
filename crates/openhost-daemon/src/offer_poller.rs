@@ -387,10 +387,22 @@ async fn process_client_packet(
 
     tracing::info!(client = %client_pk, "offer poll: processing offer");
 
+    // Resolve the offer payload to a concrete SDP string we can hand
+    // to webrtc-rs. v3 offers arrive as a compact blob (compact-offer
+    // PR) and get reconstructed via `offer_blob_to_sdp`; legacy
+    // v1/v2 offers carry a full SDP string verbatim. Both sides hash
+    // the SAME string (the reconstructed-or-verbatim SDP) for
+    // answer-binding, so the client's `offer_sdp_hash` matches what
+    // we compute below.
+    let offer_sdp_for_webrtc: String = match &plaintext.offer {
+        openhost_pkarr::OfferPayload::LegacySdp(s) => s.clone(),
+        openhost_pkarr::OfferPayload::V3Blob(blob) => openhost_pkarr::offer_blob_to_sdp(blob),
+    };
+
     // Run the handshake. `handle_offer` drains ICE and returns the
     // compact answer blob ready for sealing.
     let answer_blob = match listener
-        .handle_offer(&plaintext.offer_sdp, plaintext.binding_mode)
+        .handle_offer(&offer_sdp_for_webrtc, plaintext.binding_mode)
         .await
     {
         Ok(b) => b,
@@ -405,7 +417,7 @@ async fn process_client_packet(
     // Seal the answer back to the client as a v2 compact blob.
     let plaintext_answer = AnswerPlaintext {
         daemon_pk: *daemon_pk,
-        offer_sdp_hash: hash_offer_sdp(&plaintext.offer_sdp),
+        offer_sdp_hash: hash_offer_sdp(&offer_sdp_for_webrtc),
         answer: AnswerPayload::V2Blob(answer_blob),
     };
     let daemon_salt = state.salt();

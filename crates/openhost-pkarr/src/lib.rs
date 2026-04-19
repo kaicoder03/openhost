@@ -57,12 +57,14 @@ pub use error::{PkarrError, Result};
 pub use offer::{
     answer_blob_to_sdp, answer_txt_chunk_name, answer_txt_name, client_hash_label,
     decode_answer_fragments_from_packet, decode_offer_from_packet, encode_answer_blob,
-    encode_with_answers, hash_offer_sdp, host_hash, host_hash_label, offer_txt_name,
-    parse_answer_blob, AnswerBlob, AnswerEntry, AnswerPayload, AnswerPlaintext, BindingMode,
-    BlobCandidate, CandidateType, OfferPlaintext, OfferRecord, SetupRole, ANSWER_INNER_DOMAIN_V1,
-    ANSWER_INNER_DOMAIN_V2, ANSWER_TXT_PREFIX, CLIENT_HASH_LEN, DTLS_FP_LEN, HOST_HASH_LEN,
-    MAX_ANSWER_BLOB_LEN, MAX_BLOB_CANDIDATES, MAX_FRAGMENT_PAYLOAD_BYTES, MAX_FRAGMENT_TOTAL,
-    OFFER_INNER_DOMAIN_V1, OFFER_INNER_DOMAIN_V2, OFFER_SDP_HASH_LEN, OFFER_TXT_PREFIX,
+    encode_offer_blob, encode_with_answers, extract_sha256_fingerprint_from_sdp, hash_offer_sdp,
+    host_hash, host_hash_label, offer_blob_to_sdp, offer_txt_name, parse_answer_blob,
+    parse_offer_blob, sdp_to_offer_blob, AnswerBlob, AnswerEntry, AnswerPayload, AnswerPlaintext,
+    BindingMode, BlobCandidate, CandidateType, OfferBlob, OfferPayload, OfferPlaintext,
+    OfferRecord, SetupRole, ANSWER_INNER_DOMAIN_V1, ANSWER_INNER_DOMAIN_V2, ANSWER_TXT_PREFIX,
+    CLIENT_HASH_LEN, DTLS_FP_LEN, HOST_HASH_LEN, MAX_ANSWER_BLOB_LEN, MAX_BLOB_CANDIDATES,
+    MAX_FRAGMENT_PAYLOAD_BYTES, MAX_FRAGMENT_TOTAL, MAX_OFFER_BLOB_LEN, OFFER_INNER_DOMAIN_V1,
+    OFFER_INNER_DOMAIN_V2, OFFER_INNER_DOMAIN_V3, OFFER_SDP_HASH_LEN, OFFER_TXT_PREFIX,
     OFFER_TXT_TTL,
 };
 pub use pkarr::SignedPacket;

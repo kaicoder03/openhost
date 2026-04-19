@@ -318,14 +318,30 @@ pub fn seal_offer(
     let daemon_pk = parse_pubkey(daemon_pk_zbase32)?;
     let client_pk = parse_pubkey(client_pk_zbase32)?;
     let binding_mode = parse_binding_mode(binding_mode_u8)?;
-    let plaintext = OfferPlaintext {
-        client_pk,
-        offer_sdp: offer_sdp.to_string(),
-        binding_mode,
-    };
+    // Extract the compact v3 blob from the raw SDP on the WASM side
+    // so JS never has to see the blob structure — it just hands us
+    // the SDP that `RTCPeerConnection.createOffer()` produced.
+    let client_dtls_fp =
+        openhost_pkarr::extract_sha256_fingerprint_from_sdp(offer_sdp).map_err(Error::Pkarr)?;
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(offer_sdp, &client_dtls_fp, binding_mode)
+        .map_err(Error::Pkarr)?;
+    let plaintext = OfferPlaintext::new_v3(client_pk, offer_blob);
     let mut rng = OsRng;
     let record = OfferRecord::seal(&mut rng, &daemon_pk, &plaintext)?;
     Ok(record.sealed)
+}
+
+/// Compute the canonical offer SDP (as reconstructed on the daemon
+/// side) for a given raw SDP — exposed so JS can hash this exact
+/// string for answer-binding, matching what the daemon will hash
+/// from the received blob.
+pub fn canonicalize_offer_sdp(offer_sdp: &str, binding_mode_u8: u8) -> Result<String> {
+    let binding_mode = parse_binding_mode(binding_mode_u8)?;
+    let client_dtls_fp =
+        openhost_pkarr::extract_sha256_fingerprint_from_sdp(offer_sdp).map_err(Error::Pkarr)?;
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(offer_sdp, &client_dtls_fp, binding_mode)
+        .map_err(Error::Pkarr)?;
+    Ok(openhost_pkarr::offer_blob_to_sdp(&offer_blob))
 }
 
 /// Open an answer record with the client's 32-byte Ed25519 secret key
@@ -528,5 +544,11 @@ pub fn build_offer_packet(
         .sign(&keypair)
         .map_err(|e| Error::VerifyFailed(format!("sign: {e}")))?;
 
-    Ok(packet.serialize())
+    // Relay HTTP PUT expects `sig(64) || seq(8) || v` — the
+    // `to_relay_payload` shape. `packet.serialize()` prepends
+    // `last_seen(8) || pubkey(32)` for on-disk cache use, which
+    // relays reject with HTTP 400. Fixed in the compact-offer-blob
+    // PR; the pre-rollout browser dial path never reached this
+    // step so the bug was latent.
+    Ok(packet.to_relay_payload().to_vec())
 }
