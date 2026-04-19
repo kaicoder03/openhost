@@ -294,15 +294,16 @@ impl Dialer {
     /// first DC frame. The daemon side (`listener::negotiate`) has
     /// always waited for gather; this brings the client in line.
     ///
-    /// BEP44 packet-size caveat: a real-world offer SDP with 1 host
-    /// + 1-2 srflx candidates runs around 500-700 bytes plaintext
-    /// depending on the ice-ufrag / fingerprint values webrtc-rs
-    /// generates. Sealed-box + base64url push that into the 700-950
-    /// byte range — within the 1000-byte `v` cap, but not by much.
-    /// Dual-stack or multi-bridge hosts WILL overflow without the
-    /// IP filter installed in `webrtc_helpers::build_client_api`;
-    /// if the cap is tripped we error with `PublishOffer` rather than
-    /// silently succeed with zero candidates.
+    /// BEP44 packet-size caveat: a real-world offer SDP with one host
+    /// candidate and one or two srflx candidates runs around 500-700
+    /// bytes plaintext depending on the ice-ufrag / fingerprint values
+    /// webrtc-rs generates. Sealed-box plus base64url push that into
+    /// the 700-950 byte range, which is within the 1000-byte `v` cap
+    /// but not by much. Dual-stack or multi-bridge hosts WILL overflow
+    /// without the IP filter installed in
+    /// `webrtc_helpers::build_client_api`. If the cap is tripped the
+    /// dial errors with `PublishOffer` rather than silently succeeding
+    /// with zero candidates.
     pub async fn build_offer(
         &self,
     ) -> Result<(Arc<RTCPeerConnection>, Arc<RTCDataChannel>, String)> {

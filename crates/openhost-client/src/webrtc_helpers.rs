@@ -37,27 +37,22 @@ pub(crate) fn install_crypto_provider_once() {
 pub(crate) fn build_client_api() -> Arc<API> {
     install_crypto_provider_once();
     let mut engine = SettingEngine::default();
-    // IP filter applied to every ICE candidate webrtc-rs gathers.
-    // Rejects:
-    //
-    //   1. **All IPv6.** Multi-family candidate sets push the sealed
-    //      offer past BEP44's 1000-byte `v` cap on dual-stack hosts;
-    //      IPv4 with STUN srflx reaches the same peers in practice.
-    //      Covers both link-local (`fe80::/10`, unbind-able without
-    //      scope id) and public IPv6 host candidates. Revisit when
-    //      the offer encoder gains more fragmentation headroom.
-    //
-    //   2. **Docker Desktop macOS virtual bridges.**
-    //      - `bridge100` at `192.168.64.0/24` (Docker Desktop default)
-    //      - `bridge101` at `192.168.65.0/24` (Docker Desktop 4.30+)
-    //      These are Mac-local interfaces unreachable by a remote
-    //      peer; gathering them produces "phantom" candidates that
-    //      ICE burns connectivity-check time on before giving up.
-    //
-    // Narrow ranges (not a broad RFC 1918 sweep): a real LAN peer
-    // legitimately on `192.168.64.x` would want those candidates
-    // kept, so we filter the exact Docker Desktop bridge subnets
-    // rather than carpet-bombing RFC 1918.
+    // IP filter applied to every ICE candidate webrtc-rs gathers. It
+    // rejects all IPv6 and the two Docker Desktop macOS virtual-
+    // bridge subnets. IPv6 is dropped because multi-family candidate
+    // sets push the sealed offer past BEP44's 1000-byte `v` cap on
+    // dual-stack hosts; IPv4 with STUN srflx reaches the same peers
+    // in practice. That covers both link-local (`fe80::/10`,
+    // unbind-able without a scope id) and public IPv6 host
+    // candidates. Revisit when the offer encoder gains more
+    // fragmentation headroom. Docker Desktop's macOS bridges
+    // (`bridge100` at `192.168.64.0/24`, `bridge101` at
+    // `192.168.65.0/24` on Docker Desktop 4.30+) are Mac-local
+    // interfaces unreachable from a remote peer; gathering them
+    // produces phantom candidates that ICE burns connectivity-check
+    // time on. The filter targets those specific subnets rather than
+    // carpet-bombing RFC 1918 so a real LAN peer legitimately on
+    // `192.168.64.x` still gets its host candidates kept.
     engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| match ip {
         std::net::IpAddr::V4(v4) => !is_docker_desktop_bridge_v4(&v4),
         std::net::IpAddr::V6(_) => false,
@@ -77,6 +72,36 @@ pub(crate) fn build_client_api() -> Arc<API> {
 fn is_docker_desktop_bridge_v4(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 192 && o[1] == 168 && (o[2] == 64 || o[2] == 65)
+}
+
+/// Install an `on_peer_connection_state_change` handler that forwards
+/// every transition into an `mpsc::Receiver`. The receiver ends when
+/// the PC is dropped (the handler's clone of the sender goes with it).
+pub(crate) fn state_change_receiver(
+    pc: &Arc<RTCPeerConnection>,
+) -> mpsc::UnboundedReceiver<RTCPeerConnectionState> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    pc.on_peer_connection_state_change(Box::new(move |state| {
+        let _ = tx.send(state);
+        Box::pin(async {})
+    }));
+    rx
+}
+
+/// Install an `on_open` handler that fires a one-shot `Notify` when
+/// the data channel becomes open. Uses `notify_one` so a permit is
+/// stored if `open` fires before any waiter awaits — the next
+/// `notified().await` returns immediately in that case.
+pub(crate) fn dc_open_signal(dc: &Arc<RTCDataChannel>) -> Arc<tokio::sync::Notify> {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let inner = Arc::clone(&notify);
+    dc.on_open(Box::new(move || {
+        let inner = Arc::clone(&inner);
+        Box::pin(async move {
+            inner.notify_one();
+        })
+    }));
+    notify
 }
 
 #[cfg(test)]
@@ -108,34 +133,4 @@ mod filter_tests {
         // Public unaffected.
         assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(8, 8, 8, 8)));
     }
-}
-
-/// Install an `on_peer_connection_state_change` handler that forwards
-/// every transition into an `mpsc::Receiver`. The receiver ends when
-/// the PC is dropped (the handler's clone of the sender goes with it).
-pub(crate) fn state_change_receiver(
-    pc: &Arc<RTCPeerConnection>,
-) -> mpsc::UnboundedReceiver<RTCPeerConnectionState> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    pc.on_peer_connection_state_change(Box::new(move |state| {
-        let _ = tx.send(state);
-        Box::pin(async {})
-    }));
-    rx
-}
-
-/// Install an `on_open` handler that fires a one-shot `Notify` when
-/// the data channel becomes open. Uses `notify_one` so a permit is
-/// stored if `open` fires before any waiter awaits — the next
-/// `notified().await` returns immediately in that case.
-pub(crate) fn dc_open_signal(dc: &Arc<RTCDataChannel>) -> Arc<tokio::sync::Notify> {
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let inner = Arc::clone(&notify);
-    dc.on_open(Box::new(move || {
-        let inner = Arc::clone(&inner);
-        Box::pin(async move {
-            inner.notify_one();
-        })
-    }));
-    notify
 }
