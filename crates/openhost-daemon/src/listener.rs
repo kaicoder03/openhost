@@ -26,6 +26,8 @@ use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
+use openhost_pkarr::BindingMode;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
@@ -201,14 +203,18 @@ impl PassivePeer {
     /// `RTCPeerConnection` is retained inside the `PassivePeer` so the
     /// DTLS handshake can actually complete — callers don't need to
     /// keep it alive themselves.
-    pub async fn handle_offer(&self, offer_sdp: &str) -> Result<String, ListenerError> {
+    pub async fn handle_offer(
+        &self,
+        offer_sdp: &str,
+        binding_mode: BindingMode,
+    ) -> Result<String, ListenerError> {
         // 1. Pre-validate the DTLS role asserted in the offer.
         check_setup_role_is_active(offer_sdp)?;
 
         // 2. Wrap the whole handshake in a timeout so a broken peer
         //    can't wedge the caller.
         let budget = std::time::Duration::from_secs(self.offer_timeout_secs);
-        tokio::time::timeout(budget, self.negotiate(offer_sdp))
+        tokio::time::timeout(budget, self.negotiate(offer_sdp, binding_mode))
             .await
             .map_err(|_| ListenerError::Timeout {
                 secs: self.offer_timeout_secs,
@@ -230,7 +236,11 @@ impl PassivePeer {
         }
     }
 
-    async fn negotiate(&self, offer_sdp: &str) -> Result<String, ListenerError> {
+    async fn negotiate(
+        &self,
+        offer_sdp: &str,
+        binding_mode: BindingMode,
+    ) -> Result<String, ListenerError> {
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
             ..Default::default()
@@ -248,6 +258,7 @@ impl PassivePeer {
             dtls_transport,
             Arc::clone(&self.binding_timeout_secs),
             self.forwarder.clone(),
+            binding_mode,
         );
         wire_dtls_state_observer(Arc::clone(&pc));
         wire_prune_on_terminal_state(Arc::clone(&pc), Arc::clone(&self.active));
@@ -384,6 +395,7 @@ fn wire_data_channel_handler(
     dtls_transport: Arc<RTCDtlsTransport>,
     binding_timeout_secs: Arc<AtomicU64>,
     forwarder: Option<Arc<Forwarder>>,
+    binding_mode: BindingMode,
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let label = dc.label().to_string();
@@ -392,8 +404,16 @@ fn wire_data_channel_handler(
         let binding_timeout_secs = Arc::clone(&binding_timeout_secs);
         let forwarder = forwarder.clone();
         Box::pin(async move {
-            tracing::debug!(label, "openhostd: data channel opened");
-            wire_frame_loop(dc, binder, dtls_transport, binding_timeout_secs, forwarder).await;
+            tracing::debug!(label, ?binding_mode, "openhostd: data channel opened");
+            wire_frame_loop(
+                dc,
+                binder,
+                dtls_transport,
+                binding_timeout_secs,
+                forwarder,
+                binding_mode,
+            )
+            .await;
         })
     }));
 }
@@ -446,6 +466,7 @@ async fn wire_frame_loop(
     dtls_transport: Arc<RTCDtlsTransport>,
     binding_timeout_secs: Arc<AtomicU64>,
     forwarder: Option<Arc<Forwarder>>,
+    binding_mode: BindingMode,
 ) {
     let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
@@ -552,6 +573,7 @@ async fn wire_frame_loop(
                             &request,
                             &ws_tunnel,
                             forwarder.as_deref(),
+                            binding_mode,
                         )
                         .await;
                         if let FrameOutcome::Teardown = outcome {
@@ -585,6 +607,7 @@ enum FrameOutcome {
 /// binding is `Authenticated`, the ONLY frame accepted from the peer is
 /// `AuthClient`. Anything else produces an `ERROR` frame + teardown.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_frame(
     frame: &Frame,
     dc: &Arc<RTCDataChannel>,
@@ -595,6 +618,7 @@ async fn dispatch_frame(
     request: &Arc<Mutex<RequestInProgress>>,
     ws_tunnel: &Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
     forwarder: Option<&Forwarder>,
+    binding_mode: BindingMode,
 ) -> FrameOutcome {
     // Look up binding state, then release the lock before awaiting
     // webrtc I/O (the send + close paths below both await).
@@ -653,6 +677,7 @@ async fn dispatch_frame(
                 binder,
                 dtls_transport,
                 &nonce,
+                binding_mode,
             )
             .await;
         }
@@ -824,6 +849,16 @@ enum BindingSnapshot {
 ///
 /// Any failure (bad payload, bad signature, exporter error) emits an
 /// `ERROR` frame, marks state `Failed`, and requests teardown.
+///
+/// `binding_mode` picks where the 32-byte channel-binding secret
+/// comes from (see `spec/04-security.md §4.1`):
+///
+/// - [`BindingMode::Exporter`]: RFC 5705 DTLS exporter output with
+///   label [`EXPORTER_LABEL`] — the original CLI path.
+/// - [`BindingMode::CertFp`]: SHA-256 over the remote DTLS cert DER
+///   (via `RTCDtlsTransport::get_remote_certificate`) — mandatory
+///   for browser clients, which cannot reach the exporter today.
+#[allow(clippy::too_many_arguments)]
 async fn handle_auth_client(
     frame: &Frame,
     dc: &RTCDataChannel,
@@ -832,32 +867,24 @@ async fn handle_auth_client(
     binder: &ChannelBinder,
     dtls_transport: &RTCDtlsTransport,
     nonce: &[u8; AUTH_NONCE_LEN],
+    binding_mode: BindingMode,
 ) -> FrameOutcome {
-    let exporter = match dtls_transport
-        .export_keying_material(EXPORTER_LABEL, EXPORTER_SECRET_LEN)
-        .await
-    {
+    let binding_secret = match derive_binding_secret(dtls_transport, binding_mode).await {
         Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(?err, "openhostd: DTLS exporter failed; tearing down");
-            let _ = send_error_frame(dc, "DTLS exporter failed").await;
+        Err(reason) => {
+            tracing::warn!(
+                ?binding_mode,
+                reason,
+                "openhostd: binding-secret derivation failed; tearing down"
+            );
+            let _ = send_error_frame(dc, reason).await;
             *binding.lock().await = BindingState::Failed;
             binding_done.notify_waiters();
             return FrameOutcome::Teardown;
         }
     };
-    if exporter.len() != EXPORTER_SECRET_LEN {
-        tracing::warn!(
-            got = exporter.len(),
-            "openhostd: DTLS exporter returned wrong length; tearing down"
-        );
-        let _ = send_error_frame(dc, "DTLS exporter returned wrong length").await;
-        *binding.lock().await = BindingState::Failed;
-        binding_done.notify_waiters();
-        return FrameOutcome::Teardown;
-    }
 
-    let client_pk = match binder.verify_client_sig(&exporter, nonce, &frame.payload) {
+    let client_pk = match binder.verify_client_sig(&binding_secret, nonce, &frame.payload) {
         Ok(pk) => pk,
         Err(err) => {
             tracing::warn!(
@@ -877,7 +904,7 @@ async fn handle_auth_client(
         }
     };
 
-    let host_sig = match binder.sign_host(&exporter, nonce, &client_pk) {
+    let host_sig = match binder.sign_host(&binding_secret, nonce, &client_pk) {
         Ok(sig) => sig,
         Err(err) => {
             tracing::warn!(?err, "openhostd: sign_host failed; tearing down");
@@ -908,6 +935,46 @@ async fn handle_auth_client(
     *binding.lock().await = BindingState::Authenticated { client_pk };
     binding_done.notify_waiters();
     FrameOutcome::Continue
+}
+
+/// Produce the 32-byte channel-binding secret that feeds
+/// [`ChannelBinder::verify_client_sig`] + [`ChannelBinder::sign_host`],
+/// branching on the client's advertised [`BindingMode`].
+///
+/// Returns a static `&str` reason on failure, suitable for the
+/// `ERROR` frame the caller emits before teardown.
+async fn derive_binding_secret(
+    dtls_transport: &RTCDtlsTransport,
+    binding_mode: BindingMode,
+) -> Result<Vec<u8>, &'static str> {
+    match binding_mode {
+        BindingMode::Exporter => {
+            let exporter = dtls_transport
+                .export_keying_material(EXPORTER_LABEL, EXPORTER_SECRET_LEN)
+                .await
+                .map_err(|_| "DTLS exporter failed")?;
+            if exporter.len() != EXPORTER_SECRET_LEN {
+                return Err("DTLS exporter returned wrong length");
+            }
+            Ok(exporter)
+        }
+        BindingMode::CertFp => {
+            // `get_remote_certificate` returns the DER bytes cached by
+            // the fork's DTLS transport after the handshake. Empty if
+            // the handshake hasn't completed — which would be a
+            // protocol bug since AUTH_CLIENT is sent post-`Connected`.
+            let der = dtls_transport.get_remote_certificate().await;
+            if der.is_empty() {
+                return Err("remote DTLS certificate not available");
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(&der);
+            // Exactly EXPORTER_SECRET_LEN (32) bytes — matches the
+            // HKDF-SHA256 IKM length the binder already uses in the
+            // exporter path, so downstream code stays identical.
+            Ok(hasher.finalize().to_vec())
+        }
+    }
 }
 
 /// Emit a forwarder response as `RESPONSE_HEAD` + `RESPONSE_BODY*` +

@@ -198,6 +198,10 @@ pub fn test_config_noforward(dir: &tempfile::TempDir) -> openhost_daemon::Config
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),
             rotate_secs: 3600,
+            allowed_binding_modes: vec![
+                openhost_daemon::config::BindingModeConfig::Exporter,
+                openhost_daemon::config::BindingModeConfig::CertFp,
+            ],
         },
         forward: None,
         log: LogConfig::default(),
@@ -281,7 +285,10 @@ pub async fn establish_connection_opts(
     let _ = gather.recv().await;
     let offer_sdp = client_pc.local_description().await.unwrap().sdp;
 
-    let answer_sdp = app.handle_offer(&offer_sdp).await.expect("daemon answers");
+    let answer_sdp = app
+        .handle_offer(&offer_sdp, openhost_pkarr::BindingMode::Exporter)
+        .await
+        .expect("daemon answers");
     let answer = RTCSessionDescription::answer(answer_sdp).expect("parse answer");
     client_pc
         .set_remote_description(answer)

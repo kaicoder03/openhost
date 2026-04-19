@@ -61,6 +61,10 @@ fn build_config(
         dtls: DtlsConfig {
             cert_path: tmp.path().join("dtls.pem"),
             rotate_secs: 3600,
+            allowed_binding_modes: vec![
+                openhost_daemon::config::BindingModeConfig::Exporter,
+                openhost_daemon::config::BindingModeConfig::CertFp,
+            ],
         },
         forward: None,
         log: LogConfig::default(),

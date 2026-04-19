@@ -94,6 +94,10 @@ fn daemon_config(tmp: &TempDir, watched: Vec<String>, upstream_port: Option<u16>
         dtls: DtlsConfig {
             cert_path: tmp.path().join("dtls.pem"),
             rotate_secs: 3600,
+            allowed_binding_modes: vec![
+                openhost_daemon::config::BindingModeConfig::Exporter,
+                openhost_daemon::config::BindingModeConfig::CertFp,
+            ],
         },
         forward: upstream_port.map(|p| ForwardConfig {
             target: Some(format!("http://127.0.0.1:{p}")),

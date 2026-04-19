@@ -47,6 +47,10 @@ fn test_config(dir: &TempDir) -> Config {
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),
             rotate_secs: 3600,
+            allowed_binding_modes: vec![
+                openhost_daemon::config::BindingModeConfig::Exporter,
+                openhost_daemon::config::BindingModeConfig::CertFp,
+            ],
         },
         forward: None,
         log: LogConfig::default(),
