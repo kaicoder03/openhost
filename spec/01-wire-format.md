@@ -339,7 +339,7 @@ When forwarding a request to the loopback HTTP service, the daemon **MUST**:
 - Set the `Host` header to the value configured for the target service.
 - Reject requests whose framing violates the ABNF above (respond with a 0xF0 ERROR frame and tear down the channel).
 
-### 4.2 WebSocket tunnel (policy layer)
+### 4.2 WebSocket tunnel
 
 Daemons **MAY** be configured to tunnel RFC 6455 WebSocket upgrades for a finite set of upstream paths. The policy surface is the `[forward.websockets]` TOML section:
 
@@ -359,7 +359,22 @@ Conformance requirements for the daemon:
 - If a request's path (stripped of its query string) is not on `allowed_paths`, the request **MUST** be rejected exactly as above.
 - The wildcard `"*"` matches every path; operators **SHOULD** enumerate paths explicitly in production.
 
-The **tunnel implementation itself** — the bidirectional byte proxy between the openhost data channel and the upstream TCP socket after a successful 101 response — is the next line item in [`ROADMAP.md`](../ROADMAP.md) post-v0.3. Daemon versions that implement the policy layer but not the tunnel **MUST** distinguish the two cases in diagnostics: a request with a correctly-configured allowlist entry that would have been tunneled surfaces as a "pending" error, so operators can stop checking their config and wait for the tunnel-capable release. The `0x20 WS_UPGRADE` and `0x21 WS_FRAME` frame types above are reserved for the tunnel implementation and **MUST NOT** appear on the wire from policy-only daemons.
+#### Tunnel protocol (PR #26)
+
+When an allow-listed `Upgrade: websocket` request arrives, the daemon forwards it (preserving `Upgrade`, `Connection`, and every `Sec-WebSocket-*` header) to the upstream and awaits the response:
+
+- **Upstream returns `101 Switching Protocols`.** The daemon emits the 101 head + headers as a `RESPONSE_HEAD` frame so the openhost client can verify `Sec-WebSocket-Accept` using the same RFC 6455 rules it would against any other WS server. The daemon then transitions the data channel into **WebSocket mode**: every inbound `0x21 WS_FRAME` on the DC has its payload copied verbatim to the upstream TCP socket, and every read from the upstream is wrapped in `WS_FRAME` and emitted on the DC. Either side closing terminates both halves.
+- **Upstream returns anything else.** The daemon treats it as a failed upgrade and surfaces an application-layer 502 through the normal response path.
+
+Frame types during a WebSocket tunnel:
+
+- `0x21 WS_FRAME` — the only per-direction frame type accepted once the DC is in WebSocket mode. Payload is passthrough bytes; the RFC 6455 framing is opaque to the tunnel.
+- `0x30/0x31/0x32 AUTH_*` — already completed before the upgrade; re-arrival is a protocol violation.
+- `0xFE/0xFF PING/PONG` — remain valid for keepalive.
+- `0xF0 ERROR` — remains valid for teardown.
+- Any `REQUEST_*` / `RESPONSE_*` / `0x20 WS_UPGRADE` after a successful 101 is a protocol violation and **MUST** trigger teardown.
+
+Note that `0x20 WS_UPGRADE` is reserved for future use (explicit client-initiated upgrade semantics); in the current implementation the upgrade handshake rides the existing `REQUEST_HEAD` frame.
 
 ## 5. Error handling
 

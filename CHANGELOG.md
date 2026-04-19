@@ -8,6 +8,20 @@ once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added (PR #26, WebSocket bidirectional tunnel)
+
+- **Full daemon-side WebSocket tunnel.** PR #24's policy layer (`[forward.websockets] allowed_paths`) is now backed by a real implementation: an allow-listed `Upgrade: websocket` request is forwarded upstream with all its WS headers preserved; on a 101 the daemon takes ownership of the upgraded TCP socket via `hyper::upgrade::on(response)` and spawns two bidirectional byte-copy tasks that shuttle payloads between the openhost data channel (wrapped in `0x21 WS_FRAME` frames) and the upstream socket.
+- `Forwarder::forward` now returns `Result<ForwardOutcome>` where `ForwardOutcome::Response` is the existing HTTP path and `ForwardOutcome::WebSocket(WebSocketUpgrade)` carries the 101 head + `hyper::upgrade::Upgraded` handle.
+- `sanitize_websocket_request_headers` — new sibling of `sanitize_request_headers` that preserves `Upgrade`, `Connection`, and every `Sec-WebSocket-*` header while still stripping other hop-by-hop and provenance headers.
+- `encode_websocket_response_head` — re-encodes the upstream's 101 head into the bytes the listener emits as `RESPONSE_HEAD`, keeping `Sec-WebSocket-Accept` intact so the client can validate the RFC 6455 handshake.
+- **Listener WebSocket state**: per-DC `ws_tunnel: Arc<Mutex<Option<UnboundedSender<Bytes>>>>` is populated on a successful 101 and lets inbound `WS_FRAME` frames relay their payloads to the upstream writer task. `WS_FRAME` before a successful upgrade, or `REQUEST_*` after one, is a protocol violation (`ERROR` + teardown).
+- `ForwardError::WebSocketPending` removed (was unreachable post-PR-26; the tunnel either completes or returns `WebSocketUnsupported`).
+- Spec §4.2 updated with the tunnel protocol: which frame types are valid during a WebSocket session, close semantics, and the reservation note on `0x20 WS_UPGRADE`.
+
+### Known limitation
+
+A tokio-tungstenite-backed integration test that drives a full echo round-trip through the tunnel is a follow-up PR. The daemon-side code is exercised indirectly via the existing listener tests (DTLS handshake + channel-binding + frame codec all run in this file's path) and by the unit-level tests in `forward.rs` covering header sanitisation and `is_websocket_upgrade` classification. The full wire-level echo test adds `tokio-tungstenite = "0.23"` as a dev-dep and needs ~150 LOC of fixture; deliberately split out to keep this PR shippable in one cycle.
+
 ### Changed (PR #25, partial close of residual BEP44 answer-size gap)
 
 - **`MAX_FRAGMENT_PAYLOAD_BYTES` bumped 180 → 500** and answer-fragment TXT records now serialise across multiple DNS character-strings per RFC 1035 §3.3.14 when the base64url value exceeds 255 bytes. Pre-PR-25 answers ≤ ~180 bytes seal-size needed 2-3 fragments with per-RR overhead tax; post-PR-25 answers ≤ ~490 bytes seal-size need a **single** fragment. Wire-compatible in both directions because `simple-dns`'s TXT decoder already concatenates every character-string in an RR's rdata before handing the string back.
