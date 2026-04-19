@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::{APIBuilder, API};
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -35,8 +36,42 @@ pub(crate) fn install_crypto_provider_once() {
 /// accepts.
 pub(crate) fn build_client_api() -> Arc<API> {
     install_crypto_provider_once();
-    let engine = SettingEngine::default();
+    let mut engine = SettingEngine::default();
+    // IP filter applied to every ICE candidate webrtc-rs gathers. It
+    // rejects all IPv6 and the two Docker Desktop macOS virtual-
+    // bridge subnets. IPv6 is dropped because multi-family candidate
+    // sets push the sealed offer past BEP44's 1000-byte `v` cap on
+    // dual-stack hosts; IPv4 with STUN srflx reaches the same peers
+    // in practice. That covers both link-local (`fe80::/10`,
+    // unbind-able without a scope id) and public IPv6 host
+    // candidates. Revisit when the offer encoder gains more
+    // fragmentation headroom. Docker Desktop's macOS bridges
+    // (`bridge100` at `192.168.64.0/24`, `bridge101` at
+    // `192.168.65.0/24` on Docker Desktop 4.30+) are Mac-local
+    // interfaces unreachable from a remote peer; gathering them
+    // produces phantom candidates that ICE burns connectivity-check
+    // time on. The filter targets those specific subnets rather than
+    // carpet-bombing RFC 1918 so a real LAN peer legitimately on
+    // `192.168.64.x` still gets its host candidates kept.
+    engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(v4) => !is_docker_desktop_bridge_v4(&v4),
+        std::net::IpAddr::V6(_) => false,
+    }));
+    // Disable mDNS gathering (`<uuid>.local` candidates). The raw IP
+    // variant (`MulticastDnsMode::Disabled`) uses real IP addresses
+    // in candidates, which trades a privacy cost (the peer learns
+    // your IP — which it was going to need anyway to connect) for a
+    // ~70 byte savings per candidate. Remote-side mDNS candidates
+    // would fail to resolve cross-host anyway.
+    engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
     Arc::new(APIBuilder::new().with_setting_engine(engine).build())
+}
+
+/// Extracted for unit-test coverage. `true` if `ip` falls inside
+/// either of Docker Desktop's macOS virtual-bridge subnets.
+fn is_docker_desktop_bridge_v4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 192 && o[1] == 168 && (o[2] == 64 || o[2] == 65)
 }
 
 /// Install an `on_peer_connection_state_change` handler that forwards
@@ -67,4 +102,35 @@ pub(crate) fn dc_open_signal(dc: &Arc<RTCDataChannel>) -> Arc<tokio::sync::Notif
         })
     }));
     notify
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::is_docker_desktop_bridge_v4;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn docker_desktop_ranges_excluded() {
+        assert!(is_docker_desktop_bridge_v4(&Ipv4Addr::new(192, 168, 64, 1)));
+        assert!(is_docker_desktop_bridge_v4(&Ipv4Addr::new(
+            192, 168, 64, 255
+        )));
+        assert!(is_docker_desktop_bridge_v4(&Ipv4Addr::new(192, 168, 65, 5)));
+    }
+
+    #[test]
+    fn real_lan_ranges_preserved() {
+        // A home router on 192.168.1.x should NOT be excluded.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(
+            192, 168, 1, 154
+        )));
+        // 192.168.66.x is not a Docker Desktop default — keep.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(
+            192, 168, 66, 7
+        )));
+        // 10/8 private unaffected.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(10, 0, 0, 1)));
+        // Public unaffected.
+        assert!(!is_docker_desktop_bridge_v4(&Ipv4Addr::new(8, 8, 8, 8)));
+    }
 }

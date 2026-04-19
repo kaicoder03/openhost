@@ -89,6 +89,103 @@ fn pc_key(pc: &Arc<RTCPeerConnection>) -> PcKey {
     Arc::as_ptr(pc) as PcKey
 }
 
+/// Bundled STUN server used to discover the daemon's server-
+/// reflexive (srflx) ICE candidate. Without at least one STUN server
+/// in `RTCConfiguration.ice_servers`, webrtc-rs produces only
+/// `host`-type candidates — i.e. the local LAN / VPC address — which
+/// is useless for dials from outside the local network.
+///
+/// Exactly one STUN server is configured: each binding response from
+/// a different STUN host produces its own `srflx` candidate line, and
+/// the sealed answer record's BEP44 1000-byte `v` cap doesn't have
+/// headroom for duplicates. Cloudflare's STUN is preferred over
+/// Google for privacy. A failover list (with eviction under cap
+/// pressure) is tracked for a later PR.
+fn default_stun_servers() -> Vec<webrtc::ice_transport::ice_server::RTCIceServer> {
+    vec![webrtc::ice_transport::ice_server::RTCIceServer {
+        urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
+        ..Default::default()
+    }]
+}
+
+/// Strip the component-2 (RTCP) `a=candidate:` lines from an SDP.
+/// SCTP data channels use `a=rtcp-mux` so component 2 is never sent;
+/// keeping it only bloats the sealed answer against BEP44's
+/// 1000-byte `v` cap.
+///
+/// Parses conservatively: only drops a line when we can confirm it
+/// starts with `a=candidate:` AND the component field (position 1)
+/// is exactly `"2"`. A malformed candidate line with fewer tokens
+/// than expected is kept verbatim so a webrtc-rs format change
+/// can't silently eat candidates.
+///
+/// Terminates the output with CRLF (SDP convention) even if the
+/// input didn't — `str::lines()` strips terminators on the way in.
+fn trim_rtcp_component_candidates(sdp: &str) -> String {
+    let mut out = String::with_capacity(sdp.len());
+    for line in sdp.lines() {
+        let drop_line = line
+            .strip_prefix("a=candidate:")
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            == Some("2");
+        if !drop_line {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod sdp_trim_tests {
+    use super::trim_rtcp_component_candidates;
+
+    const SAMPLE: &str = "v=0\r\n\
+                          o=- 0 0 IN IP4 0.0.0.0\r\n\
+                          a=candidate:111 1 udp 2130706431 10.0.0.5 1000 typ host\r\n\
+                          a=candidate:111 2 udp 2130706431 10.0.0.5 1000 typ host\r\n\
+                          a=candidate:222 1 udp 1694498815 1.2.3.4 2000 typ srflx raddr 0.0.0.0 rport 2000\r\n\
+                          a=candidate:222 2 udp 1694498815 1.2.3.4 2000 typ srflx raddr 0.0.0.0 rport 2000\r\n\
+                          a=end-of-candidates\r\n";
+
+    #[test]
+    fn drops_component_2_candidates_only() {
+        let out = trim_rtcp_component_candidates(SAMPLE);
+        let cand_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("a=candidate:"))
+            .collect();
+        assert_eq!(cand_lines.len(), 2, "should keep only component-1 lines");
+        for line in &cand_lines {
+            assert!(line.contains(" 1 udp "), "line missing component 1: {line}");
+        }
+        assert!(
+            out.contains("a=end-of-candidates"),
+            "non-candidate lines preserved"
+        );
+        assert!(out.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn leaves_malformed_candidate_lines_alone() {
+        // Fewer tokens than expected — the filter keeps them so a
+        // webrtc-rs format drift can't silently eat candidates.
+        let odd = "a=candidate:notenoughtoken\r\n";
+        assert_eq!(
+            trim_rtcp_component_candidates(odd),
+            "a=candidate:notenoughtoken\r\n"
+        );
+    }
+
+    #[test]
+    fn no_candidates_is_pass_through() {
+        let simple = "v=0\r\ns=-\r\n";
+        let out = trim_rtcp_component_candidates(simple);
+        assert!(out.contains("v=0"));
+        assert!(out.contains("s=-"));
+    }
+}
+
 /// The daemon's passive WebRTC peer.
 ///
 /// Holds a single `webrtc::api::API` so every inbound offer shares one
@@ -148,6 +245,27 @@ impl PassivePeer {
         // §3.1 says the daemon MUST be passive.
         let mut engine = SettingEngine::default();
         engine.set_answering_dtls_role(DTLSRole::Server)?;
+        // Filter ICE candidate gathering:
+        //   - interface name NOT in {docker0, docker*, br-*, veth*, tap*}.
+        //     These are local bridges with per-host-only routability;
+        //     gathering them crowds out the real LAN interface and
+        //     produces answers that no remote peer can connect to.
+        //   - IP NOT IPv6 link-local (fe80::/10) — scope-required,
+        //     can't be bound raw, and adds ~60-100 bytes of SDP each.
+        engine.set_interface_filter(Box::new(|iface: &str| {
+            !(iface.starts_with("docker")
+                || iface.starts_with("br-")
+                || iface.starts_with("veth")
+                || iface.starts_with("tap"))
+        }));
+        // IPv4-only on the answer side too — mirror client filter
+        // (webrtc_helpers.rs). Multi-family candidate sets blow out
+        // the BEP44 1000-byte `v` cap on the fragmented answer record
+        // and get silently evicted. Revisit when fragmentation has
+        // more headroom (e.g. offer/answer move off the main packet).
+        engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| {
+            matches!(ip, std::net::IpAddr::V4(_))
+        }));
 
         let api = APIBuilder::new().with_setting_engine(engine).build();
 
@@ -243,6 +361,7 @@ impl PassivePeer {
     ) -> Result<String, ListenerError> {
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
+            ice_servers: default_stun_servers(),
             ..Default::default()
         };
         let pc = Arc::new(self.api.new_peer_connection(config).await?);
@@ -288,13 +407,21 @@ impl PassivePeer {
                 "local description missing after set_local_description",
             ))?;
 
+        // Drop component-2 (RTCP) candidate lines — SCTP data
+        // channels use `a=rtcp-mux` so component 2 is never sent and
+        // the line just bloats the sealed answer record against BEP44's
+        // 1000-byte `v` cap. This halves the per-candidate overhead
+        // (a 5-candidate answer drops from 10 lines to 5) without
+        // breaking any ICE topology.
+        let trimmed_sdp = trim_rtcp_component_candidates(&local_desc.sdp);
+
         // Keep the PC alive so the DTLS handshake can complete after we
         // return the answer SDP. The prune hook wired above will remove
         // this entry on Closed / Failed / Disconnected.
         let key = pc_key(&pc);
         self.active.lock().await.insert(key, pc);
 
-        Ok(local_desc.sdp)
+        Ok(trimmed_sdp)
     }
 }
 
