@@ -26,6 +26,7 @@ use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
+use zeroize::Zeroizing;
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1095,7 +1096,7 @@ async fn handle_auth_client(
 ) -> FrameOutcome {
     let binding_secret =
         match derive_binding_secret(dtls_transport, binding_mode, local_dtls_fp).await {
-            Ok(bytes) => bytes,
+            Ok(secret) => secret,
             Err(reason) => {
                 tracing::warn!(
                     ?binding_mode,
@@ -1172,7 +1173,7 @@ async fn derive_binding_secret(
     dtls_transport: &RTCDtlsTransport,
     binding_mode: BindingMode,
     local_dtls_fp: &[u8; 32],
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     match binding_mode {
         BindingMode::Exporter => {
             let exporter = dtls_transport
@@ -1182,7 +1183,7 @@ async fn derive_binding_secret(
             if exporter.len() != EXPORTER_SECRET_LEN {
                 return Err("DTLS exporter returned wrong length");
             }
-            Ok(exporter)
+            Ok(Zeroizing::new(exporter))
         }
         BindingMode::CertFp => {
             // Spec/04-security.md §4.1 says both sides hash *the host's*
@@ -1196,7 +1197,7 @@ async fn derive_binding_secret(
             // latent since PR #28.3 because the pre-compact-offer
             // dial path could not reach the binding step from a real
             // browser.
-            Ok(local_dtls_fp.to_vec())
+            Ok(Zeroizing::new(local_dtls_fp.to_vec()))
         }
     }
 }
