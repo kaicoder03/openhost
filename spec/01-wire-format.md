@@ -423,15 +423,26 @@ that is an implementation concern rather than a wire-format one.
 ## 4. HTTP-over-DataChannel framing (ABNF)
 
 Frames on an openhost data channel are binary, length-prefixed, and typed.
+Two on-wire shapes are recognised. **Post-PR-#40 encoders MUST emit
+v2.** Decoders MUST accept both; the leading byte unambiguously
+selects the shape (`0x00` = v2, any valid `FrameType` = v1 legacy).
 
 ```text
 ; ABNF per RFC 5234, with extensions from RFC 7405.
-; `uint8`, `uint32` denote network-byte-order unsigned integers.
 
-frame          = type length payload
+; --- Legacy v1 shape (decode-only post-PR-#40) ---
+frame_v1       = type length_le payload
 type           = uint8
-length         = uint32                 ; number of octets in payload; 0 <= length <= 2^24-1
+length_le      = 4 OCTET                ; u32 little-endian
+                                         ; 0 <= length <= 2^24-1
 payload        = *OCTET                 ; exactly `length` octets
+
+; --- v2 shape (emit + decode) ---
+frame_v2       = version type request_id length_be payload
+version        = %x00                   ; fixed discriminator
+request_id     = 4 OCTET                ; u32 big-endian
+length_be      = 4 OCTET                ; u32 big-endian
+                                         ; 0 <= length <= 2^24-1
 
 ; Frame types carried within an HTTP-over-DataChannel session:
 ;
@@ -467,7 +478,9 @@ payload        = *OCTET                 ; exactly `length` octets
 ; and connection teardown.
 ```
 
-Each HTTP transaction **SHOULD** use a dedicated data channel (or a multiplexed stream on a shared data channel where the underlying implementation exposes SCTP streams). Framing is otherwise oblivious to multiplexing: a channel carries one transaction from `REQUEST_HEAD` through `RESPONSE_END`.
+**Multiplexing (v2).** The `request_id` field demultiplexes multiple concurrent HTTP transactions over a single data channel. REQUEST_* / RESPONSE_* / WS_FRAME frames carry the id of their owning transaction; session-scoped frames (AUTH_NONCE / AUTH_CLIENT / AUTH_HOST, PING / PONG, connection-level ERROR) carry `request_id = 0`. Peers MAY choose to still use one data channel per transaction (wire-compatible — each channel just uses `request_id = 0` or a stable nonzero id throughout), or run multiple transactions concurrently over one channel. The browser extension's Service Worker proxy (`extension/src/background.js`) takes the latter approach so that loading a single HTML page — which fires many concurrent subresource fetches for CSS, JS, images, and video range requests — only dials one WebRTC session.
+
+**Legacy v1 (pre-PR-#40).** v1 frames carry no `request_id`. Decoders MUST synthesise `request_id = 0` when a v1 frame is received. Emitters MUST NOT produce v1 after PR #40 rollout; the shape is retained only so a post-rollout peer can still consume records (e.g. test fixtures) written by pre-rollout tooling.
 
 ### 4.1 Header rules at the daemon
 

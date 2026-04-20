@@ -413,15 +413,16 @@ fn encode_decode_frame_roundtrip_and_partial_buffer_is_none() {
     let req_head_type = 0x01u8;
     let payload = b"GET / HTTP/1.1\r\nHost: openhost\r\n\r\n".to_vec();
     let bytes = core::encode_frame(req_head_type, payload.clone()).expect("encode");
-    // Header = 1 + 4 bytes.
-    assert_eq!(bytes.len(), 5 + payload.len());
+    // Post-PR-#40: encoders emit v2 frames with a 10-byte header
+    // (version | type | request_id(4) | length(4)).
+    assert_eq!(bytes.len(), 10 + payload.len());
 
     let decoded = core::decode_frame(&bytes).expect("decode").expect("some");
     assert_eq!(decoded.frame_type, req_head_type);
     assert_eq!(decoded.payload, payload);
     assert_eq!(decoded.consumed, bytes.len());
 
-    // Partial header (< 5 bytes) → None.
+    // Partial header (< 10 bytes) → None.
     let partial = core::decode_frame(&bytes[..3]).expect("decode partial");
     assert!(partial.is_none());
 

@@ -90,23 +90,23 @@
   "reject": [
     {
       "name": "unknown_type_code",
-      "encoded_hex": "0000000000",
-      "expect": "MalformedFrame: unknown type code"
+      "encoded_hex": "50ffffff7f",
+      "expect": "MalformedFrame: unknown type code (v1 legacy path; 0x50 is unassigned)"
     },
     {
       "name": "oversized_length",
       "encoded_hex": "1200000001",
-      "expect": "OversizedFrame: requested length 16777216 exceeds limit 16777215"
+      "expect": "OversizedFrame: requested length 16777216 exceeds limit 16777215 (v1 legacy path)"
     },
     {
       "name": "ping_with_body_forbidden",
       "encoded_hex": "fe03000000000000",
-      "expect": "MalformedFrame: frame type forbids payload but length is non-zero"
+      "expect": "MalformedFrame: frame type forbids payload but length is non-zero (v1 legacy path)"
     },
     {
       "name": "request_end_with_body_forbidden",
       "encoded_hex": "0301000000ff",
-      "expect": "MalformedFrame: frame type forbids payload but length is non-zero"
+      "expect": "MalformedFrame: frame type forbids payload but length is non-zero (v1 legacy path)"
     }
   ],
   "partial": [

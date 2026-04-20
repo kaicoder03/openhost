@@ -1,22 +1,19 @@
-// `oh://` URL handler (PR #28.3 Phase 5 decision: webNavigation).
+// `oh://` URL handler.
 //
-// Chrome MV3 has no native custom-scheme registration; the survey in
-// `~/.claude/plans/tender-popping-kahn.md` §6 evaluated three candidates:
+// Chrome MV3 has no native custom-scheme registration, so `oh://` URLs
+// in the address bar never reach a DNS resolver. We intercept them at
+// `webNavigation.onBeforeNavigate` (fires before any resolution
+// attempt) and redirect the tab into our Service Worker's claimed
+// scope at `chrome-extension://<ext>/oh/<daemon-pk>/<path>`.
 //
-//   (a) `webNavigation.onBeforeNavigate` + programmatic redirect to
-//       `chrome-extension://.../viewer.html?oh=...` — **chosen**.
-//   (b) `declarativeNetRequest` rewrite on `https://openhost.invalid/...`
-//       — requires users to type a non-`oh://` URL; UX regression.
-//   (c) `registerProtocolHandler("oh", ...)` — Chromium's allowlist
-//       rejects non-stdlib schemes; not shippable.
-//
-// `webNavigation.onBeforeNavigate` fires pre-DNS-resolution so we can
-// cancel the URL-bar navigation and replace it with our extension tab.
-// Redirecting at this stage avoids the "can't resolve oh://" error
-// the omnibox would otherwise show, and costs only the
-// `webNavigation` permission (no broad host access).
+// Post-PR-#40 the SW proxy (see `background.js`) intercepts every
+// fetch under `/oh/*` and routes it through the openhost WebRTC
+// session — the rendered page loads natively, subresources included.
+// The legacy `viewer.html?oh=` shim is kept as a diagnostic fallback
+// when the SW isn't active (e.g. first-install before the SW has
+// claimed this origin).
 
-const VIEWER_URL = chrome.runtime.getURL("viewer.html");
+const OH_URL_RE = /^oh:\/\/([a-z0-9]{52})(\/.*)?$/i;
 
 export function installOhNavigationHandler() {
   if (!chrome.webNavigation) {
@@ -26,7 +23,17 @@ export function installOhNavigationHandler() {
   chrome.webNavigation.onBeforeNavigate.addListener(
     (details) => {
       if (!details.url.startsWith("oh://")) return;
-      const target = `${VIEWER_URL}?oh=${encodeURIComponent(details.url)}`;
+      const match = OH_URL_RE.exec(details.url);
+      if (!match) {
+        console.warn("openhost: malformed oh:// URL, ignoring:", details.url);
+        return;
+      }
+      const daemonPkZ = match[1].toLowerCase();
+      const rest = match[2] || "/";
+      // Redirect into the SW-claimed scope. The SW intercepts this
+      // fetch (and every subsequent subresource fetch the rendered
+      // page issues) and proxies through the openhost session.
+      const target = chrome.runtime.getURL(`oh/${daemonPkZ}${rest}`);
       chrome.tabs.update(details.tabId, { url: target });
     },
     { url: [{ schemes: ["oh"] }] },

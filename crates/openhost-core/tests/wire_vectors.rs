@@ -27,6 +27,7 @@ struct RoundtripVector {
     #[serde(default)]
     encoded_hex: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     encoded_header_hex: Option<String>,
     #[serde(default)]
     encoded_hex_canonical: Option<String>,
@@ -86,6 +87,11 @@ fn payload_bytes(v: &RoundtripVector) -> Vec<u8> {
 
 #[test]
 fn encode_roundtrip_vectors() {
+    // Post-PR-#40: encoders always emit v2 (10-byte header, request_id
+    // field). The v1 `encoded_hex` values in `wire.json` are retained
+    // for legacy-decode verification (see `legacy_v1_fixture_still_decodes`
+    // below); the roundtrip contract here is just "encode → decode
+    // recovers the original frame", independent of on-wire version.
     for v in load().encode_roundtrip {
         let ty = frame_type_from_name(&v.frame_type);
         let payload = payload_bytes(&v);
@@ -94,31 +100,36 @@ fn encode_roundtrip_vectors() {
         });
         let encoded = frame.encode_to_vec();
 
-        // Verify against canonical bytes where supplied.
-        let expected_full = v.encoded_hex_canonical.or(v.encoded_hex);
-        if let Some(exp) = expected_full {
-            assert_eq!(
-                hex::encode(&encoded),
-                exp,
-                "{}: encoded_hex mismatch",
-                v.name,
-            );
-        }
-
-        // Always verify the header bytes against encoded_header_hex when provided.
-        if let Some(header_hex) = &v.encoded_header_hex {
-            assert_eq!(
-                hex::encode(&encoded[..5]),
-                *header_hex,
-                "{}: encoded header mismatch",
-                v.name,
-            );
-        }
-
-        // Decode roundtrip must recover the original frame.
         let (decoded, consumed) = Frame::try_decode(&encoded).unwrap().unwrap();
         assert_eq!(decoded, frame, "{}: decoded frame mismatch", v.name);
         assert_eq!(consumed, encoded.len(), "{}: consumed mismatch", v.name);
+    }
+}
+
+/// The legacy v1 `encoded_hex` values in `wire.json` MUST still decode
+/// successfully — this proves the v1→v2 upgrade is wire-backward-
+/// compatible on the decode side.
+#[test]
+fn legacy_v1_fixture_still_decodes() {
+    for v in load().encode_roundtrip {
+        let Some(v1_hex) = v.encoded_hex_canonical.clone().or(v.encoded_hex.clone()) else {
+            continue; // some fixtures only ship encoded_header_hex
+        };
+        let bytes = hex::decode(&v1_hex).unwrap_or_else(|e| panic!("{}: bad hex: {e}", v.name));
+        let (decoded, _) = Frame::try_decode(&bytes)
+            .unwrap_or_else(|e| panic!("{}: v1 legacy decode errored: {e}", v.name))
+            .unwrap_or_else(|| panic!("{}: v1 legacy decode returned None", v.name));
+        let expected_ty = frame_type_from_name(&v.frame_type);
+        assert_eq!(
+            decoded.frame_type, expected_ty,
+            "{}: frame_type drift",
+            v.name
+        );
+        assert_eq!(
+            decoded.request_id, 0,
+            "{}: v1 decode must synthesise request_id=0",
+            v.name,
+        );
     }
 }
 
