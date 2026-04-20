@@ -73,6 +73,7 @@ impl App {
             publish::start(&cfg.pkarr, identity.clone(), state.clone()).await?;
         let poller = build_offer_poller(
             &cfg,
+            &pair_db_path,
             identity.clone(),
             Arc::clone(&listener),
             state.clone(),
@@ -142,6 +143,7 @@ impl App {
             publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
         let poller = build_offer_poller(
             &cfg,
+            &pair_db_path,
             identity.clone(),
             Arc::clone(&listener),
             state.clone(),
@@ -394,6 +396,7 @@ async fn build_listener(
 /// needed.
 fn build_offer_poller(
     cfg: &Config,
+    pair_db_path: &Path,
     identity: Arc<SigningKey>,
     listener: Arc<PassivePeer>,
     state: Arc<SharedState>,
@@ -408,9 +411,15 @@ fn build_offer_poller(
         .iter()
         .filter_map(|s| openhost_core::identity::PublicKey::from_zbase32(s).ok())
         .collect();
-    if watched.is_empty() {
-        return None;
-    }
+    // PR #39 — auto-watch paired clients: the poller also consumes the
+    // pair DB on every tick, so a daemon with empty `watched_clients`
+    // but a pair-DB path still spawns. `openhostd pair add <pk>` then
+    // becomes sufficient to make a client dialable with no config edit.
+    // The pair-DB path is always produced by `resolve_pair_db_path`
+    // (falls back to the platform-default location), so the poller
+    // effectively always spawns from this build path. The `spawn`
+    // assert inside `OfferPoller` catches the truly-degenerate case.
+    let pair_db_path_owned = pair_db_path.to_path_buf();
     let trigger: Arc<dyn Fn() + Send + Sync> = {
         let handle = publisher.trigger_handle();
         Arc::new(move || handle())
@@ -435,6 +444,7 @@ fn build_offer_poller(
                 .copied()
                 .map(openhost_pkarr::BindingMode::from)
                 .collect(),
+            pair_db_path: Some(pair_db_path_owned),
         },
     ))
 }

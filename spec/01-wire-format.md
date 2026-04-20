@@ -282,6 +282,21 @@ invalidating existing implementations.
 The inner `client_pk` **MUST** match the outer BEP44 signer pubkey.
 The daemon verifies this on decode and rejects a mismatch.
 
+**Offer-poll watch list (operator-facing).** A daemon knows WHICH
+clients to poll via two sources, merged as a union at every poll
+tick:
+
+1. Explicit config: `pkarr.offer_poll.watched_clients` — zbase32
+   pubkey strings.
+2. The pair DB (`allow.toml`, managed by `openhostd pair add`/`remove`
+   and PR #17's pair-watcher).
+
+Daemons MAY consume either source alone, or both. A client added via
+`openhostd pair add <pk>` becomes reachable on the next poll tick
+(no config edit, no restart). Pair-DB read errors (missing file,
+parse failure, permission denied) degrade gracefully — that tick
+contributes no auto-watched pubkeys, the config list still applies.
+
 **Answer (daemon → client).** The daemon publishes answer records as
 **extra** TXT entries inside its existing `_openhost` `SignedPacket`.
 Each answer is split into one or more **fragments**, each emitted as
