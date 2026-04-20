@@ -24,6 +24,7 @@
 //!   handle.
 
 use crate::listener::PassivePeer;
+use crate::pairing;
 use crate::publish::SharedState;
 use crate::rate_limit::TokenBucket;
 use openhost_core::identity::{PublicKey, SigningKey};
@@ -32,6 +33,7 @@ use openhost_pkarr::{
 };
 use rand::rngs::OsRng;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -59,6 +61,14 @@ pub struct OfferPollerConfig {
     /// dropped pre-handshake with a `warn!`. Mirrors
     /// `[dtls] allowed_binding_modes` from the config file.
     pub allowed_binding_modes: Vec<openhost_pkarr::BindingMode>,
+    /// Path to the pairing DB. When set, the poller ALSO watches every
+    /// pubkey present in the pair DB in addition to `watched_clients`.
+    /// This makes `openhostd pair add <pk>` sufficient to make a client
+    /// dialable with no config edit or restart — PR #17's pair-watcher
+    /// rewrites the file, the poller's next tick picks up the change.
+    /// Absent → behaves exactly like the pre-auto-watch version
+    /// (config list only).
+    pub pair_db_path: Option<PathBuf>,
 }
 
 impl Default for OfferPollerConfig {
@@ -74,6 +84,7 @@ impl Default for OfferPollerConfig {
                 openhost_pkarr::BindingMode::Exporter,
                 openhost_pkarr::BindingMode::CertFp,
             ],
+            pair_db_path: None,
         }
     }
 }
@@ -109,9 +120,14 @@ impl OfferPoller {
         publisher_trigger: Arc<dyn Fn() + Send + Sync>,
         cfg: OfferPollerConfig,
     ) -> Self {
+        // Spawn is valid when EITHER the config list is non-empty OR a
+        // pair-DB path is configured. Auto-watch (PR #39) means a
+        // daemon with empty `watched_clients` but a pair DB can still
+        // pick up paired clients on each tick, so the empty-config
+        // case is no longer a programmer error.
         assert!(
-            !cfg.watched_clients.is_empty(),
-            "OfferPoller::spawn requires a non-empty watched_clients list",
+            !cfg.watched_clients.is_empty() || cfg.pair_db_path.is_some(),
+            "OfferPoller::spawn requires non-empty watched_clients OR a pair_db_path",
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -203,6 +219,42 @@ async fn run_poll_loop(
     }
 }
 
+/// Effective per-tick watch list: the union of the explicit config
+/// `watched_clients` and the pubkeys present in the pair DB (when
+/// configured). Duplicates across the two sources collapse to one
+/// entry (by raw pubkey bytes). Pair-DB read errors (missing file,
+/// parse failure, permission denied) are logged at `debug!` and
+/// produce an empty contribution for that tick — the poller never
+/// crashes from a stale or mid-rotation pair DB.
+fn resolved_watched_clients(cfg: &OfferPollerConfig) -> Vec<PublicKey> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(cfg.watched_clients.len());
+    for pk in &cfg.watched_clients {
+        if seen.insert(pk.to_bytes()) {
+            out.push(*pk);
+        }
+    }
+    if let Some(path) = cfg.pair_db_path.as_ref() {
+        match pairing::load(path) {
+            Ok(db) => {
+                for (pk, _nickname) in db.parsed() {
+                    if seen.insert(pk.to_bytes()) {
+                        out.push(pk);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    ?err,
+                    path = %path.display(),
+                    "openhostd: pair-DB read failed; auto-watch contributes 0 entries this tick",
+                );
+            }
+        }
+    }
+    out
+}
+
 async fn poll_one_cycle(
     identity: &SigningKey,
     resolver: &dyn Resolve,
@@ -218,7 +270,8 @@ async fn poll_one_cycle(
     // Evict stale entries.
     seen.retain(|_, v| now_instant.duration_since(v.last_touched) < SEEN_TTL);
 
-    for client_pk in &cfg.watched_clients {
+    let watched = resolved_watched_clients(cfg);
+    for client_pk in &watched {
         let pk_bytes = client_pk.to_bytes();
         let pkarr_pk = match pkarr::PublicKey::try_from(&pk_bytes) {
             Ok(k) => k,
@@ -447,4 +500,93 @@ async fn process_client_packet(
 
     entry.last_ts = packet_ts_secs;
     entry.last_processed = Some(now_instant);
+}
+
+#[cfg(test)]
+mod auto_watch_tests {
+    use super::*;
+    use openhost_core::identity::SigningKey;
+    use tempfile::TempDir;
+
+    fn make_cfg_with_pair_db(
+        watched: Vec<PublicKey>,
+        pair_db_path: Option<PathBuf>,
+    ) -> OfferPollerConfig {
+        OfferPollerConfig {
+            watched_clients: watched,
+            pair_db_path,
+            ..OfferPollerConfig::default()
+        }
+    }
+
+    #[test]
+    fn resolved_watched_clients_config_only_when_no_pair_db() {
+        let pk = SigningKey::generate_os_rng().public_key();
+        let cfg = make_cfg_with_pair_db(vec![pk], None);
+        let out = resolved_watched_clients(&cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to_bytes(), pk.to_bytes());
+    }
+
+    #[test]
+    fn resolved_watched_clients_handles_missing_pair_db_file() {
+        let pk = SigningKey::generate_os_rng().public_key();
+        // Path that doesn't exist — load() returns Err, helper logs
+        // debug + returns config-only.
+        let missing = PathBuf::from("/tmp/openhost-nonexistent-pair-db-xyz.toml");
+        let cfg = make_cfg_with_pair_db(vec![pk], Some(missing));
+        let out = resolved_watched_clients(&cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to_bytes(), pk.to_bytes());
+    }
+
+    #[test]
+    fn resolved_watched_clients_merges_config_and_pair_db() {
+        let config_pk = SigningKey::generate_os_rng().public_key();
+        let pair_pk = SigningKey::generate_os_rng().public_key();
+        let tmp = TempDir::new().unwrap();
+        let pair_db = tmp.path().join("allow.toml");
+        crate::pairing::add(&pair_db, &pair_pk, None).unwrap();
+
+        let cfg = make_cfg_with_pair_db(vec![config_pk], Some(pair_db));
+        let out = resolved_watched_clients(&cfg);
+        assert_eq!(out.len(), 2);
+        let bytes: std::collections::HashSet<_> = out.iter().map(|p| p.to_bytes()).collect();
+        assert!(bytes.contains(&config_pk.to_bytes()));
+        assert!(bytes.contains(&pair_pk.to_bytes()));
+    }
+
+    #[test]
+    fn resolved_watched_clients_dedupes_overlapping_pubkeys() {
+        let pk = SigningKey::generate_os_rng().public_key();
+        let tmp = TempDir::new().unwrap();
+        let pair_db = tmp.path().join("allow.toml");
+        crate::pairing::add(&pair_db, &pk, None).unwrap();
+
+        // Same pubkey in both sources.
+        let cfg = make_cfg_with_pair_db(vec![pk], Some(pair_db));
+        let out = resolved_watched_clients(&cfg);
+        assert_eq!(
+            out.len(),
+            1,
+            "overlapping pubkey must collapse to one entry"
+        );
+        assert_eq!(out[0].to_bytes(), pk.to_bytes());
+    }
+
+    #[test]
+    fn resolved_watched_clients_pair_db_only() {
+        // No config entries — pair-DB supplies the full watch list.
+        // Exercises the "empty watched_clients, pair-DB populates"
+        // path that PR #39 is built to enable.
+        let pair_pk = SigningKey::generate_os_rng().public_key();
+        let tmp = TempDir::new().unwrap();
+        let pair_db = tmp.path().join("allow.toml");
+        crate::pairing::add(&pair_db, &pair_pk, None).unwrap();
+
+        let cfg = make_cfg_with_pair_db(vec![], Some(pair_db));
+        let out = resolved_watched_clients(&cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to_bytes(), pair_pk.to_bytes());
+    }
 }

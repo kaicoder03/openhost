@@ -360,3 +360,151 @@ async fn rate_limit_caps_burst_of_distinct_offers() -> DaemonResult<()> {
     app.shutdown().await;
     Ok(())
 }
+
+/// PR #39 — auto-watch paired clients. Config has an EMPTY
+/// `watched_clients` list; the client is added only via
+/// `pairing::add`. The daemon's offer-poller must still pick the
+/// client up on its next tick (via the pair-DB union in
+/// `resolved_watched_clients`) and process a real offer.
+#[tokio::test]
+async fn unlisted_but_paired_client_is_auto_watched() -> DaemonResult<()> {
+    let client_sk = SigningKey::generate_os_rng();
+    let client_pk = client_sk.public_key();
+
+    let tmp = TempDir::new().unwrap();
+    let pair_db = tmp.path().join("allow.toml");
+    pairing::add(&pair_db, &client_pk, Some("auto-watch".into())).unwrap();
+
+    // Crucial bit: `watched = &[]` — config list empty, pair-DB
+    // populated. Pre-PR-#39 behavior was `build_offer_poller` returns
+    // None in this case and no polling happens at all.
+    let cfg = build_config(&tmp, &[], true, 3, 5.0, 5, Some(pair_db));
+    let transport = Arc::new(CaptureTransport::default());
+    let resolver = ScriptedResolve::new();
+
+    let app = App::build_with_transport_and_resolve(
+        cfg,
+        transport.clone() as Arc<dyn openhost_pkarr::Transport>,
+        resolver.clone() as Arc<dyn openhost_pkarr::Resolve>,
+    )
+    .await
+    .expect("app builds");
+
+    let daemon_pk = app.identity().public_key();
+    let offer_sdp = real_client_offer_sdp().await;
+    let client_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp).expect("fp");
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+        &offer_sdp,
+        &client_fp,
+        openhost_pkarr::BindingMode::Exporter,
+    )
+    .expect("blob");
+    let packet = build_offer_packet(&client_sk, &daemon_pk, offer_blob, 1_700_000_000).await;
+    resolver.set_packet(&client_pk, &packet);
+
+    let expected_hash =
+        openhost_core::crypto::allowlist_hash(&app.state().salt(), &client_pk.to_bytes());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if app
+            .state()
+            .snapshot_answers()
+            .iter()
+            .any(|e| e.client_hash == expected_hash)
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("auto-watched (paired-only) client offer did not yield an answer");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    app.shutdown().await;
+    Ok(())
+}
+
+/// PR #39 — removing a pubkey from the pair DB stops polling on the
+/// next tick. Starts with the client paired, confirms an offer is
+/// processed, then removes the pair and confirms a FRESH offer
+/// (distinct ts) is NOT processed.
+#[tokio::test]
+async fn pair_remove_stops_auto_watch() -> DaemonResult<()> {
+    let client_sk = SigningKey::generate_os_rng();
+    let client_pk = client_sk.public_key();
+
+    let tmp = TempDir::new().unwrap();
+    let pair_db = tmp.path().join("allow.toml");
+    pairing::add(&pair_db, &client_pk, None).unwrap();
+
+    let cfg = build_config(&tmp, &[], true, 3, 5.0, 0, Some(pair_db.clone()));
+    let transport = Arc::new(CaptureTransport::default());
+    let resolver = ScriptedResolve::new();
+
+    let app = App::build_with_transport_and_resolve(
+        cfg,
+        transport.clone() as Arc<dyn openhost_pkarr::Transport>,
+        resolver.clone() as Arc<dyn openhost_pkarr::Resolve>,
+    )
+    .await
+    .expect("app builds");
+
+    // Step 1: paired — first offer should process.
+    let daemon_pk = app.identity().public_key();
+    let offer_sdp = real_client_offer_sdp().await;
+    let client_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&offer_sdp).expect("fp");
+    let offer_blob = openhost_pkarr::sdp_to_offer_blob(
+        &offer_sdp,
+        &client_fp,
+        openhost_pkarr::BindingMode::Exporter,
+    )
+    .expect("blob");
+    let packet_a = build_offer_packet(&client_sk, &daemon_pk, offer_blob, 1_700_000_000).await;
+    resolver.set_packet(&client_pk, &packet_a);
+
+    let expected_hash =
+        openhost_core::crypto::allowlist_hash(&app.state().salt(), &client_pk.to_bytes());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if app
+            .state()
+            .snapshot_answers()
+            .iter()
+            .any(|e| e.client_hash == expected_hash)
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("paired client's first offer did not yield an answer");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Step 2: remove pair — the poller's next tick should read the
+    // updated DB and stop polling this client.
+    pairing::remove(&pair_db, &client_pk).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Stage a FRESH offer (different ts so it's not dedupe-skipped).
+    let fresh_sdp = real_client_offer_sdp().await;
+    let fresh_fp = openhost_pkarr::extract_sha256_fingerprint_from_sdp(&fresh_sdp).expect("fp");
+    let fresh_blob = openhost_pkarr::sdp_to_offer_blob(
+        &fresh_sdp,
+        &fresh_fp,
+        openhost_pkarr::BindingMode::Exporter,
+    )
+    .expect("blob");
+    let packet_b = build_offer_packet(&client_sk, &daemon_pk, fresh_blob, 1_700_000_060).await;
+    resolver.set_packet(&client_pk, &packet_b);
+
+    let answers_before = app.state().snapshot_answers().len();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let answers_after = app.state().snapshot_answers().len();
+    assert_eq!(
+        answers_before, answers_after,
+        "removed-pair client offer must NOT yield a new answer"
+    );
+
+    app.shutdown().await;
+    Ok(())
+}
