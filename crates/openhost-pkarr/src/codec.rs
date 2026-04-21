@@ -239,13 +239,12 @@ fn parse_canonical_bytes(bytes: &[u8]) -> Result<OpenhostRecord> {
         .map_err(|_| PkarrError::MalformedCanonical("disc is not valid UTF-8"))?
         .to_string();
 
-    // v3 trailer: an optional u16 BE `turn_port`. v2 records stop at
-    // disc; v3 records carry exactly 2 more bytes. Anything in between
-    // is a malformed record.
-    let turn_port = match (version, r.is_empty()) {
+    // v3 trailer: IPv4 address (4 bytes) + UDP port (2 bytes BE). v2
+    // records stop at disc; v3 records carry exactly 6 more bytes.
+    let turn_endpoint = match (version, r.is_empty()) {
         (v, true) if v >= 3 => {
             return Err(PkarrError::MalformedCanonical(
-                "v3 record missing turn_port trailer",
+                "v3 record missing turn_endpoint trailer",
             ))
         }
         (_, true) => None,
@@ -255,16 +254,28 @@ fn parse_canonical_bytes(bytes: &[u8]) -> Result<OpenhostRecord> {
             ));
         }
         (_, false) => {
+            let ip_bytes: [u8; 4] = r
+                .take(4)?
+                .try_into()
+                .map_err(|_| PkarrError::MalformedCanonical("turn_endpoint.ip truncated"))?;
+            let ip = std::net::Ipv4Addr::from(ip_bytes);
             let port = r.u16_be()?;
             if !r.is_empty() {
                 return Err(PkarrError::MalformedCanonical(
-                    "trailing bytes after v3 turn_port",
+                    "trailing bytes after v3 turn_endpoint",
                 ));
             }
             if port == 0 {
-                return Err(PkarrError::MalformedCanonical("turn_port must be non-zero"));
+                return Err(PkarrError::MalformedCanonical(
+                    "turn_endpoint.port must be non-zero",
+                ));
             }
-            Some(port)
+            if ip.is_unspecified() || ip.is_loopback() {
+                return Err(PkarrError::MalformedCanonical(
+                    "turn_endpoint.ip must be routable",
+                ));
+            }
+            Some(openhost_core::pkarr_record::TurnEndpoint { ip, port })
         }
     };
 
@@ -275,7 +286,7 @@ fn parse_canonical_bytes(bytes: &[u8]) -> Result<OpenhostRecord> {
         roles,
         salt,
         disc,
-        turn_port,
+        turn_endpoint,
     })
 }
 
@@ -460,25 +471,31 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // v3 turn_port codec coverage (PR #42.1)
+    // v3 turn_endpoint codec coverage (PR #42.1 + PR #42.2)
     // ---------------------------------------------------------------------
 
-    fn v3_record(port: u16) -> OpenhostRecord {
+    fn v3_record(ip: [u8; 4], port: u16) -> OpenhostRecord {
+        use openhost_core::pkarr_record::TurnEndpoint;
         OpenhostRecord {
             version: 3,
-            turn_port: Some(port),
+            turn_endpoint: Some(TurnEndpoint {
+                ip: std::net::Ipv4Addr::from(ip),
+                port,
+            }),
             ..reference_record()
         }
     }
 
     #[test]
-    fn v3_round_trip_preserves_turn_port() {
+    fn v3_round_trip_preserves_turn_endpoint() {
         let sk = SigningKey::from_bytes(&RFC_SEED);
-        let record = v3_record(3478);
+        let record = v3_record([3, 238, 149, 237], 3478);
         let signed = SignedRecord::sign(record.clone(), &sk).unwrap();
         let packet = encode(&signed, &sk).unwrap();
         let decoded = decode(&packet).unwrap();
-        assert_eq!(decoded.record.turn_port, Some(3478));
+        let ep = decoded.record.turn_endpoint.expect("ep present");
+        assert_eq!(ep.ip.octets(), [3, 238, 149, 237]);
+        assert_eq!(ep.port, 3478);
         assert_eq!(decoded.record.version, 3);
     }
 
@@ -486,7 +503,7 @@ mod tests {
     fn v3_signed_record_verifies_against_pubkey() {
         let sk = SigningKey::from_bytes(&RFC_SEED);
         let pk = sk.public_key();
-        let signed = SignedRecord::sign(v3_record(3478), &sk).unwrap();
+        let signed = SignedRecord::sign(v3_record([3, 238, 149, 237], 3478), &sk).unwrap();
         let packet = encode(&signed, &sk).unwrap();
         let decoded = decode(&packet).unwrap();
         decoded.verify(&pk, decoded.record.ts).expect("v3 verifies");
@@ -500,11 +517,16 @@ mod tests {
         let v2_record = reference_record();
         let v2_signed = SignedRecord::sign(v2_record.clone(), &sk).unwrap();
         let v2_packet = encode(&v2_signed, &sk).unwrap();
-        assert_eq!(decode(&v2_packet).unwrap().record.turn_port, None);
+        assert!(decode(&v2_packet).unwrap().record.turn_endpoint.is_none());
 
-        let v3_signed = SignedRecord::sign(v3_record(51820), &sk).unwrap();
+        let v3_signed = SignedRecord::sign(v3_record([10, 0, 0, 1], 51820), &sk).unwrap();
         let v3_packet = encode(&v3_signed, &sk).unwrap();
-        assert_eq!(decode(&v3_packet).unwrap().record.turn_port, Some(51820));
+        let ep = decode(&v3_packet)
+            .unwrap()
+            .record
+            .turn_endpoint
+            .expect("v3 ep");
+        assert_eq!(ep.port, 51820);
     }
 
     /// Sanity-check: a v2 record with a maxed-out `disc` still encodes

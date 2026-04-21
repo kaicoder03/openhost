@@ -72,6 +72,7 @@ fn daemon_config(
         forward: None,
         log: LogConfig::default(),
         pairing: Default::default(),
+        turn: Default::default(),
     }
 }
 

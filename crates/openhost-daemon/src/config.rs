@@ -37,6 +37,9 @@ pub struct Config {
     /// Pairing-database configuration.
     #[serde(default)]
     pub pairing: PairingConfig,
+    /// Embedded TURN relay (PR #42.2). Disabled by default.
+    #[serde(default)]
+    pub turn: TurnConfig,
 }
 
 /// Identity keystore configuration.
@@ -153,6 +156,40 @@ impl Default for PairingConfig {
 
 fn default_pair_watch_debounce_ms() -> u64 {
     250
+}
+
+/// Embedded TURN relay configuration (PR #42.2). Opt-in: every field
+/// has a safe default, and `enabled = false` keeps the daemon's
+/// behavior byte-identical to pre-PR deployments.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TurnConfig {
+    /// Whether to bind the TURN relay and advertise it in the v3
+    /// host record.
+    pub enabled: bool,
+    /// Local UDP socket to bind. Typically `0.0.0.0:3478`; override to
+    /// pick a non-default port if 3478 is occupied or firewalled.
+    pub bind_addr: String,
+    /// Publicly-reachable IPv4 address the TURN server advertises as
+    /// the relay's external endpoint (Elastic IP, port-forwarded
+    /// router IP, etc.). Must match the IP reachable by external
+    /// clients from the internet.
+    pub public_ip: Option<std::net::Ipv4Addr>,
+    /// Port number published in the host record's `turn_endpoint`.
+    /// Defaults to the port component of `bind_addr`; override when
+    /// the daemon is port-mapped (NAT-PMP / UPnP / manual DNAT).
+    pub public_port: Option<u16>,
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "0.0.0.0:3478".to_string(),
+            public_ip: None,
+            public_port: None,
+        }
+    }
 }
 
 fn default_enforce_allowlist() -> bool {
@@ -458,6 +495,7 @@ pub fn seed_config(data_dir: &Path) -> Config {
         forward: None,
         log: LogConfig::default(),
         pairing: PairingConfig::default(),
+        turn: TurnConfig::default(),
     }
 }
 

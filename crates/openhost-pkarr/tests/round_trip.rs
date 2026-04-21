@@ -36,6 +36,16 @@ fn reference_record() -> OpenhostRecord {
     let mut salt = [0u8; 32];
     salt.copy_from_slice(&hex::decode(r["salt_hex"].as_str().unwrap()).unwrap());
 
+    let turn_endpoint = match (
+        r.get("turn_ip").and_then(|v| v.as_str()),
+        r.get("turn_port").and_then(|v| v.as_u64()),
+    ) {
+        (Some(ip), Some(port)) => Some(openhost_core::pkarr_record::TurnEndpoint {
+            ip: ip.parse().unwrap(),
+            port: port as u16,
+        }),
+        _ => None,
+    };
     OpenhostRecord {
         version: r["version"].as_u64().unwrap() as u8,
         ts: r["ts"].as_u64().unwrap(),
@@ -43,10 +53,7 @@ fn reference_record() -> OpenhostRecord {
         roles: r["roles"].as_str().unwrap().to_string(),
         salt,
         disc: r["disc"].as_str().unwrap().to_string(),
-        turn_port: r
-            .get("turn_port")
-            .and_then(|v| v.as_u64())
-            .map(|p| p as u16),
+        turn_endpoint,
     }
 }
 

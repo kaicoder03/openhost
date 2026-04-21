@@ -107,6 +107,7 @@ fn daemon_config(tmp: &TempDir, watched: Vec<String>, upstream_port: Option<u16>
         }),
         log: LogConfig::default(),
         pairing: Default::default(),
+        turn: Default::default(),
     }
 }
 
@@ -385,7 +386,7 @@ async fn publish_fake_host_record(net: &MemoryPkarrNetwork, daemon_sk: &SigningK
         roles: "server".to_string(),
         salt: [0x11; SALT_LEN],
         disc: String::new(),
-        turn_port: None,
+        turn_endpoint: None,
     };
     let signed = SignedRecord::sign(record, daemon_sk).unwrap();
     let packet = encode(&signed, daemon_sk).unwrap();

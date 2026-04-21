@@ -231,8 +231,12 @@ impl Dialer {
         let daemon_salt = signed.record.salt;
 
         // Stage 2: build the WebRTC offer (no ICE trickle — keeps SDP
-        // under the BEP44 1000-byte cap).
-        let (pc, dc, offer_sdp) = self.build_offer().await?;
+        // under the BEP44 1000-byte cap). If the resolved host record
+        // is v3 with a `turn_endpoint`, the PC picks up a relayed
+        // candidate for NAT-tolerant dials.
+        let (pc, dc, offer_sdp) = self
+            .build_offer(signed.record.turn_endpoint, &daemon_pk)
+            .await?;
 
         // RAII guard: if any stage 3-6 fails, close pc+dc before we
         // bubble the error. webrtc-rs's `RTCPeerConnection` holds UDP
@@ -329,15 +333,32 @@ impl Dialer {
     /// with zero candidates.
     pub async fn build_offer(
         &self,
+        turn_endpoint: Option<openhost_core::pkarr_record::TurnEndpoint>,
+        daemon_pk: &openhost_core::identity::PublicKey,
     ) -> Result<(Arc<RTCPeerConnection>, Arc<RTCDataChannel>, String)> {
         // STUN servers are mandatory for cross-NAT dials — without
         // them webrtc-rs gathers only `host`-type candidates and
         // can't discover the client's public address.
+        let mut ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
+            urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
+            ..Default::default()
+        }];
+        // v3 (PR #42.2): when the daemon advertises a TURN endpoint
+        // in its host record, add it here so ICE falls back to
+        // relayed candidates when direct hole-punching fails
+        // (symmetric NAT, UDP-blocked middleboxes, etc.). The TURN
+        // password is a public function of the daemon pubkey —
+        // derivable by both sides without a shared secret.
+        if let Some(ep) = turn_endpoint {
+            let password = crate::turn_creds::password_for_daemon(daemon_pk);
+            ice_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+                urls: vec![format!("turn:{}:{}", ep.ip, ep.port)],
+                username: crate::turn_creds::TURN_USERNAME.to_string(),
+                credential: password,
+            });
+        }
         let config = RTCConfiguration {
-            ice_servers: vec![webrtc::ice_transport::ice_server::RTCIceServer {
-                urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
-                ..Default::default()
-            }],
+            ice_servers,
             ..Default::default()
         };
         let pc = Arc::new(

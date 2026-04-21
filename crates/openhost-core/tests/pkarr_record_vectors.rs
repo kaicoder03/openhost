@@ -34,6 +34,8 @@ struct RecordFields {
     salt_hex: String,
     disc: String,
     #[serde(default)]
+    turn_ip: Option<String>,
+    #[serde(default)]
     turn_port: Option<u16>,
 }
 
@@ -43,6 +45,14 @@ fn decode_hex32(s: &str) -> [u8; 32] {
 }
 
 fn build_record(r: &RecordFields) -> OpenhostRecord {
+    use openhost_core::pkarr_record::TurnEndpoint;
+    let turn_endpoint = match (r.turn_ip.as_deref(), r.turn_port) {
+        (Some(ip), Some(port)) => Some(TurnEndpoint {
+            ip: ip.parse().expect("turn_ip is a valid IPv4"),
+            port,
+        }),
+        _ => None,
+    };
     OpenhostRecord {
         version: r.version,
         ts: r.ts,
@@ -50,7 +60,7 @@ fn build_record(r: &RecordFields) -> OpenhostRecord {
         roles: r.roles.clone(),
         salt: decode_hex32(&r.salt_hex),
         disc: r.disc.clone(),
-        turn_port: r.turn_port,
+        turn_endpoint,
     }
 }
 

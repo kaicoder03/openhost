@@ -175,8 +175,28 @@ export async function dialOhUrl(ohUrl, opts = {}) {
   // of a host daemon can add it to their `watched_clients` allowlist.
   console.log("openhost dialer: client_pubkey_zbase32 =", clientPkZ);
 
-  // 3. Build RTCPeerConnection + data channel.
-  const pc = new RTCPeerConnection({ iceServers: STUN });
+  // 3. Build RTCPeerConnection + data channel. When the resolved
+  // host record carries a v3 `turn_endpoint` (daemon advertises an
+  // embedded TURN relay), add it to the ICE servers list so the PC
+  // can fall back to a relayed candidate when direct hole-punching
+  // fails. The TURN password is derived from the daemon's public
+  // key — both sides compute the same value without a shared secret.
+  const iceServers = [...STUN];
+  if (hostRecord.turn_ip && hostRecord.turn_port) {
+    const { turnIceServerFor } = await import("./turn_creds.js");
+    const turnServer = await turnIceServerFor(daemonPkZ, {
+      ip: hostRecord.turn_ip,
+      port: hostRecord.turn_port,
+    });
+    if (turnServer) {
+      iceServers.push(turnServer);
+      console.log(
+        "openhost dialer: TURN relay advertised —",
+        turnServer.urls[0],
+      );
+    }
+  }
+  const pc = new RTCPeerConnection({ iceServers });
   const dc = pc.createDataChannel("openhost", { ordered: true });
   const reader = new FrameReader();
   dc.binaryType = "arraybuffer";

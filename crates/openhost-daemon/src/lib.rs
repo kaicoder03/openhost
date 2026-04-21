@@ -33,6 +33,7 @@ pub mod pairing;
 pub mod publish;
 pub mod rate_limit;
 pub mod signal;
+pub mod turn_server;
 
 pub use app::{init_tracing, App};
 pub use channel_binding::{ChannelBinder, ChannelBindingError};

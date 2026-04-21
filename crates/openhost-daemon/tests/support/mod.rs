@@ -206,6 +206,7 @@ pub fn test_config_noforward(dir: &tempfile::TempDir) -> openhost_daemon::Config
         forward: None,
         log: LogConfig::default(),
         pairing: Default::default(),
+        turn: Default::default(),
     }
 }
 

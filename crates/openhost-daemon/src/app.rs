@@ -58,6 +58,10 @@ pub struct App {
     /// the daemon keeps running and pairing changes fall back to the
     /// SIGHUP path (Unix) or a restart (Windows).
     pair_watcher: Option<crate::pair_watcher::PairWatcher>,
+    /// Embedded TURN relay (PR #42.2). `Some` only when
+    /// `[turn] enabled = true` in config. Dropped alongside the other
+    /// subsystems on shutdown.
+    turn: Option<crate::turn_server::TurnHandle>,
 }
 
 impl App {
@@ -69,6 +73,7 @@ impl App {
         let forwarder = build_forwarder(&cfg)?;
         let listener =
             build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+        let turn = maybe_spawn_turn(&cfg, &identity, &state).await?;
         let (publisher, resolver) =
             publish::start(&cfg.pkarr, identity.clone(), state.clone()).await?;
         let poller = build_offer_poller(
@@ -93,6 +98,7 @@ impl App {
             poller,
             pair_db_path,
             pair_watcher,
+            turn,
         })
     }
 
@@ -121,6 +127,7 @@ impl App {
             poller: None,
             pair_db_path,
             pair_watcher,
+            turn: None,
         })
     }
 
@@ -163,6 +170,7 @@ impl App {
             poller,
             pair_db_path,
             pair_watcher,
+            turn: None,
         })
     }
 
@@ -293,6 +301,11 @@ impl App {
         }
         if let Some(w) = self.pair_watcher.take() {
             w.shutdown();
+        }
+        if let Some(t) = self.turn.take() {
+            if let Err(err) = t.shutdown().await {
+                tracing::warn!(?err, "openhostd: TURN relay shutdown error");
+            }
         }
         self.publisher.shutdown().await;
         tracing::info!("openhostd: bye");
@@ -475,6 +488,52 @@ fn resolve_pair_db_path(cfg: &Config) -> PathBuf {
         .db_path
         .clone()
         .unwrap_or_else(pairing::default_db_path)
+}
+
+/// Spawn the embedded TURN relay when `[turn] enabled = true`,
+/// otherwise return `None` and leave the publisher's v2 path intact.
+///
+/// On success, installs `turn_endpoint` on [`SharedState`] so the
+/// publisher's next `snapshot_record` call emits a v3 record.
+async fn maybe_spawn_turn(
+    cfg: &Config,
+    identity: &Arc<SigningKey>,
+    state: &Arc<SharedState>,
+) -> Result<Option<crate::turn_server::TurnHandle>> {
+    if !cfg.turn.enabled {
+        return Ok(None);
+    }
+    let public_ip = cfg.turn.public_ip.ok_or_else(|| {
+        crate::error::DaemonError::Turn(
+            "turn.enabled = true requires turn.public_ip to be set".into(),
+        )
+    })?;
+    let bind_addr: std::net::SocketAddr = cfg.turn.bind_addr.parse().map_err(|_| {
+        crate::error::DaemonError::Turn(format!(
+            "turn.bind_addr is not a valid socket address: {}",
+            cfg.turn.bind_addr
+        ))
+    })?;
+    let runtime_cfg = crate::turn_server::TurnRuntimeConfig {
+        bind_addr,
+        public_ip,
+    };
+    let handle = crate::turn_server::spawn(&runtime_cfg, &identity.public_key())
+        .await
+        .map_err(|e| {
+            crate::error::DaemonError::Turn(format!("failed to spawn TURN server: {e}"))
+        })?;
+    let public_port = cfg.turn.public_port.unwrap_or(bind_addr.port());
+    state.set_turn_endpoint(Some(openhost_core::pkarr_record::TurnEndpoint {
+        ip: public_ip,
+        port: public_port,
+    }));
+    tracing::info!(
+        public_ip = %public_ip,
+        public_port,
+        "openhostd: TURN relay advertised in host record (v3)"
+    );
+    Ok(Some(handle))
 }
 
 /// Load the pairing DB into `state.allow`. Missing file = empty allow

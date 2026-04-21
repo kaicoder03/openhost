@@ -101,6 +101,12 @@ pub struct HostRecord {
     pub salt_hex: String,
     /// UTF-8 discovery hints.
     pub disc: String,
+    /// v3 sidecar (PR #42.2): daemon's embedded-TURN relay IPv4
+    /// address, if it advertises one. `None` for v2 records.
+    pub turn_ip: Option<String>,
+    /// v3 sidecar (PR #42.2): daemon's embedded-TURN relay UDP
+    /// port, if it advertises one. Paired with `turn_ip`.
+    pub turn_port: Option<u16>,
     /// 64-byte Ed25519 signature, hex. Already validated against
     /// `pubkey_zbase32` when this value came from
     /// [`decode_and_verify`]; advisory only when it came from
@@ -169,6 +175,8 @@ fn host_record_dto(pubkey_zbase32: &str, signed: &SignedRecord) -> HostRecord {
         roles: r.roles.clone(),
         salt_hex: hex::encode(r.salt),
         disc: r.disc.clone(),
+        turn_ip: r.turn_endpoint.map(|ep| ep.ip.to_string()),
+        turn_port: r.turn_endpoint.map(|ep| ep.port),
         signature_hex: hex::encode(signed.signature.to_bytes()),
     }
 }

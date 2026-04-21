@@ -57,6 +57,13 @@ pkarr = { workspace = true }
 # WebRTC listener (PR #5). `pem` feature enables RTCCertificate::from_pem so
 # we can hand DtlsCertificate.pem_bundle directly to webrtc-rs.
 webrtc = { workspace = true }
+# Embedded TURN relay (PR #42.2). Bound only when [turn].enabled is
+# true in config; the daemon otherwise never creates a TURN socket.
+turn = { workspace = true }
+# The `turn::relay::relay_static::RelayAddressGeneratorStatic` struct
+# requires `Arc<webrtc_util::vnet::net::Net>`; the crate's version must
+# match the one inside the webrtc-rs workspace `turn` pulls from.
+webrtc-util = "0.9"
 bytes = "1"
 # rustls 0.23 decoupled crypto providers from the default feature set; the
 # daemon installs `ring` as the process-wide provider before the listener

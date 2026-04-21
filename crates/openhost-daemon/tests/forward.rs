@@ -54,6 +54,7 @@ fn test_config(dir: &TempDir, upstream_port: u16) -> Config {
         }),
         log: LogConfig::default(),
         pairing: Default::default(),
+        turn: Default::default(),
     }
 }
 

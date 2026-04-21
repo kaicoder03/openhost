@@ -25,7 +25,7 @@ fn sample_signed_record(ts: u64) -> (SigningKey, SignedRecord) {
         roles: "server".to_string(),
         salt: [0x22; SALT_LEN],
         disc: String::new(),
-        turn_port: None,
+        turn_endpoint: None,
     };
     let signed = SignedRecord::sign(record, &sk).unwrap();
     (sk, signed)
