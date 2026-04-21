@@ -25,5 +25,6 @@ pub(crate) fn sample_record(ts: u64) -> OpenhostRecord {
         roles: "server".to_string(),
         salt,
         disc: String::new(),
+        turn_port: None,
     }
 }

@@ -191,6 +191,9 @@ impl SharedState {
             roles: self.roles.clone(),
             salt: self.salt,
             disc: String::new(),
+            // PR #42.1 only wires the field through; PR #42.2 populates
+            // it from daemon config when TURN is enabled.
+            turn_port: None,
         }
     }
 }

@@ -50,6 +50,7 @@ fn host_publishes_client_resolves_signs_and_exchanges_frames() {
         roles: "server".into(),
         salt,
         disc: "dht=1".into(),
+        turn_port: None,
     };
     let signed = SignedRecord::sign(record, &host_sk).expect("sign");
 

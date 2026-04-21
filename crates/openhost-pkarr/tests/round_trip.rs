@@ -43,6 +43,10 @@ fn reference_record() -> OpenhostRecord {
         roles: r["roles"].as_str().unwrap().to_string(),
         salt,
         disc: r["disc"].as_str().unwrap().to_string(),
+        turn_port: r
+            .get("turn_port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16),
     }
 }
 

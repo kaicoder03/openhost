@@ -197,6 +197,7 @@ mod tests {
             roles: "server".to_string(),
             salt: [0x11u8; SALT_LEN],
             disc: "dht=1".to_string(),
+            turn_port: None,
         };
         SignedRecord::sign(record, &sk).expect("sign")
     }

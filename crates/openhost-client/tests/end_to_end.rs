@@ -385,6 +385,7 @@ async fn publish_fake_host_record(net: &MemoryPkarrNetwork, daemon_sk: &SigningK
         roles: "server".to_string(),
         salt: [0x11; SALT_LEN],
         disc: String::new(),
+        turn_port: None,
     };
     let signed = SignedRecord::sign(record, daemon_sk).unwrap();
     let packet = encode(&signed, daemon_sk).unwrap();

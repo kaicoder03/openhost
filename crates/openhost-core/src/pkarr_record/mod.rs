@@ -15,10 +15,24 @@ use crate::{Error, Result};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
-/// openhost protocol version carried in the record. Incremented on breaking
-/// changes. v2 (PR #22) drops the `allow` and `ice` fields from the canonical
-/// bytes; v2 records are a hard break from v1.
+/// Default openhost protocol version emitted by builders that don't set
+/// any v3-only fields. Readers accept any version in
+/// [`MIN_SUPPORTED_VERSION`]..=[`MAX_SUPPORTED_VERSION`].
+///
+/// v2 (PR #22) dropped the `allow` and `ice` fields from the canonical
+/// bytes. v3 (PR #42.1) introduces the optional `turn_port` sidecar. A
+/// v3 record is only emitted when `turn_port.is_some()`; otherwise
+/// builders still emit v2 bytes for wire compatibility with pre-v3
+/// decoders.
 pub const PROTOCOL_VERSION: u8 = 2;
+
+/// Minimum record version a v3-aware decoder accepts. v1 is rejected —
+/// the `allow`/`ice` fields are gone and a v1 record signed over them
+/// can't be meaningfully reinterpreted.
+pub const MIN_SUPPORTED_VERSION: u8 = 2;
+
+/// Highest record version this crate emits or consumes.
+pub const MAX_SUPPORTED_VERSION: u8 = 3;
 
 /// Maximum permitted age of a signed record in seconds. Verifiers reject records
 /// whose internal timestamp is further from "now" than this window.
@@ -52,7 +66,10 @@ pub const MAX_DISC_LEN: usize = 256;
 /// carried them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenhostRecord {
-    /// Protocol version. Must equal [`PROTOCOL_VERSION`] for a v2 record.
+    /// Protocol version. Either [`PROTOCOL_VERSION`] (v2) or `3` (v3). v3
+    /// is emitted only when `turn_port.is_some()` so deployments that
+    /// don't run an embedded TURN server continue to publish
+    /// byte-identical records to the v2 format.
     pub version: u8,
     /// Unix timestamp (seconds) at which the host published this record.
     pub ts: u64,
@@ -64,6 +81,14 @@ pub struct OpenhostRecord {
     pub salt: [u8; SALT_LEN],
     /// Substrate discovery hints (informational). UTF-8, up to [`MAX_DISC_LEN`] bytes.
     pub disc: String,
+    /// Daemon's publicly-reachable UDP port for its embedded TURN
+    /// server, if one is enabled. `None` when the daemon does not
+    /// expose a TURN relay — clients then rely on direct ICE / STUN
+    /// only, which is fine on most home networks but fails under
+    /// symmetric NATs. Introduced in v3 (PR #42.1); a `Some(_)` value
+    /// forces `version = 3`.
+    #[serde(default)]
+    pub turn_port: Option<u16>,
 }
 
 impl OpenhostRecord {
@@ -71,8 +96,28 @@ impl OpenhostRecord {
     ///
     /// `now_ts` is the verifier's current Unix timestamp (seconds).
     pub fn validate(&self, now_ts: u64) -> Result<()> {
-        if self.version != PROTOCOL_VERSION {
+        if self.version < MIN_SUPPORTED_VERSION || self.version > MAX_SUPPORTED_VERSION {
             return Err(Error::InvalidRecord("unsupported protocol version"));
+        }
+        // turn_port is a v3-only field. Refuse a v2 record that claims
+        // to carry it — that would silently widen the signed surface.
+        if self.version < 3 && self.turn_port.is_some() {
+            return Err(Error::InvalidRecord(
+                "turn_port requires protocol version >= 3",
+            ));
+        }
+        // A v3 record MUST carry a turn_port; otherwise it's
+        // indistinguishable from v2 and should have been emitted as v2.
+        // (This keeps the version byte a meaningful capability flag.)
+        if self.version >= 3 && self.turn_port.is_none() {
+            return Err(Error::InvalidRecord(
+                "v3 record missing turn_port (emit as v2 instead)",
+            ));
+        }
+        if let Some(port) = self.turn_port {
+            if port == 0 {
+                return Err(Error::InvalidRecord("turn_port must be non-zero"));
+            }
         }
         // 2-hour window on either side.
         let delta = now_ts.abs_diff(self.ts);
@@ -97,12 +142,12 @@ impl OpenhostRecord {
 
     /// Produce the canonical byte representation used for signing and verification.
     ///
-    /// The v2 encoding is explicit and stable:
+    /// Layout (v2; stable since PR #22):
     ///
     /// ```text
     /// canonical = 0x01                        (legacy encoding tag; unchanged)
     ///          || "openhost1"                 (9 ASCII bytes, legacy domain separator)
-    ///          || version (1 byte, equals PROTOCOL_VERSION = 2)
+    ///          || version (1 byte; 2 or 3)
     ///          || ts (8 bytes, u64 big-endian)
     ///          || dtls_fp (32 bytes)
     ///          || roles_len (1 byte)    || roles_bytes
@@ -110,9 +155,22 @@ impl OpenhostRecord {
     ///          || disc_len (2 bytes BE) || disc_bytes
     /// ```
     ///
+    /// v3 (PR #42.1) appends one trailer:
+    ///
+    /// ```text
+    ///          || turn_port (2 bytes BE, u16; MUST be non-zero)
+    /// ```
+    ///
+    /// v2 records omit the trailer. A v3-aware decoder can therefore
+    /// consume a v2 record without change; a v2-only decoder reading a
+    /// v3 record will fail at the "trailing bytes" check. This is the
+    /// intended one-way compat: new readers see old records, old
+    /// readers reject new records. Deployments that don't run TURN
+    /// keep emitting v2 indefinitely.
+    ///
     /// The v1 schema inserted `allow_count || allow_entries || ice_count || ice_blobs`
-    /// between `salt` and `disc`. v2 drops those fields entirely; the `version`
-    /// byte is the sole discriminator for readers.
+    /// between `salt` and `disc`. v2 dropped those fields; v1 is
+    /// unsupported.
     ///
     /// Returns `Err` only when the record fails `validate(now_ts=self.ts)` — i.e.
     /// when the record is ill-formed. Otherwise the returned buffer is deterministic.
@@ -136,6 +194,11 @@ impl OpenhostRecord {
         let disc_len = u16::try_from(disc_bytes.len()).expect("validated <= MAX_DISC_LEN");
         out.extend_from_slice(&disc_len.to_be_bytes());
         out.extend_from_slice(disc_bytes);
+
+        // v3 trailer.
+        if let Some(port) = self.turn_port {
+            out.extend_from_slice(&port.to_be_bytes());
+        }
 
         Ok(out)
     }
@@ -196,6 +259,7 @@ mod tests {
             roles: "server".to_string(),
             salt,
             disc: "dht=1; relay=pkarr.example".to_string(),
+            turn_port: None,
         }
     }
 
@@ -300,6 +364,71 @@ mod tests {
         let mut r = sample_record(1_700_000_000);
         r.disc.push_str(" extra");
         assert_ne!(r.canonical_signing_bytes().unwrap(), base);
+    }
+
+    // ---------------------------------------------------------------------
+    // v3 turn_port coverage (PR #42.1)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn v3_round_trip_preserves_turn_port() {
+        let mut r = sample_record(1_700_000_000);
+        r.version = 3;
+        r.turn_port = Some(3478);
+        let bytes = r.canonical_signing_bytes().unwrap();
+        // v3 trailer is the last two bytes, big-endian u16 port.
+        assert_eq!(bytes[bytes.len() - 2..], 3478u16.to_be_bytes());
+    }
+
+    #[test]
+    fn v3_without_turn_port_rejected() {
+        let mut r = sample_record(1_700_000_000);
+        r.version = 3;
+        r.turn_port = None;
+        assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
+    }
+
+    #[test]
+    fn v2_with_turn_port_rejected() {
+        let mut r = sample_record(1_700_000_000);
+        r.version = 2;
+        r.turn_port = Some(3478);
+        assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
+    }
+
+    #[test]
+    fn turn_port_zero_rejected() {
+        let mut r = sample_record(1_700_000_000);
+        r.version = 3;
+        r.turn_port = Some(0);
+        assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
+    }
+
+    #[test]
+    fn v3_sign_verify_round_trip() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let pk = sk.public_key();
+        let mut record = sample_record(1_700_000_000);
+        record.version = 3;
+        record.turn_port = Some(3478);
+        let signed = SignedRecord::sign(record.clone(), &sk).unwrap();
+        signed.verify(&pk, record.ts).expect("v3 verifies");
+    }
+
+    #[test]
+    fn v2_records_still_encode_after_v3_landing() {
+        // Regression guard: PR #42.1 must not change v2 bytes. A v2
+        // record signed pre-PR and another signed post-PR MUST yield
+        // identical canonical bytes for the same logical record.
+        let r = sample_record(1_700_000_000);
+        let bytes = r.canonical_signing_bytes().unwrap();
+        // v2 record ends with the disc trailer; no turn_port byte.
+        // Sanity-check length equals the sum of fixed-width fields +
+        // variable-width roles + variable-width disc (no trailer).
+        let roles_len = r.roles.len();
+        let disc_len = r.disc.len();
+        let expected = 1 + 9 + 1 + 8 + 32 + 1 + roles_len + 32 + 2 + disc_len;
+        assert_eq!(bytes.len(), expected);
     }
 
     /// Measure the wire size of a v2 main record after base64url wrapping

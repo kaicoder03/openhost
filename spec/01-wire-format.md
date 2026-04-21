@@ -49,6 +49,8 @@ The packet **MUST** contain a single TXT resource record:
 
 The v1 schema additionally carried an `allow` list of 16-byte truncated HMAC entries and a per-paired-client `ice` list immediately before `disc`. v2 removes both fields from the canonical bytes; the underlying facilities they represented now live elsewhere (see the bullet list below).
 
+**v3 schema (PR #42.1).** A v3 record appends one 2-byte big-endian unsigned integer after the `disc` bytes: `turn_port`. A v3 record's `version` byte is `0x03` and `turn_port` **MUST** be non-zero. `turn_port` advertises the UDP port on the daemon's public IP where its embedded TURN server listens; clients read the field and add `turn:<daemon-ip>:<turn_port>` to their ICE configuration before dialling, enabling relay fallback under symmetric NATs that defeat direct hole-punching. Deployments without an embedded TURN server continue to publish v2 records (version byte `0x02`, no trailer); decoders **MUST** accept both. v1 is unsupported.
+
 The base64url encoding uses the RFC 4648 §5 URL-safe alphabet without padding. If the encoded string exceeds 255 bytes, it **MUST** be split across multiple DNS character strings within the same TXT RDATA (per RFC 1035 §3.3.14); decoders reconstruct the payload by concatenating the character strings in the order they appear.
 
 Two signatures bind the record:

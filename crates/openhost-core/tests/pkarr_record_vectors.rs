@@ -33,6 +33,8 @@ struct RecordFields {
     roles: String,
     salt_hex: String,
     disc: String,
+    #[serde(default)]
+    turn_port: Option<u16>,
 }
 
 fn decode_hex32(s: &str) -> [u8; 32] {
@@ -48,6 +50,7 @@ fn build_record(r: &RecordFields) -> OpenhostRecord {
         roles: r.roles.clone(),
         salt: decode_hex32(&r.salt_hex),
         disc: r.disc.clone(),
+        turn_port: r.turn_port,
     }
 }
 
