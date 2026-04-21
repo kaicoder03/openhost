@@ -247,9 +247,12 @@ export async function dialOhUrl(ohUrl, opts = {}) {
     await pc.setLocalDescription(offer);
     await waitForIceComplete(pc);
     const offerSdp = pc.localDescription.sdp;
+    const ufrag = (offerSdp.match(/a=ice-ufrag:(\S+)/) || [])[1];
+    const pwd = (offerSdp.match(/a=ice-pwd:(\S+)/) || [])[1];
 
     // 4. Seal + publish offer.
-    console.log("[dial] A7 offer SDP ready,", offerSdp.length, "chars");
+    console.log("[dial] A7 offer SDP ready,", offerSdp.length, "chars",
+      "ufrag=", ufrag, "pwd_len=", pwd?.length);
     const sealed = seal_offer(daemonPkZ, clientPkZ, offerSdp, BINDING_MODE_CERT_FP);
     console.log("[dial] A8 seal_offer OK");
     const packet = build_offer_packet(clientSeed, daemonPkZ, sealed, BigInt(Math.floor(Date.now() / 1000)));
@@ -264,6 +267,11 @@ export async function dialOhUrl(ohUrl, opts = {}) {
 
     // 6. Apply answer + wait for DTLS Connected.
     await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    // Log the CURRENT pc.localDescription ufrag AFTER answer applied,
+    // to catch Chrome mutating ufrag mid-session.
+    const ufragNow = (pc.localDescription.sdp.match(/a=ice-ufrag:(\S+)/) || [])[1];
+    console.log("[dial] A11 answer applied; local ufrag now=", ufragNow,
+      "(was", ufrag, ")");
     await waitForPcConnected(pc, opts.connectTimeoutMs ?? 45_000);
     await waitForDcOpen(dc, opts.connectTimeoutMs ?? 45_000);
 

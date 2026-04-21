@@ -88,7 +88,7 @@ function ensureOffscreen() {
     try {
       await chrome.offscreen.createDocument({
         url: OFFSCREEN_URL,
-        reasons: ["USER_MEDIA"],
+        reasons: ["WEB_RTC"],
         justification:
           "openhost holds a long-lived WebRTC session to the home daemon",
       });
@@ -111,11 +111,12 @@ const OH_PATH_RE = /^\/oh\/([a-z0-9]{52})(\/.*)?$/i;
 // fetch to an absolute path like `/api/videos`, which the browser
 // resolves against the extension ORIGIN, not the page's directory —
 // so the resulting URL pops out of the `/oh/<pk>/` scope and 404s.
-// We fix that by inspecting the referrer: if the requesting page is
-// under `/oh/<pk>/`, we rewrite the fetch to be under the same pk's
-// scope too. This makes relative and absolute URLs both "just work"
-// the way a regular website would.
-function resolveOhScope(event) {
+// We fix that by looking up the requesting page via `event.clientId`
+// (the standard SW API; extensions strip Referer by default so we
+// can't rely on `event.request.referrer`). If the client's URL is
+// under `/oh/<pk>/`, the fetch is rewritten back into the same pk's
+// scope. Makes relative and absolute URLs both "just work".
+async function resolveOhScope(event) {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return null;
 
@@ -127,20 +128,30 @@ function resolveOhScope(event) {
     };
   }
 
-  // Referer-based rewrite for same-origin absolute paths.
-  const referrer = event.request.referrer;
-  if (!referrer) return null;
-  let refUrl;
+  // Client-based rewrite for same-origin absolute paths. The client
+  // is the page (Window) that issued the fetch; its URL tells us
+  // which `/oh/<pk>/` scope the page is living in.
+  const clientId = event.clientId || event.resultingClientId;
+  if (!clientId) return null;
+  let client;
   try {
-    refUrl = new URL(referrer);
+    client = await self.clients.get(clientId);
   } catch {
     return null;
   }
-  if (refUrl.origin !== self.location.origin) return null;
-  const ref = OH_PATH_RE.exec(refUrl.pathname);
-  if (!ref) return null;
+  if (!client) return null;
+
+  let clientUrl;
+  try {
+    clientUrl = new URL(client.url);
+  } catch {
+    return null;
+  }
+  if (clientUrl.origin !== self.location.origin) return null;
+  const scope = OH_PATH_RE.exec(clientUrl.pathname);
+  if (!scope) return null;
   return {
-    daemonPkZ: ref[1].toLowerCase(),
+    daemonPkZ: scope[1].toLowerCase(),
     path: url.pathname + (url.search || ""),
   };
 }
@@ -152,12 +163,52 @@ self.addEventListener("fetch", (event) => {
     "[sw-fetch]",
     event.request.method,
     event.request.url,
-    "referrer:",
-    event.request.referrer || "(none)",
+    "mode:",
+    event.request.mode,
+    "dest:",
+    event.request.destination,
+    "clientId:",
+    event.clientId || "(none)",
   );
-  const scope = resolveOhScope(event);
-  if (!scope) return;
-  event.respondWith(handleOhFetch(scope.daemonPkZ, scope.path, event.request));
+
+  const url = new URL(event.request.url);
+  if (url.origin !== self.location.origin) return;
+
+  // Navigations (top-level document loads + offscreen document
+  // creation) that aren't under `/oh/<pk>/...` MUST be left to
+  // Chrome's native handler. Calling respondWith on the offscreen
+  // document's fetch stalls `chrome.offscreen.createDocument`, which
+  // deadlocks the whole dial flow.
+  if (
+    event.request.mode === "navigate" &&
+    !OH_PATH_RE.test(url.pathname)
+  ) {
+    return;
+  }
+
+  // Sync fast path: URL is under our scope, claim it.
+  if (OH_PATH_RE.test(url.pathname)) {
+    event.respondWith(
+      (async () => {
+        const scope = await resolveOhScope(event);
+        return handleOhFetch(scope.daemonPkZ, scope.path, event.request);
+      })(),
+    );
+    return;
+  }
+
+  // Subresource fetches (mode != "navigate") to same-origin paths
+  // not under `/oh/<pk>/` — these are `fetch('/api/...')` from a
+  // rendered openhost page. Look up the requesting client, and if
+  // it's under `/oh/<pk>/`, rewrite the fetch into that scope. Else
+  // pass through to Chrome's file handler via `fetch(event.request)`.
+  event.respondWith(
+    (async () => {
+      const scope = await resolveOhScope(event);
+      if (!scope) return fetch(event.request);
+      return handleOhFetch(scope.daemonPkZ, scope.path, event.request);
+    })(),
+  );
 });
 
 // Take control of any already-open pages on install + activate so
@@ -167,6 +218,14 @@ self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) =>
   event.waitUntil(self.clients.claim()),
 );
+
+// Relay offscreen-doc console logs into the SW's console so they
+// show up in SW DevTools + automation tooling.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.kind !== "openhost-log") return;
+  const tag = `[offscreen.${msg.level}]`;
+  console.log(tag, ...(msg.args || []));
+});
 
 // Uint8Array ↔ base64 helpers mirror the offscreen side. See
 // offscreen.js for why we don't just pass ArrayBuffers through

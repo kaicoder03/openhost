@@ -5,6 +5,31 @@
 
 import { dialOhUrl } from "./dialer/openhost_session.js";
 
+// Forward every console.log in this offscreen doc over to the SW so
+// it shows up in SW DevTools (or in any tool listening to the SW
+// console — Playwright, for instance). Offscreen docs don't surface
+// as pages in most automation APIs, so without this the whole dial
+// flow is opaque from outside.
+(function forwardLogs() {
+  const levels = ["log", "info", "warn", "error"];
+  for (const lvl of levels) {
+    const orig = console[lvl].bind(console);
+    console[lvl] = (...args) => {
+      try {
+        chrome.runtime.sendMessage({
+          kind: "openhost-log",
+          level: lvl,
+          args: args.map((a) => {
+            try { return typeof a === "string" ? a : JSON.stringify(a); }
+            catch { return String(a); }
+          }),
+        }).catch(() => {});
+      } catch {}
+      orig(...args);
+    };
+  }
+})();
+
 console.log("openhost offscreen: booted, awaiting SW requests");
 
 // sessions: Map<daemonPkZ, Promise<OpenhostSession>>.
