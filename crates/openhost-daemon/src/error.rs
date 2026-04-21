@@ -51,6 +51,10 @@ pub enum DaemonError {
     /// Low-level I/O failure not caught by a more specific variant.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Embedded TURN relay spawn or misconfiguration (PR #42.2).
+    #[error("turn relay error: {0}")]
+    Turn(String),
 }
 
 /// Pair-DB file-watcher failures.

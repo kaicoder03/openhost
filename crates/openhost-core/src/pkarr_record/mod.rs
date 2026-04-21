@@ -14,16 +14,34 @@ use crate::identity::{PublicKey, SigningKey};
 use crate::{Error, Result};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
+
+/// Reachability information for the daemon's embedded TURN relay.
+/// v3 schema trailer (PR #42.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEndpoint {
+    /// Publicly-reachable IPv4 address (the daemon's Elastic IP,
+    /// residential public IP, etc.). Operators configure this
+    /// explicitly in `[turn.public_ip]` — the daemon cannot discover
+    /// its own public IP reliably (EC2 is NATed behind an Elastic IP
+    /// mapping; most residential deployments are behind a home
+    /// router).
+    pub ip: Ipv4Addr,
+    /// UDP port the TURN server is bound to on the public IP.
+    /// Must be non-zero.
+    pub port: u16,
+}
 
 /// Default openhost protocol version emitted by builders that don't set
 /// any v3-only fields. Readers accept any version in
 /// [`MIN_SUPPORTED_VERSION`]..=[`MAX_SUPPORTED_VERSION`].
 ///
 /// v2 (PR #22) dropped the `allow` and `ice` fields from the canonical
-/// bytes. v3 (PR #42.1) introduces the optional `turn_port` sidecar. A
-/// v3 record is only emitted when `turn_port.is_some()`; otherwise
-/// builders still emit v2 bytes for wire compatibility with pre-v3
-/// decoders.
+/// bytes. v3 (PR #42.1 + PR #42.2) introduces the optional
+/// `turn_endpoint` sidecar (IPv4 address + UDP port) advertising the
+/// daemon's embedded TURN relay. A v3 record is only emitted when
+/// `turn_endpoint.is_some()`; otherwise builders still emit v2 bytes
+/// for wire compatibility with pre-v3 decoders.
 pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Minimum record version a v3-aware decoder accepts. v1 is rejected —
@@ -81,14 +99,15 @@ pub struct OpenhostRecord {
     pub salt: [u8; SALT_LEN],
     /// Substrate discovery hints (informational). UTF-8, up to [`MAX_DISC_LEN`] bytes.
     pub disc: String,
-    /// Daemon's publicly-reachable UDP port for its embedded TURN
-    /// server, if one is enabled. `None` when the daemon does not
-    /// expose a TURN relay — clients then rely on direct ICE / STUN
-    /// only, which is fine on most home networks but fails under
-    /// symmetric NATs. Introduced in v3 (PR #42.1); a `Some(_)` value
-    /// forces `version = 3`.
+    /// Daemon's publicly-reachable IPv4 address + UDP port for its
+    /// embedded TURN server. Both fields are populated together in
+    /// v3 — a client can't dial TURN with only a port, and the
+    /// daemon's identity pubkey alone doesn't disclose an IP. A
+    /// `Some(_)` value forces `version = 3`; v2 records always have
+    /// `None`. IPv6 TURN is out of scope for v3; the field widens to
+    /// `IpAddr` in a future schema bump.
     #[serde(default)]
-    pub turn_port: Option<u16>,
+    pub turn_endpoint: Option<TurnEndpoint>,
 }
 
 impl OpenhostRecord {
@@ -99,24 +118,30 @@ impl OpenhostRecord {
         if self.version < MIN_SUPPORTED_VERSION || self.version > MAX_SUPPORTED_VERSION {
             return Err(Error::InvalidRecord("unsupported protocol version"));
         }
-        // turn_port is a v3-only field. Refuse a v2 record that claims
-        // to carry it — that would silently widen the signed surface.
-        if self.version < 3 && self.turn_port.is_some() {
+        // turn_endpoint is a v3-only field. Refuse a v2 record that
+        // claims to carry it — that would silently widen the signed
+        // surface.
+        if self.version < 3 && self.turn_endpoint.is_some() {
             return Err(Error::InvalidRecord(
-                "turn_port requires protocol version >= 3",
+                "turn_endpoint requires protocol version >= 3",
             ));
         }
-        // A v3 record MUST carry a turn_port; otherwise it's
-        // indistinguishable from v2 and should have been emitted as v2.
-        // (This keeps the version byte a meaningful capability flag.)
-        if self.version >= 3 && self.turn_port.is_none() {
+        // A v3 record MUST carry a turn_endpoint; otherwise it's
+        // indistinguishable from v2 and should have been emitted as
+        // v2. Keeps the version byte a meaningful capability flag.
+        if self.version >= 3 && self.turn_endpoint.is_none() {
             return Err(Error::InvalidRecord(
-                "v3 record missing turn_port (emit as v2 instead)",
+                "v3 record missing turn_endpoint (emit as v2 instead)",
             ));
         }
-        if let Some(port) = self.turn_port {
-            if port == 0 {
-                return Err(Error::InvalidRecord("turn_port must be non-zero"));
+        if let Some(ep) = self.turn_endpoint {
+            if ep.port == 0 {
+                return Err(Error::InvalidRecord("turn_endpoint.port must be non-zero"));
+            }
+            if ep.ip.is_unspecified() || ep.ip.is_loopback() {
+                return Err(Error::InvalidRecord(
+                    "turn_endpoint.ip must be a routable address",
+                ));
             }
         }
         // 2-hour window on either side.
@@ -155,9 +180,10 @@ impl OpenhostRecord {
     ///          || disc_len (2 bytes BE) || disc_bytes
     /// ```
     ///
-    /// v3 (PR #42.1) appends one trailer:
+    /// v3 (PR #42.1 + PR #42.2) appends one trailer:
     ///
     /// ```text
+    ///          || turn_ip (4 bytes, IPv4 in network order)
     ///          || turn_port (2 bytes BE, u16; MUST be non-zero)
     /// ```
     ///
@@ -196,8 +222,9 @@ impl OpenhostRecord {
         out.extend_from_slice(disc_bytes);
 
         // v3 trailer.
-        if let Some(port) = self.turn_port {
-            out.extend_from_slice(&port.to_be_bytes());
+        if let Some(ep) = self.turn_endpoint {
+            out.extend_from_slice(&ep.ip.octets());
+            out.extend_from_slice(&ep.port.to_be_bytes());
         }
 
         Ok(out)
@@ -259,7 +286,7 @@ mod tests {
             roles: "server".to_string(),
             salt,
             disc: "dht=1; relay=pkarr.example".to_string(),
-            turn_port: None,
+            turn_endpoint: None,
         }
     }
 
@@ -367,40 +394,63 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // v3 turn_port coverage (PR #42.1)
+    // v3 turn_endpoint coverage (PR #42.1 + PR #42.2)
     // ---------------------------------------------------------------------
 
-    #[test]
-    fn v3_round_trip_preserves_turn_port() {
-        let mut r = sample_record(1_700_000_000);
-        r.version = 3;
-        r.turn_port = Some(3478);
-        let bytes = r.canonical_signing_bytes().unwrap();
-        // v3 trailer is the last two bytes, big-endian u16 port.
-        assert_eq!(bytes[bytes.len() - 2..], 3478u16.to_be_bytes());
+    fn v3_endpoint() -> TurnEndpoint {
+        TurnEndpoint {
+            ip: std::net::Ipv4Addr::new(3, 238, 149, 237),
+            port: 3478,
+        }
     }
 
     #[test]
-    fn v3_without_turn_port_rejected() {
+    fn v3_round_trip_preserves_turn_endpoint() {
         let mut r = sample_record(1_700_000_000);
         r.version = 3;
-        r.turn_port = None;
+        r.turn_endpoint = Some(v3_endpoint());
+        let bytes = r.canonical_signing_bytes().unwrap();
+        // Trailer = IPv4 (4 bytes) + port (2 bytes BE) = 6 bytes.
+        let trailer = &bytes[bytes.len() - 6..];
+        assert_eq!(&trailer[..4], &[3u8, 238, 149, 237]);
+        assert_eq!(&trailer[4..], &3478u16.to_be_bytes());
+    }
+
+    #[test]
+    fn v3_without_turn_endpoint_rejected() {
+        let mut r = sample_record(1_700_000_000);
+        r.version = 3;
+        r.turn_endpoint = None;
         assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
     }
 
     #[test]
-    fn v2_with_turn_port_rejected() {
+    fn v2_with_turn_endpoint_rejected() {
         let mut r = sample_record(1_700_000_000);
         r.version = 2;
-        r.turn_port = Some(3478);
+        r.turn_endpoint = Some(v3_endpoint());
         assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
     }
 
     #[test]
-    fn turn_port_zero_rejected() {
+    fn turn_endpoint_zero_port_rejected() {
         let mut r = sample_record(1_700_000_000);
         r.version = 3;
-        r.turn_port = Some(0);
+        r.turn_endpoint = Some(TurnEndpoint {
+            ip: std::net::Ipv4Addr::new(1, 2, 3, 4),
+            port: 0,
+        });
+        assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
+    }
+
+    #[test]
+    fn turn_endpoint_loopback_ip_rejected() {
+        let mut r = sample_record(1_700_000_000);
+        r.version = 3;
+        r.turn_endpoint = Some(TurnEndpoint {
+            ip: std::net::Ipv4Addr::new(127, 0, 0, 1),
+            port: 3478,
+        });
         assert!(matches!(r.validate(r.ts), Err(Error::InvalidRecord(_))));
     }
 
@@ -410,21 +460,17 @@ mod tests {
         let pk = sk.public_key();
         let mut record = sample_record(1_700_000_000);
         record.version = 3;
-        record.turn_port = Some(3478);
+        record.turn_endpoint = Some(v3_endpoint());
         let signed = SignedRecord::sign(record.clone(), &sk).unwrap();
         signed.verify(&pk, record.ts).expect("v3 verifies");
     }
 
     #[test]
     fn v2_records_still_encode_after_v3_landing() {
-        // Regression guard: PR #42.1 must not change v2 bytes. A v2
-        // record signed pre-PR and another signed post-PR MUST yield
-        // identical canonical bytes for the same logical record.
+        // Regression guard: PR #42.1/.2 must not change v2 bytes.
         let r = sample_record(1_700_000_000);
         let bytes = r.canonical_signing_bytes().unwrap();
-        // v2 record ends with the disc trailer; no turn_port byte.
-        // Sanity-check length equals the sum of fixed-width fields +
-        // variable-width roles + variable-width disc (no trailer).
+        // v2 record ends with the disc trailer; no v3 trailer bytes.
         let roles_len = r.roles.len();
         let disc_len = r.disc.len();
         let expected = 1 + 9 + 1 + 8 + 32 + 1 + roles_len + 32 + 2 + disc_len;

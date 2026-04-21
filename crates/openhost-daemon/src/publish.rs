@@ -66,6 +66,10 @@ pub struct SharedState {
     ///
     /// [`snapshot_answers`]: SharedState::snapshot_answers
     answers: RwLock<HashMap<[u8; CLIENT_HASH_LEN], AnswerEntry>>,
+    /// Optional embedded-TURN endpoint to advertise in v3 host records.
+    /// `None` emits a v2 record (default); `Some` emits v3 with the
+    /// daemon's publicly-reachable TURN IP + UDP port.
+    turn_endpoint: RwLock<Option<openhost_core::pkarr_record::TurnEndpoint>>,
 }
 
 impl SharedState {
@@ -84,7 +88,17 @@ impl SharedState {
             allow: RwLock::new(Vec::new()),
             roles: "server".to_string(),
             answers: RwLock::new(HashMap::new()),
+            turn_endpoint: RwLock::new(None),
         }
+    }
+
+    /// Install (or clear) the TURN endpoint advertised in the host
+    /// record. Called by [`App::build`] when `[turn] enabled = true`.
+    pub fn set_turn_endpoint(&self, ep: Option<openhost_core::pkarr_record::TurnEndpoint>) {
+        *self
+            .turn_endpoint
+            .write()
+            .expect("turn_endpoint lock poisoned") = ep;
     }
 
     /// Queue an answer entry for publication. The entry is keyed on
@@ -184,16 +198,26 @@ impl SharedState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let turn_endpoint = *self
+            .turn_endpoint
+            .read()
+            .expect("turn_endpoint lock poisoned");
+        // Deployments that leave [turn].enabled = false emit a v2 record
+        // (byte-identical to pre-PR #42 output). When turn_endpoint is
+        // Some, bump to v3 so the trailer is included on the wire.
+        let version = if turn_endpoint.is_some() {
+            3
+        } else {
+            PROTOCOL_VERSION
+        };
         OpenhostRecord {
-            version: PROTOCOL_VERSION,
+            version,
             ts,
             dtls_fp: self.dtls_fp(),
             roles: self.roles.clone(),
             salt: self.salt,
             disc: String::new(),
-            // PR #42.1 only wires the field through; PR #42.2 populates
-            // it from daemon config when TURN is enabled.
-            turn_port: None,
+            turn_endpoint,
         }
     }
 }

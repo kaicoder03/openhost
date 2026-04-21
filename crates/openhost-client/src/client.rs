@@ -178,7 +178,7 @@ mod tests {
             roles: "server".to_string(),
             salt: [0x11u8; SALT_LEN],
             disc: String::new(),
-            turn_port: None,
+            turn_endpoint: None,
         }
     }
 

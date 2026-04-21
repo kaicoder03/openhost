@@ -25,7 +25,7 @@ required-features = ["cli"]
 
 [features]
 default = []
-cli = ["clap", "tracing-subscriber", "serde_json", "hex"]
+cli = ["clap", "tracing-subscriber", "serde_json"]
 # Opt-in suite that resolves a real host pubkey over public Pkarr
 # relays. NOT on CI — run manually before publishing.
 real-network = []
@@ -63,15 +63,16 @@ webrtc = { workspace = true }
 bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
+# Required by turn_creds (PR #42.3); hex-encodes the password digest.
+hex = { workspace = true }
+
 # Optional — cli feature only
 clap = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-hex = { workspace = true }
 serde_json = { workspace = true }
 # End-to-end test scaffolding (PR #8).
 openhost-daemon = { path = "../openhost-daemon" }

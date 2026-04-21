@@ -56,6 +56,7 @@ fn build_config(tmp: &TempDir, pair_db_path: std::path::PathBuf) -> Config {
             // 250 ms window on every modification.
             watch_debounce_ms: 50,
         },
+        turn: Default::default(),
     }
 }
 

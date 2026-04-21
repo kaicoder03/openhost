@@ -72,6 +72,7 @@ fn build_config(
             db_path: pair_db_path,
             ..PairingConfig::default()
         },
+        turn: Default::default(),
     }
 }
 

@@ -26,6 +26,7 @@ pub mod client;
 pub mod dialer;
 pub mod error;
 pub mod session;
+pub mod turn_creds;
 mod webrtc_helpers;
 
 pub use binding::{ClientBinder, ClientBindingError};

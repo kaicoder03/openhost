@@ -49,7 +49,11 @@ The packet **MUST** contain a single TXT resource record:
 
 The v1 schema additionally carried an `allow` list of 16-byte truncated HMAC entries and a per-paired-client `ice` list immediately before `disc`. v2 removes both fields from the canonical bytes; the underlying facilities they represented now live elsewhere (see the bullet list below).
 
-**v3 schema (PR #42.1).** A v3 record appends one 2-byte big-endian unsigned integer after the `disc` bytes: `turn_port`. A v3 record's `version` byte is `0x03` and `turn_port` **MUST** be non-zero. `turn_port` advertises the UDP port on the daemon's public IP where its embedded TURN server listens; clients read the field and add `turn:<daemon-ip>:<turn_port>` to their ICE configuration before dialling, enabling relay fallback under symmetric NATs that defeat direct hole-punching. Deployments without an embedded TURN server continue to publish v2 records (version byte `0x02`, no trailer); decoders **MUST** accept both. v1 is unsupported.
+**v3 schema (PR #42.1 + PR #42.2).** A v3 record appends a 6-byte trailer after `disc`: `turn_ip` (4 bytes, IPv4 in network order) followed by `turn_port` (2 bytes, unsigned 16-bit big-endian). A v3 record's `version` byte is `0x03`; `turn_port` **MUST** be non-zero and `turn_ip` **MUST** be routable (`0.0.0.0` and `127.0.0.0/8` are rejected).
+
+The pair advertises the publicly-reachable IPv4 address + UDP port of the daemon's embedded TURN relay. Clients read the trailer and add `turn:<turn_ip>:<turn_port>` to their `RTCConfiguration.ice_servers` before dialling. The TURN long-term credential is derivable entirely from public state: `realm = "openhost"`, `username = "openhost"`, `password = lower_hex(sha256("openhost-turn-v1" || daemon_pubkey))[..32]`. Daemon and client compute the same password independently, so no out-of-band credential exchange is needed; the password is not secret, only matching-input scaffolding for the TURN MESSAGE-INTEGRITY HMAC.
+
+Deployments without an embedded TURN server keep publishing v2 records (version byte `0x02`, no trailer); decoders **MUST** accept both. v1 is unsupported.
 
 The base64url encoding uses the RFC 4648 §5 URL-safe alphabet without padding. If the encoded string exceeds 255 bytes, it **MUST** be split across multiple DNS character strings within the same TXT RDATA (per RFC 1035 §3.3.14); decoders reconstruct the payload by concatenating the character strings in the order they appear.
 
