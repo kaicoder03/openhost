@@ -6,7 +6,8 @@
   "permissions": [
     "webNavigation",
     "tabs",
-    "storage"
+    "storage",
+    "offscreen"
   ],
   "host_permissions": [
     "https://relay.pkarr.org/*",
@@ -27,6 +28,6 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; object-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'"
   }
 }
