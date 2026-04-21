@@ -975,8 +975,14 @@ mod tests {
         // to indicate options that are desired for that particular
         // connection and MUST NOT be forwarded by proxies."
         let mut h = HeaderMap::new();
-        h.insert(http::header::CONNECTION, HeaderValue::from_static("X-Custom"));
-        h.insert(HeaderName::from_static("x-custom"), HeaderValue::from_static("remove-me"));
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Custom"),
+        );
+        h.insert(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_static("remove-me"),
+        );
 
         sanitize_request_headers(&mut h, "x").unwrap();
 
