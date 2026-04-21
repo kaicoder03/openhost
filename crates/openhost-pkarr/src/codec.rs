@@ -25,7 +25,8 @@ use base64::Engine;
 use ed25519_dalek::Signature;
 use openhost_core::identity::{PublicKey, SigningKey, PUBLIC_KEY_LEN};
 use openhost_core::pkarr_record::{
-    OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, MAX_DISC_LEN, PROTOCOL_VERSION, SALT_LEN,
+    OpenhostRecord, SignedRecord, DTLS_FINGERPRINT_LEN, MAX_DISC_LEN, MAX_SUPPORTED_VERSION,
+    MIN_SUPPORTED_VERSION, SALT_LEN,
 };
 use pkarr::dns::Name;
 use pkarr::{Keypair, SignedPacket, Timestamp};
@@ -207,7 +208,7 @@ fn parse_canonical_bytes(bytes: &[u8]) -> Result<OpenhostRecord> {
     }
 
     let version = r.u8()?;
-    if version != PROTOCOL_VERSION {
+    if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Err(PkarrError::MalformedCanonical(
             "unsupported protocol version",
         ));
@@ -238,11 +239,34 @@ fn parse_canonical_bytes(bytes: &[u8]) -> Result<OpenhostRecord> {
         .map_err(|_| PkarrError::MalformedCanonical("disc is not valid UTF-8"))?
         .to_string();
 
-    if !r.is_empty() {
-        return Err(PkarrError::MalformedCanonical(
-            "trailing bytes after canonical record",
-        ));
-    }
+    // v3 trailer: an optional u16 BE `turn_port`. v2 records stop at
+    // disc; v3 records carry exactly 2 more bytes. Anything in between
+    // is a malformed record.
+    let turn_port = match (version, r.is_empty()) {
+        (v, true) if v >= 3 => {
+            return Err(PkarrError::MalformedCanonical(
+                "v3 record missing turn_port trailer",
+            ))
+        }
+        (_, true) => None,
+        (v, false) if v < 3 => {
+            return Err(PkarrError::MalformedCanonical(
+                "trailing bytes after canonical record",
+            ));
+        }
+        (_, false) => {
+            let port = r.u16_be()?;
+            if !r.is_empty() {
+                return Err(PkarrError::MalformedCanonical(
+                    "trailing bytes after v3 turn_port",
+                ));
+            }
+            if port == 0 {
+                return Err(PkarrError::MalformedCanonical("turn_port must be non-zero"));
+            }
+            Some(port)
+        }
+    };
 
     Ok(OpenhostRecord {
         version,
@@ -251,6 +275,7 @@ fn parse_canonical_bytes(bytes: &[u8]) -> Result<OpenhostRecord> {
         roles,
         salt,
         disc,
+        turn_port,
     })
 }
 
@@ -432,6 +457,54 @@ mod tests {
             SignedPacket::deserialize(&wire).is_err(),
             "tampered BEP44 sig must fail pkarr deserialization"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // v3 turn_port codec coverage (PR #42.1)
+    // ---------------------------------------------------------------------
+
+    fn v3_record(port: u16) -> OpenhostRecord {
+        OpenhostRecord {
+            version: 3,
+            turn_port: Some(port),
+            ..reference_record()
+        }
+    }
+
+    #[test]
+    fn v3_round_trip_preserves_turn_port() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let record = v3_record(3478);
+        let signed = SignedRecord::sign(record.clone(), &sk).unwrap();
+        let packet = encode(&signed, &sk).unwrap();
+        let decoded = decode(&packet).unwrap();
+        assert_eq!(decoded.record.turn_port, Some(3478));
+        assert_eq!(decoded.record.version, 3);
+    }
+
+    #[test]
+    fn v3_signed_record_verifies_against_pubkey() {
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+        let pk = sk.public_key();
+        let signed = SignedRecord::sign(v3_record(3478), &sk).unwrap();
+        let packet = encode(&signed, &sk).unwrap();
+        let decoded = decode(&packet).unwrap();
+        decoded.verify(&pk, decoded.record.ts).expect("v3 verifies");
+    }
+
+    #[test]
+    fn v2_and_v3_records_coexist_on_the_wire() {
+        // Codec must accept both schema versions without a mode switch.
+        let sk = SigningKey::from_bytes(&RFC_SEED);
+
+        let v2_record = reference_record();
+        let v2_signed = SignedRecord::sign(v2_record.clone(), &sk).unwrap();
+        let v2_packet = encode(&v2_signed, &sk).unwrap();
+        assert_eq!(decode(&v2_packet).unwrap().record.turn_port, None);
+
+        let v3_signed = SignedRecord::sign(v3_record(51820), &sk).unwrap();
+        let v3_packet = encode(&v3_signed, &sk).unwrap();
+        assert_eq!(decode(&v3_packet).unwrap().record.turn_port, Some(51820));
     }
 
     /// Sanity-check: a v2 record with a maxed-out `disc` still encodes
