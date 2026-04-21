@@ -1,0 +1,4 @@
+## 2026-04-21 - [HIGH] HTTP Parser and Sanitization Gaps
+**Vulnerability:** The HTTP forwarder's request head parser was susceptible to HTTP Request Smuggling (HRS) by allowing whitespace between the header field-name and colon, and by allowing obsolete line folding. Additionally, it failed to dynamically strip headers listed in the `Connection` field, and missed `Proxy-Connection` in its hop-by-hop list.
+**Learning:** Hand-rolled HTTP parsers often miss subtle RFC requirements (RFC 7230) that are critical for security in a proxying environment. Allowing ambiguous header formats can lead to desynchronization attacks between the openhost daemon and the upstream service.
+**Prevention:** Always validate header names and values strictly against RFC 7230 §3.2.4. Specifically, reject any whitespace before the colon, reject line folding, and ensure all hop-by-hop headers (both fixed and dynamic) are stripped before forwarding.

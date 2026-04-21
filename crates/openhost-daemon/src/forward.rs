@@ -50,6 +50,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "transfer-encoding",
@@ -380,12 +381,21 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse("obsolete line folding rejected"));
+        }
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace before colon in header name",
+            ));
+        }
+        let name = name.trim();
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` around the value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -405,9 +415,8 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_connection_headers(headers, false);
+
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -429,12 +438,10 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        if *name == "connection" || *name == "upgrade" {
-            continue;
-        }
-        headers.remove(*name);
-    }
+    // Dynamic Connection-listed headers MUST be stripped even on the
+    // WebSocket path, but we MUST keep Upgrade and Connection themselves.
+    strip_connection_headers(headers, true);
+
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -454,12 +461,7 @@ fn encode_websocket_response_head(
     status: StatusCode,
     mut headers: HeaderMap,
 ) -> Result<Vec<u8>, ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        if *name == "connection" || *name == "upgrade" {
-            continue;
-        }
-        headers.remove(*name);
-    }
+    strip_connection_headers(&mut headers, true);
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
     out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
@@ -471,6 +473,39 @@ fn encode_websocket_response_head(
     }
     out.extend_from_slice(b"\r\n");
     Ok(out)
+}
+
+/// Dynamic hop-by-hop header removal per RFC 7230 §6.1.
+///
+/// Strips every header name listed in the `Connection` header, plus
+/// the fixed [`HOP_BY_HOP_HEADERS`] list. When `is_websocket` is true,
+/// `Connection` and `Upgrade` are preserved.
+fn strip_connection_headers(headers: &mut HeaderMap, is_websocket: bool) {
+    if let Some(conn) = headers.get(http::header::CONNECTION).cloned() {
+        if let Ok(s) = conn.to_str() {
+            for part in s.split(',') {
+                let name = part.trim();
+                if !name.is_empty() {
+                    if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
+                        if is_websocket
+                            && (header_name == http::header::UPGRADE
+                                || header_name == http::header::CONNECTION)
+                        {
+                            continue;
+                        }
+                        headers.remove(header_name);
+                    }
+                }
+            }
+        }
+    }
+
+    for name in HOP_BY_HOP_HEADERS {
+        if is_websocket && (*name == "connection" || *name == "upgrade") {
+            continue;
+        }
+        headers.remove(*name);
+    }
 }
 
 /// Build `http://<target-authority><path>` for the outbound request.
@@ -510,9 +545,7 @@ fn encode_response_head(
     mut headers: HeaderMap,
     body_len: usize,
 ) -> Result<Vec<u8>, ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_connection_headers(&mut headers, false);
     // Rewrite Content-Length to match the buffered body. The upstream
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
@@ -897,5 +930,80 @@ mod tests {
         let target: Uri = "http://127.0.0.1:8080".parse().unwrap();
         let uri = combine_target_and_path(&target, "http://evil.example/foo").unwrap();
         assert_eq!(uri.to_string(), "http://127.0.0.1:8080/foo");
+    }
+
+    // --- Vulnerability reproduction tests (PR #Sentinel) ------------
+
+    #[test]
+    fn parse_request_head_vulnerability_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+        // field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nX-Custom : value\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("whitespace before colon in header name")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_vulnerability_obsolete_folding() {
+        // RFC 7230 §3.2.4: "A proxy or gateway that receives an obsolete
+        // line folding in a response message [...] MUST either message
+        // with a 502 (Bad Gateway) or replace each [folding] with a
+        // single SP". For requests, it's generally rejected.
+        let raw = b"GET / HTTP/1.1\r\nX-Custom: value\r\n folded\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("obsolete line folding rejected")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_vulnerability_trailing_ows() {
+        // RFC 7230 §3.2.4: value should be trimmed of OWS.
+        let raw = b"GET / HTTP/1.1\r\nX-Custom: value \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        let val = headers.get("x-custom").unwrap().to_str().unwrap();
+        assert_eq!(val, "value");
+    }
+
+    #[test]
+    fn sanitize_vulnerability_dynamic_hop_by_hop() {
+        // RFC 7230 §6.1: "The "Connection" header field allows the sender
+        // to indicate options that are desired for that particular
+        // connection and MUST NOT be forwarded by proxies."
+        let mut h = HeaderMap::new();
+        h.insert(http::header::CONNECTION, HeaderValue::from_static("X-Custom"));
+        h.insert(HeaderName::from_static("x-custom"), HeaderValue::from_static("remove-me"));
+
+        sanitize_request_headers(&mut h, "x").unwrap();
+
+        assert!(
+            !h.contains_key("x-custom"),
+            "X-Custom should have been removed via Connection header"
+        );
+        assert!(
+            !h.contains_key(http::header::CONNECTION),
+            "Connection header itself must be removed"
+        );
+    }
+
+    #[test]
+    fn sanitize_vulnerability_proxy_connection() {
+        // Proxy-Connection is a common non-standard hop-by-hop header.
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("close"),
+        );
+
+        sanitize_request_headers(&mut h, "x").unwrap();
+
+        assert!(
+            !h.contains_key("proxy-connection"),
+            "Proxy-Connection should be treated as hop-by-hop"
+        );
     }
 }
