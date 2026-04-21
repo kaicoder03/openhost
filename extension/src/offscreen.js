@@ -30,7 +30,20 @@ function getOrDialSession(daemonPkZ) {
       session._pc.addEventListener("connectionstatechange", () => {
         const s = session._pc.connectionState;
         if (s === "failed" || s === "closed" || s === "disconnected") {
+          console.log(
+            "openhost offscreen: PC transitioned to",
+            s,
+            "— closing + evicting",
+            daemonPkZ,
+          );
           sessions.delete(daemonPkZ);
+          // Without this the RTCPeerConnection + its ICE agent + its
+          // TURN allocation stay alive forever: the PC keeps sending
+          // STUN checks through the relay with its own stale ufrag,
+          // which the daemon discards as a mismatched-session, which
+          // in turn masks the real ICE state of any *new* dial.
+          try { session._pc.close(); } catch {}
+          try { session._dc.close(); } catch {}
         }
       });
     } catch (e) {
@@ -43,23 +56,46 @@ function getOrDialSession(daemonPkZ) {
   return pending;
 }
 
+// Uint8Array ↔ base64 helpers. chrome.runtime.sendMessage JSON-
+// serialises its payloads, which destroys `ArrayBuffer` / `Uint8Array`
+// into an empty `{}`. We therefore base64 the request + response
+// bytes as they cross the SW ↔ offscreen boundary.
+function bytesToBase64(u8) {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < u8.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || msg.kind !== "openhost-request") return false;
   (async () => {
     try {
       const session = await getOrDialSession(msg.daemonPkZ);
       const body =
-        msg.bodyBuf == null ? null : new Uint8Array(msg.bodyBuf);
+        msg.bodyB64 == null ? null : base64ToBytes(msg.bodyB64);
       const resp = await session.request(
         msg.method,
         msg.path,
         msg.headers || {},
         body,
       );
-      // `resp.body` is a Uint8Array view; pass its underlying buffer
-      // so structured-clone can transfer it without a copy.
-      const buf = resp.body instanceof Uint8Array ? resp.body.buffer : resp.body;
-      sendResponse({ head: resp.head, bodyBuf: buf });
+      const respBytes =
+        resp.body instanceof Uint8Array
+          ? resp.body
+          : new Uint8Array(resp.body || new ArrayBuffer(0));
+      sendResponse({
+        head: resp.head,
+        bodyB64: bytesToBase64(respBytes),
+      });
     } catch (err) {
       console.error("openhost offscreen: request failed", err);
       sendResponse({

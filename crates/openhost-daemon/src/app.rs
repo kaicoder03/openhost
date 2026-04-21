@@ -74,6 +74,7 @@ impl App {
         let listener =
             build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
         let turn = maybe_spawn_turn(&cfg, &identity, &state).await?;
+        wire_daemon_turn_client(&cfg, &identity, &listener);
         let (publisher, resolver) =
             publish::start(&cfg.pkarr, identity.clone(), state.clone()).await?;
         let poller = build_offer_poller(
@@ -534,6 +535,27 @@ async fn maybe_spawn_turn(
         "openhostd: TURN relay advertised in host record (v3)"
     );
     Ok(Some(handle))
+}
+
+/// If `[turn]` is enabled, tell the listener to also use the TURN
+/// relay as one of its ICE servers. The URL uses loopback so the
+/// daemon's ICE never tries to hairpin through NAT back to itself —
+/// it connects to the same TURN server directly over localhost.
+fn wire_daemon_turn_client(cfg: &Config, identity: &Arc<SigningKey>, listener: &Arc<PassivePeer>) {
+    if !cfg.turn.enabled {
+        return;
+    }
+    let bind_addr: std::net::SocketAddr = match cfg.turn.bind_addr.parse() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let url = format!("turn:127.0.0.1:{}", bind_addr.port());
+    let password = crate::turn_server::password_for_daemon(&identity.public_key());
+    listener.set_turn_local(url.clone(), password);
+    tracing::info!(
+        turn_local_url = %url,
+        "openhostd: listener will allocate a relay candidate via its own TURN"
+    );
 }
 
 /// Load the pairing DB into `state.allow`. Missing file = empty allow

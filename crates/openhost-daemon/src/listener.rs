@@ -159,6 +159,27 @@ fn sdp_to_answer_blob(sdp: &str) -> Result<AnswerBlob, ListenerError> {
         }
     }
 
+    // When TURN is enabled we gather host + srflx + relay, and the
+    // combined 3-candidate answer blob overflows the BEP44 1000-byte
+    // `v` cap after fragmentation overhead, causing eviction at
+    // publish time. Drop `host` candidates — they advertise the
+    // daemon's private LAN IP (10.0.1.50 on EC2) which no internet
+    // peer can reach anyway. The srflx + relay pair is what actually
+    // forms useful candidate pairs cross-network:
+    //   - srflx → client_srflx: direct UDP hole punch. Fastest path
+    //     when both NATs cooperate. The 2026-04-20 live-success case.
+    //   - relay → client_relay: the fallback when hole punch fails.
+    //     AWS NAT SNAT prevents relay-to-relay traversal via direct
+    //     TURN permissions, so this is a best-effort lane for
+    //     symmetric-NAT clients; a permission-free TURN variant is
+    //     a follow-up.
+    if candidates
+        .iter()
+        .any(|c| matches!(c.typ, CandidateType::Srflx | CandidateType::Relay))
+    {
+        candidates.retain(|c| c.typ != CandidateType::Host);
+    }
+
     Ok(AnswerBlob {
         ice_ufrag: ice_ufrag.ok_or(ListenerError::OfferParse("answer SDP missing a=ice-ufrag"))?,
         ice_pwd: ice_pwd.ok_or(ListenerError::OfferParse("answer SDP missing a=ice-pwd"))?,
@@ -233,16 +254,37 @@ mod sdp_blob_tests {
         assert_eq!(blob.ice_ufrag, "abcd");
         assert_eq!(blob.ice_pwd, "0123456789abcdefghij!@");
         assert_eq!(blob.setup, SetupRole::Passive);
-        // Expect exactly 2 candidates: the two component-1 IPv4 entries.
-        // Component-2 entries dropped, the IPv6 host dropped.
-        assert_eq!(blob.candidates.len(), 2);
-        assert!(matches!(blob.candidates[0].typ, CandidateType::Host));
-        assert!(matches!(blob.candidates[1].typ, CandidateType::Srflx));
+        // When the SDP contains srflx or relay, host candidates are
+        // dropped (they advertise a private LAN IP that no internet
+        // peer can reach anyway, and they eat BEP44 packet budget).
+        // The sample SDP has a component-1 srflx, so only that
+        // survives: host (10.0.0.5) dropped, component-2 dropped,
+        // IPv6 host dropped.
+        assert_eq!(blob.candidates.len(), 1);
+        assert!(matches!(blob.candidates[0].typ, CandidateType::Srflx));
         assert_eq!(
             blob.candidates[0].ip,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))
         );
-        assert_eq!(blob.candidates[0].port, 1000);
+        assert_eq!(blob.candidates[0].port, 2000);
+    }
+
+    #[test]
+    fn sdp_to_answer_blob_keeps_host_when_no_srflx_or_relay() {
+        // Regression guard: the host-drop heuristic should NOT fire
+        // when the SDP only advertises host candidates (e.g. a
+        // loopback integration test). Without it the answer would
+        // ship zero candidates and the client could never connect.
+        let host_only = "v=0\r\n\
+                         o=- 0 0 IN IP4 0.0.0.0\r\n\
+                         s=-\r\n\
+                         a=ice-ufrag:abcd\r\n\
+                         a=ice-pwd:0123456789abcdefghij!@\r\n\
+                         a=setup:passive\r\n\
+                         a=candidate:111 1 udp 2130706431 10.0.0.5 1000 typ host\r\n";
+        let blob = sdp_to_answer_blob(host_only).unwrap();
+        assert_eq!(blob.candidates.len(), 1);
+        assert!(matches!(blob.candidates[0].typ, CandidateType::Host));
     }
 
     #[test]
@@ -310,6 +352,15 @@ pub struct PassivePeer {
     /// without a `[forward]` config section stays serviceable as a
     /// pkarr-only host discovery target.
     forwarder: Option<Arc<Forwarder>>,
+    /// Local URL of the daemon's own embedded TURN server, if enabled.
+    /// When `Some`, `negotiate` adds a `turn:...` ICE server to the
+    /// peer connection so the daemon allocates its own relay candidate.
+    /// Both sides (client + daemon) having relay candidates makes TURN
+    /// permissions work correctly even in NAT-translated environments
+    /// (AWS EC2's NAT gateway SNATs egress, which breaks permissions
+    /// when the daemon's ICE sends from its private IP toward the
+    /// relay's public IP).
+    turn_local_url: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl PassivePeer {
@@ -372,7 +423,18 @@ impl PassivePeer {
             skip_ice_gather: Arc::new(AtomicBool::new(false)),
             binder,
             forwarder,
+            turn_local_url: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install a TURN server the daemon itself will use as an ICE
+    /// server, so it also allocates a relay candidate. Called by
+    /// [`App::build`] when `[turn] enabled = true`. `url` is typically
+    /// `turn:127.0.0.1:<port>` (loopback — no NAT in the way);
+    /// `password` is derived from the daemon's identity via
+    /// [`crate::turn_server::password_for_daemon`].
+    pub fn set_turn_local(&self, url: String, password: String) {
+        *self.turn_local_url.lock().expect("turn_local_url lock") = Some((url, password));
     }
 
     /// Override the channel-binding timeout. Tests shorten this so the
@@ -451,9 +513,30 @@ impl PassivePeer {
         offer_sdp: &str,
         binding_mode: BindingMode,
     ) -> Result<AnswerBlob, ListenerError> {
+        let mut ice_servers = default_stun_servers();
+        // When the daemon runs its own TURN relay (PR #42.2), wire it
+        // in as an ICE server so this PC gathers its own `relay`
+        // candidate. That avoids the EC2-NAT-gateway SNAT problem:
+        // without its own relay allocation, the daemon's packets to
+        // the client's relay candidate appear at the TURN server from
+        // the NAT gateway's IP (not the daemon's) and get dropped
+        // for "no permission installed". With both sides going
+        // through relay candidates, permissions line up.
+        if let Some((url, password)) = self
+            .turn_local_url
+            .lock()
+            .expect("turn_local_url lock")
+            .clone()
+        {
+            ice_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+                urls: vec![url],
+                username: crate::turn_server::TURN_USERNAME.to_string(),
+                credential: password,
+            });
+        }
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
-            ice_servers: default_stun_servers(),
+            ice_servers,
             ..Default::default()
         };
         let pc = Arc::new(self.api.new_peer_connection(config).await?);

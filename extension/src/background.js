@@ -106,16 +106,85 @@ function ensureOffscreen() {
 
 const OH_PATH_RE = /^\/oh\/([a-z0-9]{52})(\/.*)?$/i;
 
-self.addEventListener("fetch", (event) => {
+// Resolve the openhost scope a given fetch should be served against.
+// A page at `chrome-extension://<ext>/oh/<pk>/index.html` can make a
+// fetch to an absolute path like `/api/videos`, which the browser
+// resolves against the extension ORIGIN, not the page's directory —
+// so the resulting URL pops out of the `/oh/<pk>/` scope and 404s.
+// We fix that by inspecting the referrer: if the requesting page is
+// under `/oh/<pk>/`, we rewrite the fetch to be under the same pk's
+// scope too. This makes relative and absolute URLs both "just work"
+// the way a regular website would.
+function resolveOhScope(event) {
   const url = new URL(event.request.url);
-  if (url.origin !== self.location.origin) return;
-  const match = OH_PATH_RE.exec(url.pathname);
-  if (!match) return;
+  if (url.origin !== self.location.origin) return null;
 
-  const daemonPkZ = match[1].toLowerCase();
-  const path = (match[2] || "/") + (url.search || "");
-  event.respondWith(handleOhFetch(daemonPkZ, path, event.request));
+  const direct = OH_PATH_RE.exec(url.pathname);
+  if (direct) {
+    return {
+      daemonPkZ: direct[1].toLowerCase(),
+      path: (direct[2] || "/") + (url.search || ""),
+    };
+  }
+
+  // Referer-based rewrite for same-origin absolute paths.
+  const referrer = event.request.referrer;
+  if (!referrer) return null;
+  let refUrl;
+  try {
+    refUrl = new URL(referrer);
+  } catch {
+    return null;
+  }
+  if (refUrl.origin !== self.location.origin) return null;
+  const ref = OH_PATH_RE.exec(refUrl.pathname);
+  if (!ref) return null;
+  return {
+    daemonPkZ: ref[1].toLowerCase(),
+    path: url.pathname + (url.search || ""),
+  };
+}
+
+self.addEventListener("fetch", (event) => {
+  // Diagnostic: log every fetch the SW sees so we can tell whether
+  // Chrome is routing subresource / API fetches through us at all.
+  console.log(
+    "[sw-fetch]",
+    event.request.method,
+    event.request.url,
+    "referrer:",
+    event.request.referrer || "(none)",
+  );
+  const scope = resolveOhScope(event);
+  if (!scope) return;
+  event.respondWith(handleOhFetch(scope.daemonPkZ, scope.path, event.request));
 });
+
+// Take control of any already-open pages on install + activate so
+// subresource fetches from previously-loaded documents route through
+// this worker rather than going direct to Chrome's file handler.
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) =>
+  event.waitUntil(self.clients.claim()),
+);
+
+// Uint8Array ↔ base64 helpers mirror the offscreen side. See
+// offscreen.js for why we don't just pass ArrayBuffers through
+// chrome.runtime.sendMessage (JSON-serialisation eats them).
+function bytesToBase64(u8) {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < u8.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
 async function handleOhFetch(daemonPkZ, path, request) {
   try {
@@ -126,10 +195,10 @@ async function handleOhFetch(daemonPkZ, path, request) {
       if (k.toLowerCase() === "host") continue;
       headers[k] = v;
     }
-    const bodyBuf =
+    const bodyB64 =
       request.method === "GET" || request.method === "HEAD"
         ? null
-        : await request.arrayBuffer();
+        : bytesToBase64(new Uint8Array(await request.arrayBuffer()));
 
     const reply = await chrome.runtime.sendMessage({
       kind: "openhost-request",
@@ -137,8 +206,7 @@ async function handleOhFetch(daemonPkZ, path, request) {
       method: request.method,
       path,
       headers,
-      // Arbitrary structured-cloneable types; ArrayBuffer is transferable.
-      bodyBuf,
+      bodyB64,
     });
     if (!reply || reply.error) {
       throw new Error(reply ? reply.error : "offscreen: no reply");
@@ -154,7 +222,8 @@ async function handleOhFetch(daemonPkZ, path, request) {
 }
 
 function buildResponseFromOpenhost(reply) {
-  const { head = "", bodyBuf } = reply;
+  const { head = "", bodyB64 } = reply;
+  const bodyBuf = bodyB64 ? base64ToBytes(bodyB64) : null;
   const lines = head.split(/\r?\n/);
   const statusLine = lines[0] || "HTTP/1.1 200 OK";
   const m = /^HTTP\/\d\.\d\s+(\d+)\s*(.*)$/.exec(statusLine);

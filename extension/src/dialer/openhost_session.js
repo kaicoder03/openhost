@@ -64,13 +64,42 @@ export function parseOhUrl(ohUrl) {
 }
 
 export async function fetchHostPacket(daemonPkZ) {
+  const failures = [];
   for (const r of RELAYS) {
+    // Cache-buster query param forces Chrome to skip any cached
+    // opaque / empty-body CORS response and re-issue a preflight.
+    // Public pkarr relays either ignore unknown query params or
+    // accept them as a cache hint.
+    const url = `${r}/${daemonPkZ}?t=${Date.now()}`;
     try {
-      const resp = await fetch(`${r}/${daemonPkZ}`);
-      if (resp.ok) return new Uint8Array(await resp.arrayBuffer());
-    } catch {}
+      const resp = await fetch(url, {
+        mode: "cors",
+        credentials: "omit",
+        cache: "no-store",
+      });
+      if (!resp.ok) {
+        failures.push(`${r}: HTTP ${resp.status}`);
+        continue;
+      }
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      console.log(
+        `[fetchHostPacket] ${r} → HTTP ${resp.status}, type=${resp.type}, ${buf.length} bytes`,
+      );
+      if (buf.length === 0) {
+        // A 200 with empty body is almost always CORS stripping the
+        // payload from the view of `fetch()`. Don't pass it to WASM —
+        // the pkarr decoder then panics on truncated-packet bounds.
+        failures.push(`${r}: 200 OK but empty body (CORS strip?)`);
+        continue;
+      }
+      return buf;
+    } catch (err) {
+      failures.push(`${r}: ${err && err.message ? err.message : err}`);
+    }
   }
-  throw new Error(`no relay returned a packet for ${daemonPkZ}`);
+  throw new Error(
+    `no relay returned a usable packet for ${daemonPkZ}: ${failures.join("; ")}`,
+  );
 }
 
 // Per-install client identity. 32-byte Ed25519 seed lives in
@@ -151,28 +180,30 @@ export class OpenhostSession {
 // Full dial: resolve → seal + publish offer → poll answer → WebRTC
 // connect → cert-fp binding handshake → return a live session.
 export async function dialOhUrl(ohUrl, opts = {}) {
+  console.log("[dial] entering dialOhUrl");
   await ensureWasmInit();
+  console.log("[dial] A1 ensureWasmInit done");
   const { daemonPkZ, path } = parseOhUrl(ohUrl);
   const nowTsBig = BigInt(Math.floor(Date.now() / 1000));
+  console.log("[dial] A2 parsed URL, daemonPkZ=", daemonPkZ);
 
   // 1. Resolve + verify host record.
   const hostPacket = await fetchHostPacket(daemonPkZ);
+  console.log("[dial] A3 fetched host packet,", hostPacket.length, "bytes");
   const hostRecord = decode_and_verify(hostPacket, daemonPkZ, nowTsBig);
+  console.log("[dial] A4 decode_and_verify OK, record.version=", hostRecord.version);
   if (hostRecord.pubkey_zbase32 !== daemonPkZ) {
-    // decode_and_verify already passed, so this is belt-and-suspenders —
-    // the WASM layer pins the pubkey it was asked about into the DTO.
-    // A mismatch here means something upstream re-shaped the struct.
     throw new Error(
       `host-record pubkey mismatch: asked ${daemonPkZ}, got ${hostRecord.pubkey_zbase32}`,
     );
   }
   const daemonSalt = hexToBytes(hostRecord.salt_hex);
+  console.log("[dial] A5 salt parsed");
 
   // 2. Client identity.
   const clientSeed = await loadOrCreateClientSeed();
+  console.log("[dial] A6 loadOrCreateClientSeed OK, seed bytes=", clientSeed.length);
   const clientPkZ = client_pubkey_from_seed(clientSeed);
-  // Dev diagnostic: surface the per-install client pubkey so operators
-  // of a host daemon can add it to their `watched_clients` allowlist.
   console.log("openhost dialer: client_pubkey_zbase32 =", clientPkZ);
 
   // 3. Build RTCPeerConnection + data channel. When the resolved
@@ -198,56 +229,70 @@ export async function dialOhUrl(ohUrl, opts = {}) {
   }
   const pc = new RTCPeerConnection({ iceServers });
   const dc = pc.createDataChannel("openhost", { ordered: true });
-  const reader = new FrameReader();
-  dc.binaryType = "arraybuffer";
-  dc.onmessage = e => reader.push(e.data);
-  dc.onerror = e => reader.fail(new Error(`DC error: ${e}`));
+  // RAII-style teardown: any exception after this point MUST close the
+  // PC + DC, otherwise the ICE agent keeps running in the background
+  // forever (sending STUN checks to the daemon via the TURN relay,
+  // confusing future dials with stale-ufrag traffic).
+  let teardown = () => {
+    try { pc.close(); } catch {}
+    try { dc.close(); } catch {}
+  };
+  try {
+    const reader = new FrameReader();
+    dc.binaryType = "arraybuffer";
+    dc.onmessage = e => reader.push(e.data);
+    dc.onerror = e => reader.fail(new Error(`DC error: ${e}`));
 
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await waitForIceComplete(pc);
-  const offerSdp = pc.localDescription.sdp;
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceComplete(pc);
+    const offerSdp = pc.localDescription.sdp;
 
-  // 4. Seal + publish offer.
-  const sealed = seal_offer(daemonPkZ, clientPkZ, offerSdp, BINDING_MODE_CERT_FP);
-  const packet = build_offer_packet(clientSeed, daemonPkZ, sealed, BigInt(Math.floor(Date.now() / 1000)));
-  await publishOfferPacket(clientPkZ, packet);
+    // 4. Seal + publish offer.
+    console.log("[dial] A7 offer SDP ready,", offerSdp.length, "chars");
+    const sealed = seal_offer(daemonPkZ, clientPkZ, offerSdp, BINDING_MODE_CERT_FP);
+    console.log("[dial] A8 seal_offer OK");
+    const packet = build_offer_packet(clientSeed, daemonPkZ, sealed, BigInt(Math.floor(Date.now() / 1000)));
+    console.log("[dial] A9 build_offer_packet OK");
+    await publishOfferPacket(clientPkZ, packet);
+    console.log("[dial] A10 publishOfferPacket done");
 
-  // 5. Poll answer fragments on the daemon's zone. The host's DTLS
-  // fingerprint was already verified under the BEP44 signature during
-  // step 1; threading it here lets the v2 compact-blob branch
-  // reconstruct the full SDP locally.
-  const answerSdp = await pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed,
-                                       hostDtlsFpHex: hostRecord.dtls_fingerprint_hex,
-                                       timeoutMs: opts.answerTimeoutMs ?? 30_000 });
+    // 5. Poll answer fragments on the daemon's zone.
+    const answerSdp = await pollAnswer({ daemonPkZ, daemonSalt, clientPkZ, clientSeed,
+                                         hostDtlsFpHex: hostRecord.dtls_fingerprint_hex,
+                                         timeoutMs: opts.answerTimeoutMs ?? 30_000 });
 
-  // 6. Apply answer + wait for DTLS Connected.
-  await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-  await waitForPcConnected(pc, opts.connectTimeoutMs ?? 45_000);
-  await waitForDcOpen(dc, opts.connectTimeoutMs ?? 45_000);
+    // 6. Apply answer + wait for DTLS Connected.
+    await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    await waitForPcConnected(pc, opts.connectTimeoutMs ?? 45_000);
+    await waitForDcOpen(dc, opts.connectTimeoutMs ?? 45_000);
 
-  // 7. Channel-binding handshake.
-  const nonceFrame = await reader.next(opts.bindingTimeoutMs ?? 10_000);
-  if (nonceFrame.frame_type !== FRAME.AUTH_NONCE) {
-    throw new Error(`expected AUTH_NONCE, got 0x${nonceFrame.frame_type.toString(16)}`);
+    // 7. Channel-binding handshake.
+    const nonceFrame = await reader.next(opts.bindingTimeoutMs ?? 10_000);
+    if (nonceFrame.frame_type !== FRAME.AUTH_NONCE) {
+      throw new Error(`expected AUTH_NONCE, got 0x${nonceFrame.frame_type.toString(16)}`);
+    }
+    const nonce = new Uint8Array(nonceFrame.payload);
+    const certDer = await readRemoteCertDer(pc);
+    const authBytes = compute_cert_fp_binding(certDer, daemonPkZ, clientPkZ, nonce);
+    const authClientPayload = sign_auth_client(clientSeed, authBytes);
+    dc.send(encode_frame(FRAME.AUTH_CLIENT, Array.from(authClientPayload)));
+
+    const hostFrame = await reader.next(opts.bindingTimeoutMs ?? 10_000);
+    if (hostFrame.frame_type !== FRAME.AUTH_HOST) {
+      throw new Error(`expected AUTH_HOST, got 0x${hostFrame.frame_type.toString(16)}`);
+    }
+    const ok = verify_auth_host(daemonPkZ, authBytes, new Uint8Array(hostFrame.payload));
+    if (!ok) {
+      throw new Error("AUTH_HOST signature did not verify — aborting session");
+    }
+
+    // Session handed off to caller; they own teardown.
+    teardown = () => {};
+    return new OpenhostSession({ pc, dc, reader, hostRecord, clientPkZ, daemonPkZ });
+  } finally {
+    teardown();
   }
-  const nonce = new Uint8Array(nonceFrame.payload);
-  const certDer = await readRemoteCertDer(pc);
-  const authBytes = compute_cert_fp_binding(certDer, daemonPkZ, clientPkZ, nonce);
-  const authClientPayload = sign_auth_client(clientSeed, authBytes);
-  dc.send(encode_frame(FRAME.AUTH_CLIENT, Array.from(authClientPayload)));
-
-  const hostFrame = await reader.next(opts.bindingTimeoutMs ?? 10_000);
-  if (hostFrame.frame_type !== FRAME.AUTH_HOST) {
-    throw new Error(`expected AUTH_HOST, got 0x${hostFrame.frame_type.toString(16)}`);
-  }
-  const ok = verify_auth_host(daemonPkZ, authBytes, new Uint8Array(hostFrame.payload));
-  if (!ok) {
-    pc.close();
-    throw new Error("AUTH_HOST signature did not verify — aborting session");
-  }
-
-  return new OpenhostSession({ pc, dc, reader, hostRecord, clientPkZ, daemonPkZ });
 }
 
 // ---- helpers ----

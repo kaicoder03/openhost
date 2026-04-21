@@ -53,6 +53,16 @@ pub mod core;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
+/// Install a panic hook that writes every Rust panic as a
+/// `console.error` in the host JS context. Without this, a panicking
+/// `#[wasm_bindgen]` export surfaces to JS as the generic
+/// `RuntimeError: unreachable` with no message, defeating
+/// diagnostics. Idempotent — hookless harm if called many times.
+#[wasm_bindgen(start)]
+pub fn init_panic_hook() {
+    console_error_panic_hook::set_once();
+}
+
 fn to_js<T: Serialize + ?Sized>(value: &T) -> Result<JsValue, JsError> {
     serde_wasm_bindgen::to_value(value)
         .map_err(|e| JsError::new(&format!("JS serialization failed: {e}")))
