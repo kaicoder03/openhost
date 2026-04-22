@@ -291,9 +291,9 @@ mod tests {
         // FSEvents (macOS) sometimes fires a "initial crawl" event on the
         // parent directory when we start watching. Drain any start-up
         // events so they don't look like sibling-fire regressions.
-        while let Ok(Some(())) = tokio::time::timeout(Duration::from_millis(200), watcher.recv()).await
-        {
-        }
+        while let Ok(Some(())) =
+            tokio::time::timeout(Duration::from_millis(200), watcher.recv()).await
+        {}
 
         fs::write(&sibling, b"unrelated").unwrap();
 
