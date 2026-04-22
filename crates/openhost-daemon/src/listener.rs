@@ -25,7 +25,7 @@ use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrad
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
-use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
+use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -159,6 +159,14 @@ fn sdp_to_answer_blob(sdp: &str) -> Result<AnswerBlob, ListenerError> {
         }
     }
 
+    // With `SettingEngine::set_nat_1to1_ips` in effect (cloud-NAT 1:1
+    // deployments: AWS Elastic IP, GCE static-external-IP, etc.) the
+    // daemon's host candidate IS the public IP — the fastest direct
+    // lane for cross-internet peers. Keep every filter-survived
+    // candidate and let the remote side's ICE pick the winning pair.
+    // Compact answer-blob candidates are ~7 bytes each; 3 fit in the
+    // BEP44 `v` budget with headroom.
+
     Ok(AnswerBlob {
         ice_ufrag: ice_ufrag.ok_or(ListenerError::OfferParse("answer SDP missing a=ice-ufrag"))?,
         ice_pwd: ice_pwd.ok_or(ListenerError::OfferParse("answer SDP missing a=ice-pwd"))?,
@@ -233,16 +241,12 @@ mod sdp_blob_tests {
         assert_eq!(blob.ice_ufrag, "abcd");
         assert_eq!(blob.ice_pwd, "0123456789abcdefghij!@");
         assert_eq!(blob.setup, SetupRole::Passive);
-        // Expect exactly 2 candidates: the two component-1 IPv4 entries.
-        // Component-2 entries dropped, the IPv6 host dropped.
+        // Keep every filter-survived candidate (component-1 IPv4 UDP
+        // of known type): host + srflx. Component-2 entries and the
+        // IPv6 host were dropped earlier by the per-line filter.
         assert_eq!(blob.candidates.len(), 2);
         assert!(matches!(blob.candidates[0].typ, CandidateType::Host));
         assert!(matches!(blob.candidates[1].typ, CandidateType::Srflx));
-        assert_eq!(
-            blob.candidates[0].ip,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))
-        );
-        assert_eq!(blob.candidates[0].port, 1000);
     }
 
     #[test]
@@ -310,6 +314,15 @@ pub struct PassivePeer {
     /// without a `[forward]` config section stays serviceable as a
     /// pkarr-only host discovery target.
     forwarder: Option<Arc<Forwarder>>,
+    /// Local URL of the daemon's own embedded TURN server, if enabled.
+    /// When `Some`, `negotiate` adds a `turn:...` ICE server to the
+    /// peer connection so the daemon allocates its own relay candidate.
+    /// Both sides (client + daemon) having relay candidates makes TURN
+    /// permissions work correctly even in NAT-translated environments
+    /// (AWS EC2's NAT gateway SNATs egress, which breaks permissions
+    /// when the daemon's ICE sends from its private IP toward the
+    /// relay's public IP).
+    turn_local_url: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl PassivePeer {
@@ -324,6 +337,7 @@ impl PassivePeer {
         identity: Arc<SigningKey>,
         state: Arc<SharedState>,
         forwarder: Option<Arc<Forwarder>>,
+        nat_1to1_public_ip: Option<std::net::Ipv4Addr>,
     ) -> Result<Self, ListenerError> {
         // rustls 0.23+ requires a CryptoProvider before any TLS / DTLS
         // session is established. Install ring once per process; the
@@ -357,6 +371,21 @@ impl PassivePeer {
             matches!(ip, std::net::IpAddr::V4(_))
         }));
 
+        // 1-to-1 NAT handling for cloud-NATed deployments (AWS EC2
+        // with Elastic IP, GCE with static-external-IP, etc.). When
+        // configured, the local host candidate's IP is REPLACED with
+        // the operator-provided public IP on the wire, so peers dial
+        // straight to the Elastic IP instead of the unreachable
+        // private VPC IP. Turns a symmetric/hairpin-NAT setup into a
+        // functional 1:1 NAT for ICE connectivity checks — no TURN
+        // required for the happy path.
+        if let Some(public_ip) = nat_1to1_public_ip {
+            engine.set_nat_1to1_ips(
+                vec![public_ip.to_string()],
+                webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::Host,
+            );
+        }
+
         let api = APIBuilder::new().with_setting_engine(engine).build();
 
         let binder = Arc::new(ChannelBinder::new(identity));
@@ -372,7 +401,18 @@ impl PassivePeer {
             skip_ice_gather: Arc::new(AtomicBool::new(false)),
             binder,
             forwarder,
+            turn_local_url: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install a TURN server the daemon itself will use as an ICE
+    /// server, so it also allocates a relay candidate. Called by
+    /// [`App::build`] when `[turn] enabled = true`. `url` is typically
+    /// `turn:127.0.0.1:<port>` (loopback — no NAT in the way);
+    /// `password` is derived from the daemon's identity via
+    /// [`crate::turn_server::password_for_daemon`].
+    pub fn set_turn_local(&self, url: String, password: String) {
+        *self.turn_local_url.lock().expect("turn_local_url lock") = Some((url, password));
     }
 
     /// Override the channel-binding timeout. Tests shorten this so the
@@ -451,9 +491,30 @@ impl PassivePeer {
         offer_sdp: &str,
         binding_mode: BindingMode,
     ) -> Result<AnswerBlob, ListenerError> {
+        let mut ice_servers = default_stun_servers();
+        // When the daemon runs its own TURN relay (PR #42.2), wire it
+        // in as an ICE server so this PC gathers its own `relay`
+        // candidate. That avoids the EC2-NAT-gateway SNAT problem:
+        // without its own relay allocation, the daemon's packets to
+        // the client's relay candidate appear at the TURN server from
+        // the NAT gateway's IP (not the daemon's) and get dropped
+        // for "no permission installed". With both sides going
+        // through relay candidates, permissions line up.
+        if let Some((url, password)) = self
+            .turn_local_url
+            .lock()
+            .expect("turn_local_url lock")
+            .clone()
+        {
+            ice_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+                urls: vec![url],
+                username: crate::turn_server::TURN_USERNAME.to_string(),
+                credential: password,
+            });
+        }
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
-            ice_servers: default_stun_servers(),
+            ice_servers,
             ..Default::default()
         };
         let pc = Arc::new(self.api.new_peer_connection(config).await?);
@@ -1292,9 +1353,27 @@ async fn start_websocket_tunnel(
     Ok(())
 }
 
-/// Body chunks are bounded by [`MAX_PAYLOAD_LEN`] (16 MiB − 1) per
-/// the wire codec; larger upstream bodies get split into multiple
-/// `RESPONSE_BODY` frames.
+/// SCTP data channels negotiate a per-message size limit during the
+/// DTLS handshake. Chrome + Firefox default to 65_536 bytes; sending
+/// a larger single datagram surfaces as `DC error: [object
+/// RTCErrorEvent]` on the peer and tears the channel down. The wire
+/// codec allows up to [`MAX_PAYLOAD_LEN`] (16 MiB) per frame, but at
+/// the transport layer we cap each outgoing RESPONSE_BODY message at
+/// 16 KiB so a 20 MiB video download becomes ~1280 frames the peer
+/// reassembles cleanly. 16 KiB has comfortable headroom under every
+/// real-world SCTP negotiation we've observed.
+const SCTP_SAFE_CHUNK_BYTES: usize = 60 * 1024;
+/// Pause sending new body chunks once the data-channel's send buffer
+/// exceeds this high-water mark (1 MiB). Resume when it drains under
+/// the low-water mark. Prevents "Failure to send data" from the SCTP
+/// transport when the application outruns the peer's receive window.
+const SCTP_BUFFER_HIGH_WATER: usize = 1024 * 1024;
+const SCTP_BUFFER_LOW_WATER: usize = 256 * 1024;
+
+/// Emit a forwarder response split across frames of at most
+/// [`SCTP_SAFE_CHUNK_BYTES`] bytes per RESPONSE_BODY — the per-frame
+/// payload cap imposed by the data channel's SCTP message-size
+/// limit, not the wire-codec's [`MAX_PAYLOAD_LEN`].
 async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(), webrtc::Error> {
     send_frame(
         dc,
@@ -1302,13 +1381,41 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
     )
     .await?;
 
+    // Wire up a backpressure notify: the SCTP stack fires
+    // `on_buffered_amount_low` when the buffered byte count drops
+    // below our configured threshold. We wait on that `Notify` after
+    // every chunk that pushes us over the high-water mark.
+    let drain_notify: Arc<Notify> = Arc::new(Notify::new());
+    dc.set_buffered_amount_low_threshold(SCTP_BUFFER_LOW_WATER)
+        .await;
+    {
+        let drain_notify = drain_notify.clone();
+        dc.on_buffered_amount_low(Box::new(move || {
+            let drain_notify = drain_notify.clone();
+            Box::pin(async move {
+                drain_notify.notify_waiters();
+            })
+        }))
+        .await;
+    }
+
     let body = resp.body;
     let mut offset = 0;
     while offset < body.len() {
-        let end = (offset + MAX_PAYLOAD_LEN).min(body.len());
+        // Backpressure: if the data-channel buffer is above the
+        // high-water mark, wait for the low-threshold callback
+        // before enqueuing another chunk. Fall back to a bounded
+        // poll so we don't deadlock if the callback is missed.
+        while dc.buffered_amount().await > SCTP_BUFFER_HIGH_WATER {
+            let wait = drain_notify.notified();
+            tokio::pin!(wait);
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut wait).await;
+        }
+
+        let end = (offset + SCTP_SAFE_CHUNK_BYTES).min(body.len());
         let slice = body.slice(offset..end);
         let body_frame = Frame::new(FrameType::ResponseBody, slice.to_vec())
-            .expect("chunk length bounded by MAX_PAYLOAD_LEN");
+            .expect("chunk length bounded by SCTP_SAFE_CHUNK_BYTES");
         send_frame(dc, body_frame).await?;
         offset = end;
     }

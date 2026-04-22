@@ -5,6 +5,31 @@
 
 import { dialOhUrl } from "./dialer/openhost_session.js";
 
+// Forward every console.log in this offscreen doc over to the SW so
+// it shows up in SW DevTools (or in any tool listening to the SW
+// console — Playwright, for instance). Offscreen docs don't surface
+// as pages in most automation APIs, so without this the whole dial
+// flow is opaque from outside.
+(function forwardLogs() {
+  const levels = ["log", "info", "warn", "error"];
+  for (const lvl of levels) {
+    const orig = console[lvl].bind(console);
+    console[lvl] = (...args) => {
+      try {
+        chrome.runtime.sendMessage({
+          kind: "openhost-log",
+          level: lvl,
+          args: args.map((a) => {
+            try { return typeof a === "string" ? a : JSON.stringify(a); }
+            catch { return String(a); }
+          }),
+        }).catch(() => {});
+      } catch {}
+      orig(...args);
+    };
+  }
+})();
+
 console.log("openhost offscreen: booted, awaiting SW requests");
 
 // sessions: Map<daemonPkZ, Promise<OpenhostSession>>.
@@ -29,8 +54,26 @@ function getOrDialSession(daemonPkZ) {
     try {
       session._pc.addEventListener("connectionstatechange", () => {
         const s = session._pc.connectionState;
-        if (s === "failed" || s === "closed" || s === "disconnected") {
+        // `disconnected` is transient — ICE consent-freshness can hiccup
+        // and recover. Only treat `failed`/`closed` as terminal. Killing
+        // a "disconnected" PC racing a real request would stall that
+        // request until its (absent) timeout fires.
+        if (s === "failed" || s === "closed") {
+          console.log(
+            "openhost offscreen: PC transitioned to",
+            s,
+            "— closing + evicting",
+            daemonPkZ,
+          );
           sessions.delete(daemonPkZ);
+          try { session._pc.close(); } catch {}
+          try { session._dc.close(); } catch {}
+        } else {
+          console.log(
+            "openhost offscreen: PC state=",
+            s,
+            "(not evicting)",
+          );
         }
       });
     } catch (e) {
@@ -43,23 +86,46 @@ function getOrDialSession(daemonPkZ) {
   return pending;
 }
 
+// Uint8Array ↔ base64 helpers. chrome.runtime.sendMessage JSON-
+// serialises its payloads, which destroys `ArrayBuffer` / `Uint8Array`
+// into an empty `{}`. We therefore base64 the request + response
+// bytes as they cross the SW ↔ offscreen boundary.
+function bytesToBase64(u8) {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < u8.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || msg.kind !== "openhost-request") return false;
   (async () => {
     try {
       const session = await getOrDialSession(msg.daemonPkZ);
       const body =
-        msg.bodyBuf == null ? null : new Uint8Array(msg.bodyBuf);
+        msg.bodyB64 == null ? null : base64ToBytes(msg.bodyB64);
       const resp = await session.request(
         msg.method,
         msg.path,
         msg.headers || {},
         body,
       );
-      // `resp.body` is a Uint8Array view; pass its underlying buffer
-      // so structured-clone can transfer it without a copy.
-      const buf = resp.body instanceof Uint8Array ? resp.body.buffer : resp.body;
-      sendResponse({ head: resp.head, bodyBuf: buf });
+      const respBytes =
+        resp.body instanceof Uint8Array
+          ? resp.body
+          : new Uint8Array(resp.body || new ArrayBuffer(0));
+      sendResponse({
+        head: resp.head,
+        bodyB64: bytesToBase64(respBytes),
+      });
     } catch (err) {
       console.error("openhost offscreen: request failed", err);
       sendResponse({

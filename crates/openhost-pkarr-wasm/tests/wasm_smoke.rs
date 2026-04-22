@@ -431,3 +431,81 @@ fn encode_decode_frame_roundtrip_and_partial_buffer_is_none() {
     let err = core::encode_frame(0xEE, vec![]).expect_err("unknown type rejected");
     assert!(matches!(err, core::Error::Frame(_)));
 }
+
+#[test]
+fn live_v3_packet_decodes() {
+    // Reproduces PR #42.4's browser-side panic natively: feed the same
+    // bytes the EC2 daemon published to pkarr into `decode_and_verify`
+    // and let any Rust panic surface with a message.
+    let bytes = match std::fs::read("/tmp/pkarr-live.bin") {
+        Ok(b) => b,
+        Err(_) => return, // skip if the fixture isn't staged locally
+    };
+    let daemon_pk = "zw4gsnobuzddia4cr4amiwoued7ep183protpexymn4oroanb8ro";
+    // Use a generous `now_ts` so freshness can't be what kills us.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = openhost_pkarr_wasm::core::decode_and_verify(&bytes, daemon_pk, now);
+    match result {
+        Ok(hr) => {
+            println!(
+                "decoded: version={} turn_ip={:?} turn_port={:?}",
+                hr.version, hr.turn_ip, hr.turn_port
+            );
+        }
+        Err(e) => panic!("decode_and_verify returned Err: {e}"),
+    }
+}
+
+#[test]
+fn live_seal_offer_reproduces_browser_flow() {
+    // Walk the same sequence the offscreen dialer does, native-side,
+    // to find which WASM call panics in the browser.
+    let bytes = match std::fs::read("/tmp/pkarr-live.bin") {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let daemon_pk = "zw4gsnobuzddia4cr4amiwoued7ep183protpexymn4oroanb8ro";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Step A: decode_and_verify.
+    let hr = openhost_pkarr_wasm::core::decode_and_verify(&bytes, daemon_pk, now)
+        .expect("decode_and_verify");
+    println!("A: decode_and_verify OK version={}", hr.version);
+
+    // Step B: client identity.
+    let client_seed = [0x77u8; 32];
+    let client_pk_z = openhost_pkarr_wasm::core::client_pubkey_from_seed(&client_seed)
+        .expect("client_pubkey_from_seed");
+    println!("B: client_pubkey_from_seed OK → {}", client_pk_z);
+
+    // Step C: seal_offer (the big one — this is what the dialer calls
+    // once the SDP is ready).
+    let fake_sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
+                    a=ice-ufrag:abcd\r\na=ice-pwd:abcdefghijklmnopqrstuvwxyz\r\n\
+                    a=setup:actpass\r\na=fingerprint:sha-256 \
+                    11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:\
+                    11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+                    m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                    c=IN IP4 0.0.0.0\r\na=mid:0\r\n\
+                    a=candidate:1 1 udp 100 192.168.1.154 54482 typ host\r\n";
+    let sealed = openhost_pkarr_wasm::core::seal_offer(daemon_pk, &client_pk_z, fake_sdp, 0x02)
+        .expect("seal_offer");
+    println!("C: seal_offer OK sealed_len={}", sealed.len());
+
+    // Step D: build_offer_packet — the next WASM call.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    match openhost_pkarr_wasm::core::build_offer_packet(&client_seed, daemon_pk, &sealed, now_secs)
+    {
+        Ok(pkt) => println!("D: build_offer_packet OK packet_len={}", pkt.len()),
+        Err(e) => panic!("D: build_offer_packet err: {e}"),
+    }
+}

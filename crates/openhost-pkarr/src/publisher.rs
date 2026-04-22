@@ -97,6 +97,21 @@ impl Transport for PkarrTransport {
     }
 }
 
+/// Is this error variant the "relay's stored seq doesn't match our
+/// claimed CAS" form of concurrency failure? Returned when our local
+/// `last_seq` has drifted out of sync with the relay (e.g. daemon
+/// restart after relay accepted a publish our in-memory state never
+/// observed). The publisher retries such failures unconditionally.
+fn is_cas_failed(err: &PkarrError) -> bool {
+    use pkarr::errors::{ConcurrencyError, PublishError};
+    matches!(
+        err,
+        PkarrError::Publish(PublishError::Concurrency(
+            ConcurrencyError::CasFailed | ConcurrencyError::NotMostRecent,
+        )),
+    )
+}
+
 /// Produces a fresh `OpenhostRecord` each time the publisher fires.
 ///
 /// Typed as a boxed `FnMut` so callers can close over mutable state (e.g. the
@@ -302,7 +317,23 @@ impl Publisher {
         let cas = self
             .last_seq
             .map(|s| Timestamp::from(s * codec::MICROS_PER_SECOND));
-        self.transport.publish(&packet, cas).await?;
+        match self.transport.publish(&packet, cas).await {
+            Ok(()) => {}
+            Err(err) if cas.is_some() && is_cas_failed(&err) => {
+                // Local `last_seq` diverged from what the relay stores
+                // (e.g. the daemon restarted while the relay still
+                // holds a higher seq from a previous run, or pkarr's
+                // internal retry stored a slightly-bumped seq our
+                // counter didn't track). Re-issue unconditionally:
+                // our seq is `now_secs * 1e6` so the relay's freshness
+                // check still protects against true rollback.
+                tracing::warn!(
+                    "openhost-pkarr: CAS conflict on republish; retrying unconditionally",
+                );
+                self.transport.publish(&packet, None).await?;
+            }
+            Err(err) => return Err(err),
+        }
         self.last_seq = Some(ts);
         Ok(ts)
     }

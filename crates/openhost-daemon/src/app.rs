@@ -71,9 +71,22 @@ impl App {
         let pair_db_path = resolve_pair_db_path(&cfg);
         load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
-        let listener =
-            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+        // When the operator sets `[turn] public_ip` (typically the
+        // host's cloud Elastic IP), we also use it as the 1-to-1 NAT
+        // hint on the WebRTC ICE agent — host candidates get rewritten
+        // to this IP on the wire, so remote peers dial straight there
+        // instead of the unreachable private VPC IP.
+        let nat_public_ip = if cfg.turn.enabled { cfg.turn.public_ip } else { None };
+        let listener = build_listener(
+            &cert,
+            identity.clone(),
+            state.clone(),
+            forwarder.clone(),
+            nat_public_ip,
+        )
+        .await?;
         let turn = maybe_spawn_turn(&cfg, &identity, &state).await?;
+        wire_daemon_turn_client(&cfg, &identity, &listener);
         let (publisher, resolver) =
             publish::start(&cfg.pkarr, identity.clone(), state.clone()).await?;
         let poller = build_offer_poller(
@@ -111,7 +124,7 @@ impl App {
         load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
         let listener =
-            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone(), None).await?;
         let publisher =
             publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
         let pair_watcher = crate::pair_watcher::PairWatcher::spawn(
@@ -145,7 +158,7 @@ impl App {
         load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
         let listener =
-            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone(), None).await?;
         let publisher =
             publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
         let poller = build_offer_poller(
@@ -392,6 +405,7 @@ async fn build_listener(
     identity: Arc<SigningKey>,
     state: Arc<SharedState>,
     forwarder: Option<Arc<Forwarder>>,
+    nat_1to1_public_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<Arc<PassivePeer>> {
     let peer = PassivePeer::new(
         cert.certificate.clone(),
@@ -399,6 +413,7 @@ async fn build_listener(
         identity,
         state,
         forwarder,
+        nat_1to1_public_ip,
     )
     .await?;
     Ok(Arc::new(peer))
@@ -534,6 +549,27 @@ async fn maybe_spawn_turn(
         "openhostd: TURN relay advertised in host record (v3)"
     );
     Ok(Some(handle))
+}
+
+/// If `[turn]` is enabled, tell the listener to also use the TURN
+/// relay as one of its ICE servers. The URL uses loopback so the
+/// daemon's ICE never tries to hairpin through NAT back to itself —
+/// it connects to the same TURN server directly over localhost.
+fn wire_daemon_turn_client(cfg: &Config, identity: &Arc<SigningKey>, listener: &Arc<PassivePeer>) {
+    if !cfg.turn.enabled {
+        return;
+    }
+    let bind_addr: std::net::SocketAddr = match cfg.turn.bind_addr.parse() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let url = format!("turn:127.0.0.1:{}", bind_addr.port());
+    let password = crate::turn_server::password_for_daemon(&identity.public_key());
+    listener.set_turn_local(url.clone(), password);
+    tracing::info!(
+        turn_local_url = %url,
+        "openhostd: listener will allocate a relay candidate via its own TURN"
+    );
 }
 
 /// Load the pairing DB into `state.allow`. Missing file = empty allow

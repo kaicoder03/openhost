@@ -23,7 +23,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["viewer.html", "src/*", "wasm/pkg/*", "oh/*"],
+      "resources": ["*", "**/*"],
       "matches": ["<all_urls>"]
     }
   ],

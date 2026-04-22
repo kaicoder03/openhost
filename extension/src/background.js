@@ -88,7 +88,7 @@ function ensureOffscreen() {
     try {
       await chrome.offscreen.createDocument({
         url: OFFSCREEN_URL,
-        reasons: ["USER_MEDIA"],
+        reasons: ["WEB_RTC"],
         justification:
           "openhost holds a long-lived WebRTC session to the home daemon",
       });
@@ -106,16 +106,144 @@ function ensureOffscreen() {
 
 const OH_PATH_RE = /^\/oh\/([a-z0-9]{52})(\/.*)?$/i;
 
+// Resolve the openhost scope a given fetch should be served against.
+// A page at `chrome-extension://<ext>/oh/<pk>/index.html` can make a
+// fetch to an absolute path like `/api/videos`, which the browser
+// resolves against the extension ORIGIN, not the page's directory —
+// so the resulting URL pops out of the `/oh/<pk>/` scope and 404s.
+// We fix that by looking up the requesting page via `event.clientId`
+// (the standard SW API; extensions strip Referer by default so we
+// can't rely on `event.request.referrer`). If the client's URL is
+// under `/oh/<pk>/`, the fetch is rewritten back into the same pk's
+// scope. Makes relative and absolute URLs both "just work".
+async function resolveOhScope(event) {
+  const url = new URL(event.request.url);
+  if (url.origin !== self.location.origin) return null;
+
+  const direct = OH_PATH_RE.exec(url.pathname);
+  if (direct) {
+    return {
+      daemonPkZ: direct[1].toLowerCase(),
+      path: (direct[2] || "/") + (url.search || ""),
+    };
+  }
+
+  // Client-based rewrite for same-origin absolute paths. The client
+  // is the page (Window) that issued the fetch; its URL tells us
+  // which `/oh/<pk>/` scope the page is living in.
+  const clientId = event.clientId || event.resultingClientId;
+  if (!clientId) return null;
+  let client;
+  try {
+    client = await self.clients.get(clientId);
+  } catch {
+    return null;
+  }
+  if (!client) return null;
+
+  let clientUrl;
+  try {
+    clientUrl = new URL(client.url);
+  } catch {
+    return null;
+  }
+  if (clientUrl.origin !== self.location.origin) return null;
+  const scope = OH_PATH_RE.exec(clientUrl.pathname);
+  if (!scope) return null;
+  return {
+    daemonPkZ: scope[1].toLowerCase(),
+    path: url.pathname + (url.search || ""),
+  };
+}
+
 self.addEventListener("fetch", (event) => {
+  // Diagnostic: log every fetch the SW sees so we can tell whether
+  // Chrome is routing subresource / API fetches through us at all.
+  console.log(
+    "[sw-fetch]",
+    event.request.method,
+    event.request.url,
+    "mode:",
+    event.request.mode,
+    "dest:",
+    event.request.destination,
+    "clientId:",
+    event.clientId || "(none)",
+  );
+
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
-  const match = OH_PATH_RE.exec(url.pathname);
-  if (!match) return;
 
-  const daemonPkZ = match[1].toLowerCase();
-  const path = (match[2] || "/") + (url.search || "");
-  event.respondWith(handleOhFetch(daemonPkZ, path, event.request));
+  // Navigations (top-level document loads + offscreen document
+  // creation) that aren't under `/oh/<pk>/...` MUST be left to
+  // Chrome's native handler. Calling respondWith on the offscreen
+  // document's fetch stalls `chrome.offscreen.createDocument`, which
+  // deadlocks the whole dial flow.
+  if (
+    event.request.mode === "navigate" &&
+    !OH_PATH_RE.test(url.pathname)
+  ) {
+    return;
+  }
+
+  // Sync fast path: URL is under our scope, claim it.
+  if (OH_PATH_RE.test(url.pathname)) {
+    event.respondWith(
+      (async () => {
+        const scope = await resolveOhScope(event);
+        return handleOhFetch(scope.daemonPkZ, scope.path, event.request);
+      })(),
+    );
+    return;
+  }
+
+  // Subresource fetches (mode != "navigate") to same-origin paths
+  // not under `/oh/<pk>/` — these are `fetch('/api/...')` from a
+  // rendered openhost page. Look up the requesting client, and if
+  // it's under `/oh/<pk>/`, rewrite the fetch into that scope. Else
+  // pass through to Chrome's file handler via `fetch(event.request)`.
+  event.respondWith(
+    (async () => {
+      const scope = await resolveOhScope(event);
+      if (!scope) return fetch(event.request);
+      return handleOhFetch(scope.daemonPkZ, scope.path, event.request);
+    })(),
+  );
 });
+
+// Take control of any already-open pages on install + activate so
+// subresource fetches from previously-loaded documents route through
+// this worker rather than going direct to Chrome's file handler.
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) =>
+  event.waitUntil(self.clients.claim()),
+);
+
+// Relay offscreen-doc console logs into the SW's console so they
+// show up in SW DevTools + automation tooling.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.kind !== "openhost-log") return;
+  const tag = `[offscreen.${msg.level}]`;
+  console.log(tag, ...(msg.args || []));
+});
+
+// Uint8Array ↔ base64 helpers mirror the offscreen side. See
+// offscreen.js for why we don't just pass ArrayBuffers through
+// chrome.runtime.sendMessage (JSON-serialisation eats them).
+function bytesToBase64(u8) {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < u8.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
 async function handleOhFetch(daemonPkZ, path, request) {
   try {
@@ -126,10 +254,10 @@ async function handleOhFetch(daemonPkZ, path, request) {
       if (k.toLowerCase() === "host") continue;
       headers[k] = v;
     }
-    const bodyBuf =
+    const bodyB64 =
       request.method === "GET" || request.method === "HEAD"
         ? null
-        : await request.arrayBuffer();
+        : bytesToBase64(new Uint8Array(await request.arrayBuffer()));
 
     const reply = await chrome.runtime.sendMessage({
       kind: "openhost-request",
@@ -137,8 +265,7 @@ async function handleOhFetch(daemonPkZ, path, request) {
       method: request.method,
       path,
       headers,
-      // Arbitrary structured-cloneable types; ArrayBuffer is transferable.
-      bodyBuf,
+      bodyB64,
     });
     if (!reply || reply.error) {
       throw new Error(reply ? reply.error : "offscreen: no reply");
@@ -154,7 +281,8 @@ async function handleOhFetch(daemonPkZ, path, request) {
 }
 
 function buildResponseFromOpenhost(reply) {
-  const { head = "", bodyBuf } = reply;
+  const { head = "", bodyB64 } = reply;
+  const bodyBuf = bodyB64 ? base64ToBytes(bodyB64) : null;
   const lines = head.split(/\r?\n/);
   const statusLine = lines[0] || "HTTP/1.1 200 OK";
   const m = /^HTTP\/\d\.\d\s+(\d+)\s*(.*)$/.exec(statusLine);

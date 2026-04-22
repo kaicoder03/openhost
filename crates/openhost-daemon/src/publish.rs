@@ -35,6 +35,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// always produces the same per-host salt.
 const ALLOW_SALT_HKDF_SALT: &[u8] = b"openhost-allow-salt-v1";
 
+/// Seconds a queued `AnswerEntry` stays eligible for publication. A
+/// client that hasn't applied an answer within this window is either
+/// giving up or has already moved on; keeping the entry any longer
+/// burns BEP44 packet budget and risks evicting fresher answers
+/// under the 1000-byte `v` cap. 60 seconds covers a slow NAT-punch
+/// dial with room to spare (a healthy dial reads the answer within
+/// ~5-10s of publish).
+const ANSWER_TTL_SECS: u64 = 60;
+
+/// Maximum number of `AnswerEntry` values the publisher will include
+/// in a single republish. Picked to always fit under the BEP44
+/// 1000-byte `v` cap with headroom for the v3 host record + DNS
+/// framing + base64url expansion. Overshoot = packet-too-large, which
+/// evicts the NEWEST answer inside the packet builder and wastes the
+/// freshest dial. k=1 is the correct default for humans-clicking-
+/// links openhost usage; raising needs concurrent-dial testing.
+const MAX_PUBLISHED_ANSWERS: usize = 1;
+
 /// Mutable state shared between the publisher and the rest of the daemon.
 ///
 /// Every field that later PRs will mutate is wrapped in a `RwLock`; every
@@ -111,17 +129,30 @@ impl SharedState {
             .insert(entry.client_hash, entry);
     }
 
-    /// Snapshot (clone) of every queued answer. The publisher's
-    /// `AnswerSource` calls this on each publish. Entries remain in
-    /// the map across calls — a later `push_answer` for the same
-    /// `client_hash` overwrites.
+    /// Snapshot a bounded set of queued answers for publication.
+    /// Evicts entries older than [`ANSWER_TTL_SECS`], then returns at
+    /// most the most-recent [`MAX_PUBLISHED_ANSWERS`] by
+    /// `created_at`. Two layers of defense against the BEP44
+    /// 1000-byte packet cap:
+    ///  - TTL prune eliminates yesterday's dead dials from the map.
+    ///  - Max-count cap keeps `k` concurrent live dials from inflating
+    ///    the packet and causing the packet builder to evict the
+    ///    newest (= most-useful) answer.
+    ///
+    /// A client that dialled and hasn't yet read its answer while `k`
+    /// others dialled in between is a pathological case; openhost is
+    /// designed for humans clicking a link, so k=1 is correct.
     pub fn snapshot_answers(&self) -> Vec<AnswerEntry> {
-        self.answers
-            .read()
-            .expect("answers lock poisoned")
-            .values()
-            .cloned()
-            .collect()
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut map = self.answers.write().expect("answers lock poisoned");
+        map.retain(|_, e| now.saturating_sub(e.created_at) <= ANSWER_TTL_SECS);
+        let mut out: Vec<AnswerEntry> = map.values().cloned().collect();
+        out.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+        out.truncate(MAX_PUBLISHED_ANSWERS);
+        out
     }
 
     /// Replace the DTLS fingerprint (for cert rotation). Callers MUST
