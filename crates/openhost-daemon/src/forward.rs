@@ -50,6 +50,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "transfer-encoding",
@@ -380,12 +381,31 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        // RFC 7230 §3.2.4: "A proxy MUST reject any received request message that
+        // contains [obsolete line folding]".
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "request head contains obsolete line folding",
+            ));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header field-name
+        // and colon. [...] a proxy MUST reject any received request message that
+        // contains whitespace between a header field-name and colon".
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "request head has whitespace before ':'",
+            ));
+        }
+
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )`
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
+
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -405,6 +425,8 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    strip_connection_headers(headers, &[]);
+
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -429,6 +451,10 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    // Preserve Upgrade and Connection even if they are listed in the
+    // Connection header, so we can re-negotiate the upgrade upstream.
+    strip_connection_headers(headers, &["upgrade", "connection"]);
+
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -443,6 +469,31 @@ fn sanitize_websocket_request_headers(
     })?;
     headers.insert(http::header::HOST, host_value);
     Ok(())
+}
+
+/// Dynamically remove headers listed in the `Connection` field (RFC 7230 §6.1).
+/// `exclude` contains lowercase header names that should NOT be stripped
+/// even if they appear in the `Connection` field (e.g. for WebSockets).
+fn strip_connection_headers(headers: &mut HeaderMap, exclude: &[&str]) {
+    let mut to_remove = Vec::new();
+    if let Some(conn) = headers.get(http::header::CONNECTION) {
+        if let Ok(val) = conn.to_str() {
+            for name in val.split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    let is_excluded = exclude.iter().any(|&ex| name.eq_ignore_ascii_case(ex));
+                    if !is_excluded {
+                        if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
+                            to_remove.push(header_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for name in to_remove {
+        headers.remove(name);
+    }
 }
 
 /// Re-encode an upstream WebSocket 101 response head into the bytes
@@ -597,6 +648,32 @@ mod tests {
             HeaderValue::from_static("keep-me"),
         );
         h
+    }
+
+    #[test]
+    fn sanitize_strips_proxy_connection() {
+        let mut h = HeaderMap::new();
+        h.insert("proxy-connection", HeaderValue::from_static("close"));
+        sanitize_request_headers(&mut h, "x").unwrap();
+        assert!(!h.contains_key("proxy-connection"));
+    }
+
+    #[test]
+    fn sanitize_strips_dynamic_connection_headers() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Foo, X-Bar"),
+        );
+        h.insert("x-foo", HeaderValue::from_static("remove-me"));
+        h.insert("x-bar", HeaderValue::from_static("remove-me-too"));
+        h.insert("x-baz", HeaderValue::from_static("keep-me"));
+        sanitize_request_headers(&mut h, "x").unwrap();
+        assert!(!h.contains_key("x-foo"));
+        assert!(!h.contains_key("x-bar"));
+        assert_eq!(h.get("x-baz").unwrap(), "keep-me");
+        // Connection header itself should also be stripped as hop-by-hop
+        assert!(!h.contains_key(http::header::CONNECTION));
     }
 
     #[test]
@@ -782,6 +859,37 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: No whitespace allowed between name and colon.
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(m) if m.contains("whitespace before ':'")),
+            "expected error for whitespace before colon, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obsolete_line_folding() {
+        // RFC 7230 §3.2.4: Header lines must not start with whitespace.
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n  Folded\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(m) if m.contains("obsolete line folding")),
+            "expected error for obsolete line folding, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com  \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example.com");
     }
 
     // --- Response head encoder --------------------------------------
