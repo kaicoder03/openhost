@@ -2264,6 +2264,7 @@ dependencies = [
  "hex",
  "js-sys",
  "openhost-core",
+ "openhost-peer",
  "openhost-pkarr",
  "pkarr",
  "rand 0.8.6",

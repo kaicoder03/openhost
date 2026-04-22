@@ -44,11 +44,16 @@ export const FRAME = Object.freeze({
 
 export const BINDING_MODE_CERT_FP = 0x02;
 
-const RELAYS = [
-  "https://relay.pkarr.org",
-  "https://pkarr.pubky.app",
-  "https://pkarr.pubky.org",
-];
+// Web-app build: routes pkarr PUT/GET through a CORS-enabled proxy
+// hosted on the same machine as the sender. Public pkarr relays do
+// not emit `Access-Control-Allow-Origin` so a browser `fetch` from
+// e.g. `http://localhost:8000` is rejected by the same-origin policy.
+// The proxy at `OH_RELAY_URL` (window-global, settable from the page)
+// simply forwards to `relay.pkarr.org` with CORS headers added.
+const DEFAULT_RELAY = (typeof window !== "undefined" && window.OH_RELAY_URL)
+  ? [window.OH_RELAY_URL]
+  : ["http://127.0.0.1:8080"];
+const RELAYS = DEFAULT_RELAY;
 const STUN = [{ urls: "stun:stun.l.google.com:19302" }];
 
 let initPromise = null;
@@ -220,6 +225,7 @@ export async function dialOhUrl(ohUrl, opts = {}) {
   const packet = build_offer_packet(clientSeed, daemonPkZ, sealed, BigInt(Math.floor(Date.now() / 1000)));
   await publishOfferPacket(clientPkZ, packet);
 
+  console.log("openhost dialer: offer published, polling for answer…");
   // 5. Poll answer fragments on the daemon's zone. The host's DTLS
   // fingerprint was already verified under the BEP44 signature during
   // step 1; threading it here lets the v2 compact-blob branch
@@ -330,17 +336,22 @@ async function publishOfferPacket(clientPkZ, packetBytes) {
   // ok is what we used to do; it left the other relays without the
   // record and broke cross-relay rendezvous.
   for (const r of RELAYS) {
+    console.log(`openhost dialer: PUT ${r}/${clientPkZ} (${packetBytes.length ?? packetBytes.byteLength} bytes)`);
     try {
       const resp = await fetch(`${r}/${clientPkZ}`, {
         method: "PUT", body: packetBytes,
         headers: { "Content-Type": "application/pkarr.org.relays.v1+octet" },
       });
+      console.log(`openhost dialer: PUT ${r} -> ${resp.status}`);
       if (resp.ok) {
         successes += 1;
         continue;
       }
       lastErr = new Error(`${r} → ${resp.status}`);
-    } catch (e) { lastErr = e; }
+    } catch (e) {
+      console.log(`openhost dialer: PUT ${r} threw: ${e?.message ?? e}`);
+      lastErr = e;
+    }
   }
   if (successes === 0) {
     throw new Error(`all relays rejected offer publish: ${lastErr?.message ?? "unknown"}`);

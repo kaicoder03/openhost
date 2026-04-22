@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oh — receive a file</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  body {
+    margin: 0;
+    padding: 2rem 1rem;
+    max-width: 38rem;
+    margin-inline: auto;
+    line-height: 1.4;
+  }
+  h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
+  .subtitle { color: #666; margin: 0 0 2rem; }
+  fieldset {
+    border: 1px solid rgba(127,127,127,0.35);
+    border-radius: 0.5rem;
+    padding: 1rem;
+    margin-bottom: 1.25rem;
+  }
+  legend { font-weight: 600; padding: 0 0.5rem; }
+  label { display: block; font-size: 0.9rem; margin-bottom: 0.25rem; color: #555; }
+  input, textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.55rem 0.75rem;
+    font-size: 1rem;
+    font-family: ui-monospace, monospace;
+    border: 1px solid rgba(127,127,127,0.4);
+    border-radius: 0.35rem;
+    background: transparent;
+    color: inherit;
+  }
+  textarea { min-height: 4rem; resize: vertical; }
+  button {
+    display: inline-block;
+    padding: 0.65rem 1.25rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border: 0;
+    border-radius: 0.35rem;
+    background: #4361ee;
+    color: white;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: progress; }
+  .status {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+    margin-top: 1rem;
+    padding: 0.75rem;
+    background: rgba(127,127,127,0.12);
+    border-radius: 0.35rem;
+    min-height: 1.5rem;
+    white-space: pre-wrap;
+  }
+  .status.err { color: #d63031; }
+  .status.ok { color: #2e7d32; }
+</style>
+</head>
+<body>
+  <h1>oh — receive a file</h1>
+  <p class="subtitle">Paste the pairing code from <code>oh send</code> and the file will stream here over an authenticated WebRTC data channel.</p>
+
+  <form id="recv-form">
+    <fieldset>
+      <legend>Pairing code</legend>
+      <label for="code">12 BIP-39 words OR a <code>oh+pair://</code> URI</label>
+      <textarea id="code" name="code" placeholder="witch collapse practice feed shame open despair creek road again ice least" autocomplete="off" autocapitalize="none" spellcheck="false"></textarea>
+    </fieldset>
+
+    <button type="submit" id="recv-btn">Receive</button>
+  </form>
+
+  <div id="status" class="status" aria-live="polite"></div>
+
+  <script type="module" src="./src/recv.js"></script>
+</body>
+</html>

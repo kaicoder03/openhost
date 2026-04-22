@@ -268,3 +268,98 @@ pub fn build_offer_packet(
     core::build_offer_packet(client_sk_bytes, daemon_pk_zbase32, sealed_offer, now_ts)
         .map_err(|e| to_js_err(&e))
 }
+
+// ---------------------------------------------------------------------
+// openhost-peer (PR-A / PR-B) — pairing code + role-key derivation for
+// the web app and Flutter app. Browser side only ever needs the
+// *receiver* seed + the *sender* pubkey; we expose the sender seed + pk
+// too so the web app can symmetrically run send-from-browser later.
+// ---------------------------------------------------------------------
+
+/// DTO returned from [`pairing_roles`] — both role seeds + their
+/// zbase32 pubkeys, plus the canonical URI rendering of the code.
+#[derive(serde::Serialize)]
+pub struct PairingRolesDto {
+    /// 32-byte Ed25519 seed for the sender role.
+    #[serde(with = "serde_bytes_array_32")]
+    pub sender_seed: [u8; 32],
+    /// z-base-32 encoded Ed25519 pubkey for the sender role.
+    pub sender_pubkey_zbase32: String,
+    /// 32-byte Ed25519 seed for the receiver role.
+    #[serde(with = "serde_bytes_array_32")]
+    pub receiver_seed: [u8; 32],
+    /// z-base-32 encoded Ed25519 pubkey for the receiver role.
+    pub receiver_pubkey_zbase32: String,
+    /// Canonical `oh+pair://<zbase32>` URI for the code.
+    pub uri: String,
+    /// Space-separated 12 BIP-39 words.
+    pub words: String,
+}
+
+// serde helper — serializes a `[u8; 32]` as a Vec<u8> so it round-trips
+// to a `Uint8Array` through serde-wasm-bindgen.
+mod serde_bytes_array_32 {
+    use serde::{Serialize, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], ser: S) -> Result<S::Ok, S::Error> {
+        bytes.to_vec().serialize(ser)
+    }
+}
+
+/// Parse a pairing code (12 BIP-39 words OR a `oh+pair://` URI) and
+/// derive both role keys + their zbase32 pubkeys.
+///
+/// Errors if the code fails to parse. All returned seeds are 32-byte
+/// Ed25519 private-key seeds; the browser converts them to signing
+/// keys via the existing `client_pubkey_from_seed` path on the wire,
+/// but the web app never needs to hold them in JS — every seal /
+/// answer-decrypt step runs in WASM.
+#[wasm_bindgen]
+pub fn pairing_roles(code_str: &str) -> Result<JsValue, JsError> {
+    let code = openhost_peer::PairingCode::parse(code_str)
+        .map_err(|e| JsError::new(&format!("invalid pairing code: {e}")))?;
+    let roles = openhost_peer::Roles::derive(&code);
+    let sender_sk = ed25519_dalek::SigningKey::from_bytes(roles.sender_seed());
+    let receiver_sk = ed25519_dalek::SigningKey::from_bytes(roles.receiver_seed());
+    let sender_pk =
+        openhost_core::identity::PublicKey::from_bytes(&sender_sk.verifying_key().to_bytes())
+            .map_err(|e| JsError::new(&format!("sender pubkey: {e}")))?;
+    let receiver_pk =
+        openhost_core::identity::PublicKey::from_bytes(&receiver_sk.verifying_key().to_bytes())
+            .map_err(|e| JsError::new(&format!("receiver pubkey: {e}")))?;
+    let dto = PairingRolesDto {
+        sender_seed: *roles.sender_seed(),
+        sender_pubkey_zbase32: sender_pk.to_zbase32(),
+        receiver_seed: *roles.receiver_seed(),
+        receiver_pubkey_zbase32: receiver_pk.to_zbase32(),
+        uri: code.to_uri(),
+        words: code.to_words(),
+    };
+    to_js(&dto)
+}
+
+/// Generate a fresh pairing code (128 bits of OS-RNG entropy) and
+/// return its words + URI + derived roles. Used by the "send from
+/// browser" flow (PR-D follow-up) — receive-only web app doesn't
+/// need this.
+#[wasm_bindgen]
+pub fn pairing_generate() -> Result<JsValue, JsError> {
+    let code = openhost_peer::PairingCode::generate();
+    let roles = openhost_peer::Roles::derive(&code);
+    let sender_sk = ed25519_dalek::SigningKey::from_bytes(roles.sender_seed());
+    let receiver_sk = ed25519_dalek::SigningKey::from_bytes(roles.receiver_seed());
+    let sender_pk =
+        openhost_core::identity::PublicKey::from_bytes(&sender_sk.verifying_key().to_bytes())
+            .map_err(|e| JsError::new(&format!("sender pubkey: {e}")))?;
+    let receiver_pk =
+        openhost_core::identity::PublicKey::from_bytes(&receiver_sk.verifying_key().to_bytes())
+            .map_err(|e| JsError::new(&format!("receiver pubkey: {e}")))?;
+    let dto = PairingRolesDto {
+        sender_seed: *roles.sender_seed(),
+        sender_pubkey_zbase32: sender_pk.to_zbase32(),
+        receiver_seed: *roles.receiver_seed(),
+        receiver_pubkey_zbase32: receiver_pk.to_zbase32(),
+        uri: code.to_uri(),
+        words: code.to_words(),
+    };
+    to_js(&dto)
+}
