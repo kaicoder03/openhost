@@ -44,6 +44,33 @@ export const FRAME = Object.freeze({
 
 export const BINDING_MODE_CERT_FP = 0x02;
 
+// Backpressure thresholds for RTCDataChannel.send — pause queuing
+// new frames once the send buffer exceeds the high-water mark, resume
+// when it drains past the low-water mark. Prevents the SCTP stack
+// from surfacing "Failure to send data" on large request bodies.
+const DC_BUFFER_HIGH_WATER = 1024 * 1024;
+const DC_BUFFER_LOW_WATER = 256 * 1024;
+
+async function sendFrameWithBackpressure(dc, frameType, payload) {
+  while (dc.bufferedAmount > DC_BUFFER_HIGH_WATER) {
+    if (dc.bufferedAmountLowThreshold !== DC_BUFFER_LOW_WATER) {
+      dc.bufferedAmountLowThreshold = DC_BUFFER_LOW_WATER;
+    }
+    await new Promise((resolve) => {
+      const onLow = () => {
+        dc.removeEventListener("bufferedamountlow", onLow);
+        resolve();
+      };
+      dc.addEventListener("bufferedamountlow", onLow);
+      setTimeout(() => {
+        dc.removeEventListener("bufferedamountlow", onLow);
+        resolve();
+      }, 50);
+    });
+  }
+  dc.send(encode_frame(frameType, Array.from(payload)));
+}
+
 const RELAYS = [
   "https://relay.pkarr.org",
   "https://pkarr.pubky.app",
@@ -146,9 +173,23 @@ export class OpenhostSession {
     const headLines = [`${method} ${path} HTTP/1.1`, "Host: openhost"];
     for (const [k, v] of Object.entries(headers)) headLines.push(`${k}: ${v}`);
     const headBytes = new TextEncoder().encode(headLines.join("\r\n") + "\r\n\r\n");
-    this._dc.send(encode_frame(FRAME.REQUEST_HEAD, Array.from(headBytes)));
-    if (body) this._dc.send(encode_frame(FRAME.REQUEST_BODY, Array.from(body)));
-    this._dc.send(encode_frame(FRAME.REQUEST_END, []));
+    await sendFrameWithBackpressure(this._dc, FRAME.REQUEST_HEAD, headBytes);
+    if (body) {
+      // Chunk the request body so each DC message stays under the SCTP
+      // send-buffer's high-water mark, and await `bufferedAmountLow`
+      // between chunks so a large POST doesn't overrun the data channel.
+      const bodyBytes = body instanceof Uint8Array ? body : new Uint8Array(body);
+      const CHUNK = 60 * 1024;
+      for (let offset = 0; offset < bodyBytes.length; offset += CHUNK) {
+        const end = Math.min(offset + CHUNK, bodyBytes.length);
+        await sendFrameWithBackpressure(
+          this._dc,
+          FRAME.REQUEST_BODY,
+          bodyBytes.subarray(offset, end),
+        );
+      }
+    }
+    await sendFrameWithBackpressure(this._dc, FRAME.REQUEST_END, new Uint8Array(0));
 
     const headFrame = await this._reader.next();
     if (headFrame.frame_type !== FRAME.RESPONSE_HEAD) {
@@ -241,11 +282,27 @@ export async function dialOhUrl(ohUrl, opts = {}) {
     const reader = new FrameReader();
     dc.binaryType = "arraybuffer";
     dc.onmessage = e => reader.push(e.data);
-    dc.onerror = e => reader.fail(new Error(`DC error: ${e}`));
+    dc.onerror = e => {
+      const err = e && e.error;
+      const detail = err
+        ? `${err.errorDetail || err.name || "?"}: ${err.message || ""} sctpCauseCode=${err.sctpCauseCode ?? "-"} httpRequestStatusCode=${err.httpRequestStatusCode ?? "-"}`
+        : String(e);
+      reader.fail(new Error(`DC error: ${detail}`));
+    };
+    dc.onclose = () => {
+      reader.fail(new Error("DC closed"));
+    };
 
+    pc.addEventListener("icegatheringstatechange", () =>
+      console.log("[dial] icegathering state=", pc.iceGatheringState));
+    pc.addEventListener("icecandidateerror", (e) =>
+      console.log("[dial] icecandidateerror url=", e.url, "errorText=", e.errorText));
     const offer = await pc.createOffer();
+    console.log("[dial] createOffer OK");
     await pc.setLocalDescription(offer);
-    await waitForIceComplete(pc);
+    console.log("[dial] setLocalDescription OK, initial gatheringState=", pc.iceGatheringState);
+    await waitForIceComplete(pc, 8000);
+    console.log("[dial] waitForIceComplete done, gatheringState=", pc.iceGatheringState);
     const offerSdp = pc.localDescription.sdp;
     const ufrag = (offerSdp.match(/a=ice-ufrag:(\S+)/) || [])[1];
     const pwd = (offerSdp.match(/a=ice-pwd:(\S+)/) || [])[1];
@@ -311,11 +368,17 @@ function hexToBytes(hex) {
   return out;
 }
 
-function waitForIceComplete(pc) {
-  return new Promise(res => {
+function waitForIceComplete(pc, timeoutMs = 8000) {
+  return new Promise((res) => {
     if (pc.iceGatheringState === "complete") return res();
+    const timer = setTimeout(() => {
+      pc.removeEventListener("icegatheringstatechange", check);
+      console.log("[dial] waitForIceComplete timeout; proceeding with partial candidates");
+      res();
+    }, timeoutMs);
     const check = () => {
       if (pc.iceGatheringState === "complete") {
+        clearTimeout(timer);
         pc.removeEventListener("icegatheringstatechange", check);
         res();
       }
@@ -375,18 +438,30 @@ async function publishOfferPacket(clientPkZ, packetBytes) {
   // packet on whichever relay it polls. Returning after the first
   // ok is what we used to do; it left the other relays without the
   // record and broke cross-relay rendezvous.
-  for (const r of RELAYS) {
+  // Fan out to every relay in parallel with a per-relay deadline.
+  // One slow or hung relay must not stall the whole dial; we only
+  // need one success for the daemon's poller to pick up the offer.
+  const RELAY_TIMEOUT_MS = 8000;
+  const results = await Promise.all(RELAYS.map(async (r) => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), RELAY_TIMEOUT_MS);
     try {
       const resp = await fetch(`${r}/${clientPkZ}`, {
-        method: "PUT", body: packetBytes,
+        method: "PUT", body: packetBytes, signal: ac.signal,
         headers: { "Content-Type": "application/pkarr.org.relays.v1+octet" },
       });
-      if (resp.ok) {
-        successes += 1;
-        continue;
-      }
-      lastErr = new Error(`${r} → ${resp.status}`);
-    } catch (e) { lastErr = e; }
+      return resp.ok
+        ? { ok: true, relay: r }
+        : { ok: false, err: new Error(`${r} → ${resp.status}`) };
+    } catch (e) {
+      return { ok: false, err: e };
+    } finally {
+      clearTimeout(timer);
+    }
+  }));
+  for (const r of results) {
+    if (r.ok) successes += 1;
+    else lastErr = r.err;
   }
   if (successes === 0) {
     throw new Error(`all relays rejected offer publish: ${lastErr?.message ?? "unknown"}`);

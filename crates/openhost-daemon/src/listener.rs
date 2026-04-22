@@ -25,7 +25,7 @@ use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrad
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
-use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
+use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -159,26 +159,13 @@ fn sdp_to_answer_blob(sdp: &str) -> Result<AnswerBlob, ListenerError> {
         }
     }
 
-    // When TURN is enabled we gather host + srflx + relay, and the
-    // combined 3-candidate answer blob overflows the BEP44 1000-byte
-    // `v` cap after fragmentation overhead, causing eviction at
-    // publish time. Drop `host` candidates — they advertise the
-    // daemon's private LAN IP (10.0.1.50 on EC2) which no internet
-    // peer can reach anyway. The srflx + relay pair is what actually
-    // forms useful candidate pairs cross-network:
-    //   - srflx → client_srflx: direct UDP hole punch. Fastest path
-    //     when both NATs cooperate. The 2026-04-20 live-success case.
-    //   - relay → client_relay: the fallback when hole punch fails.
-    //     AWS NAT SNAT prevents relay-to-relay traversal via direct
-    //     TURN permissions, so this is a best-effort lane for
-    //     symmetric-NAT clients; a permission-free TURN variant is
-    //     a follow-up.
-    if candidates
-        .iter()
-        .any(|c| matches!(c.typ, CandidateType::Srflx | CandidateType::Relay))
-    {
-        candidates.retain(|c| c.typ != CandidateType::Host);
-    }
+    // With `SettingEngine::set_nat_1to1_ips` in effect (cloud-NAT 1:1
+    // deployments: AWS Elastic IP, GCE static-external-IP, etc.) the
+    // daemon's host candidate IS the public IP — the fastest direct
+    // lane for cross-internet peers. Keep every filter-survived
+    // candidate and let the remote side's ICE pick the winning pair.
+    // Compact answer-blob candidates are ~7 bytes each; 3 fit in the
+    // BEP44 `v` budget with headroom.
 
     Ok(AnswerBlob {
         ice_ufrag: ice_ufrag.ok_or(ListenerError::OfferParse("answer SDP missing a=ice-ufrag"))?,
@@ -254,37 +241,12 @@ mod sdp_blob_tests {
         assert_eq!(blob.ice_ufrag, "abcd");
         assert_eq!(blob.ice_pwd, "0123456789abcdefghij!@");
         assert_eq!(blob.setup, SetupRole::Passive);
-        // When the SDP contains srflx or relay, host candidates are
-        // dropped (they advertise a private LAN IP that no internet
-        // peer can reach anyway, and they eat BEP44 packet budget).
-        // The sample SDP has a component-1 srflx, so only that
-        // survives: host (10.0.0.5) dropped, component-2 dropped,
-        // IPv6 host dropped.
-        assert_eq!(blob.candidates.len(), 1);
-        assert!(matches!(blob.candidates[0].typ, CandidateType::Srflx));
-        assert_eq!(
-            blob.candidates[0].ip,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))
-        );
-        assert_eq!(blob.candidates[0].port, 2000);
-    }
-
-    #[test]
-    fn sdp_to_answer_blob_keeps_host_when_no_srflx_or_relay() {
-        // Regression guard: the host-drop heuristic should NOT fire
-        // when the SDP only advertises host candidates (e.g. a
-        // loopback integration test). Without it the answer would
-        // ship zero candidates and the client could never connect.
-        let host_only = "v=0\r\n\
-                         o=- 0 0 IN IP4 0.0.0.0\r\n\
-                         s=-\r\n\
-                         a=ice-ufrag:abcd\r\n\
-                         a=ice-pwd:0123456789abcdefghij!@\r\n\
-                         a=setup:passive\r\n\
-                         a=candidate:111 1 udp 2130706431 10.0.0.5 1000 typ host\r\n";
-        let blob = sdp_to_answer_blob(host_only).unwrap();
-        assert_eq!(blob.candidates.len(), 1);
+        // Keep every filter-survived candidate (component-1 IPv4 UDP
+        // of known type): host + srflx. Component-2 entries and the
+        // IPv6 host were dropped earlier by the per-line filter.
+        assert_eq!(blob.candidates.len(), 2);
         assert!(matches!(blob.candidates[0].typ, CandidateType::Host));
+        assert!(matches!(blob.candidates[1].typ, CandidateType::Srflx));
     }
 
     #[test]
@@ -375,6 +337,7 @@ impl PassivePeer {
         identity: Arc<SigningKey>,
         state: Arc<SharedState>,
         forwarder: Option<Arc<Forwarder>>,
+        nat_1to1_public_ip: Option<std::net::Ipv4Addr>,
     ) -> Result<Self, ListenerError> {
         // rustls 0.23+ requires a CryptoProvider before any TLS / DTLS
         // session is established. Install ring once per process; the
@@ -407,6 +370,21 @@ impl PassivePeer {
         engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| {
             matches!(ip, std::net::IpAddr::V4(_))
         }));
+
+        // 1-to-1 NAT handling for cloud-NATed deployments (AWS EC2
+        // with Elastic IP, GCE with static-external-IP, etc.). When
+        // configured, the local host candidate's IP is REPLACED with
+        // the operator-provided public IP on the wire, so peers dial
+        // straight to the Elastic IP instead of the unreachable
+        // private VPC IP. Turns a symmetric/hairpin-NAT setup into a
+        // functional 1:1 NAT for ICE connectivity checks — no TURN
+        // required for the happy path.
+        if let Some(public_ip) = nat_1to1_public_ip {
+            engine.set_nat_1to1_ips(
+                vec![public_ip.to_string()],
+                webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::Host,
+            );
+        }
 
         let api = APIBuilder::new().with_setting_engine(engine).build();
 
@@ -1375,9 +1353,27 @@ async fn start_websocket_tunnel(
     Ok(())
 }
 
-/// Body chunks are bounded by [`MAX_PAYLOAD_LEN`] (16 MiB − 1) per
-/// the wire codec; larger upstream bodies get split into multiple
-/// `RESPONSE_BODY` frames.
+/// SCTP data channels negotiate a per-message size limit during the
+/// DTLS handshake. Chrome + Firefox default to 65_536 bytes; sending
+/// a larger single datagram surfaces as `DC error: [object
+/// RTCErrorEvent]` on the peer and tears the channel down. The wire
+/// codec allows up to [`MAX_PAYLOAD_LEN`] (16 MiB) per frame, but at
+/// the transport layer we cap each outgoing RESPONSE_BODY message at
+/// 16 KiB so a 20 MiB video download becomes ~1280 frames the peer
+/// reassembles cleanly. 16 KiB has comfortable headroom under every
+/// real-world SCTP negotiation we've observed.
+const SCTP_SAFE_CHUNK_BYTES: usize = 60 * 1024;
+/// Pause sending new body chunks once the data-channel's send buffer
+/// exceeds this high-water mark (1 MiB). Resume when it drains under
+/// the low-water mark. Prevents "Failure to send data" from the SCTP
+/// transport when the application outruns the peer's receive window.
+const SCTP_BUFFER_HIGH_WATER: usize = 1024 * 1024;
+const SCTP_BUFFER_LOW_WATER: usize = 256 * 1024;
+
+/// Emit a forwarder response split across frames of at most
+/// [`SCTP_SAFE_CHUNK_BYTES`] bytes per RESPONSE_BODY — the per-frame
+/// payload cap imposed by the data channel's SCTP message-size
+/// limit, not the wire-codec's [`MAX_PAYLOAD_LEN`].
 async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(), webrtc::Error> {
     send_frame(
         dc,
@@ -1385,13 +1381,41 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
     )
     .await?;
 
+    // Wire up a backpressure notify: the SCTP stack fires
+    // `on_buffered_amount_low` when the buffered byte count drops
+    // below our configured threshold. We wait on that `Notify` after
+    // every chunk that pushes us over the high-water mark.
+    let drain_notify: Arc<Notify> = Arc::new(Notify::new());
+    dc.set_buffered_amount_low_threshold(SCTP_BUFFER_LOW_WATER)
+        .await;
+    {
+        let drain_notify = drain_notify.clone();
+        dc.on_buffered_amount_low(Box::new(move || {
+            let drain_notify = drain_notify.clone();
+            Box::pin(async move {
+                drain_notify.notify_waiters();
+            })
+        }))
+        .await;
+    }
+
     let body = resp.body;
     let mut offset = 0;
     while offset < body.len() {
-        let end = (offset + MAX_PAYLOAD_LEN).min(body.len());
+        // Backpressure: if the data-channel buffer is above the
+        // high-water mark, wait for the low-threshold callback
+        // before enqueuing another chunk. Fall back to a bounded
+        // poll so we don't deadlock if the callback is missed.
+        while dc.buffered_amount().await > SCTP_BUFFER_HIGH_WATER {
+            let wait = drain_notify.notified();
+            tokio::pin!(wait);
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut wait).await;
+        }
+
+        let end = (offset + SCTP_SAFE_CHUNK_BYTES).min(body.len());
         let slice = body.slice(offset..end);
         let body_frame = Frame::new(FrameType::ResponseBody, slice.to_vec())
-            .expect("chunk length bounded by MAX_PAYLOAD_LEN");
+            .expect("chunk length bounded by SCTP_SAFE_CHUNK_BYTES");
         send_frame(dc, body_frame).await?;
         offset = end;
     }

@@ -54,7 +54,11 @@ function getOrDialSession(daemonPkZ) {
     try {
       session._pc.addEventListener("connectionstatechange", () => {
         const s = session._pc.connectionState;
-        if (s === "failed" || s === "closed" || s === "disconnected") {
+        // `disconnected` is transient — ICE consent-freshness can hiccup
+        // and recover. Only treat `failed`/`closed` as terminal. Killing
+        // a "disconnected" PC racing a real request would stall that
+        // request until its (absent) timeout fires.
+        if (s === "failed" || s === "closed") {
           console.log(
             "openhost offscreen: PC transitioned to",
             s,
@@ -62,13 +66,14 @@ function getOrDialSession(daemonPkZ) {
             daemonPkZ,
           );
           sessions.delete(daemonPkZ);
-          // Without this the RTCPeerConnection + its ICE agent + its
-          // TURN allocation stay alive forever: the PC keeps sending
-          // STUN checks through the relay with its own stale ufrag,
-          // which the daemon discards as a mismatched-session, which
-          // in turn masks the real ICE state of any *new* dial.
           try { session._pc.close(); } catch {}
           try { session._dc.close(); } catch {}
+        } else {
+          console.log(
+            "openhost offscreen: PC state=",
+            s,
+            "(not evicting)",
+          );
         }
       });
     } catch (e) {

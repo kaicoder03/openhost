@@ -71,8 +71,20 @@ impl App {
         let pair_db_path = resolve_pair_db_path(&cfg);
         load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
-        let listener =
-            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+        // When the operator sets `[turn] public_ip` (typically the
+        // host's cloud Elastic IP), we also use it as the 1-to-1 NAT
+        // hint on the WebRTC ICE agent — host candidates get rewritten
+        // to this IP on the wire, so remote peers dial straight there
+        // instead of the unreachable private VPC IP.
+        let nat_public_ip = if cfg.turn.enabled { cfg.turn.public_ip } else { None };
+        let listener = build_listener(
+            &cert,
+            identity.clone(),
+            state.clone(),
+            forwarder.clone(),
+            nat_public_ip,
+        )
+        .await?;
         let turn = maybe_spawn_turn(&cfg, &identity, &state).await?;
         wire_daemon_turn_client(&cfg, &identity, &listener);
         let (publisher, resolver) =
@@ -112,7 +124,7 @@ impl App {
         load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
         let listener =
-            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone(), None).await?;
         let publisher =
             publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
         let pair_watcher = crate::pair_watcher::PairWatcher::spawn(
@@ -146,7 +158,7 @@ impl App {
         load_pair_db_into_state(&pair_db_path, &state, &cfg)?;
         let forwarder = build_forwarder(&cfg)?;
         let listener =
-            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone()).await?;
+            build_listener(&cert, identity.clone(), state.clone(), forwarder.clone(), None).await?;
         let publisher =
             publish::start_with_transport(&cfg.pkarr, identity.clone(), state.clone(), transport);
         let poller = build_offer_poller(
@@ -393,6 +405,7 @@ async fn build_listener(
     identity: Arc<SigningKey>,
     state: Arc<SharedState>,
     forwarder: Option<Arc<Forwarder>>,
+    nat_1to1_public_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<Arc<PassivePeer>> {
     let peer = PassivePeer::new(
         cert.certificate.clone(),
@@ -400,6 +413,7 @@ async fn build_listener(
         identity,
         state,
         forwarder,
+        nat_1to1_public_ip,
     )
     .await?;
     Ok(Arc::new(peer))
