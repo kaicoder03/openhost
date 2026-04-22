@@ -59,7 +59,9 @@
 pub mod code;
 pub mod error;
 pub mod mailbox;
+pub mod roles;
 
 pub use code::{PairingCode, PAIRING_SECRET_BYTES, PAIRING_URI_SCHEME};
 pub use error::{PeerError, Result};
 pub use mailbox::{MailboxKey, MAILBOX_NONCE_LEN};
+pub use roles::Roles;

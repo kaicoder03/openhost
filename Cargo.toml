@@ -8,6 +8,7 @@ members = [
     "crates/openhost-pkarr-wasm",
     "crates/openhost-ffi",
     "crates/openhost-peer",
+    "crates/openhost-cli",
 ]
 
 [workspace.package]

@@ -25,7 +25,7 @@ use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrad
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
-use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
+use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -504,6 +504,17 @@ impl PassivePeer {
         // The blob's candidate-hygiene filters (component-1-only,
         // IPv4-only) live inside `sdp_to_answer_blob`.
         let blob = sdp_to_answer_blob(&local_desc.sdp)?;
+        // Diagnostic: surface the candidate set that made it into the
+        // answer so operators can tell at a glance whether srflx
+        // gathering succeeded. Each line is one candidate.
+        for cand in &blob.candidates {
+            tracing::info!(
+                typ = ?cand.typ,
+                ip = %cand.ip,
+                port = cand.port,
+                "openhostd: answer candidate",
+            );
+        }
 
         // Keep the PC alive so the DTLS handshake can complete after we
         // return the answer. The prune hook wired above will remove
@@ -1292,9 +1303,25 @@ async fn start_websocket_tunnel(
     Ok(())
 }
 
-/// Body chunks are bounded by [`MAX_PAYLOAD_LEN`] (16 MiB − 1) per
-/// the wire codec; larger upstream bodies get split into multiple
-/// `RESPONSE_BODY` frames.
+/// SCTP per-message ceiling for RESPONSE_BODY chunks. The wire
+/// codec allows up to `MAX_PAYLOAD_LEN` (16 MiB), but SCTP itself
+/// rejects individual messages above its negotiated MTU. 60 KiB
+/// has comfortable headroom under every real-world SCTP
+/// negotiation we've observed while keeping the per-message
+/// overhead low.
+const SCTP_SAFE_CHUNK_BYTES: usize = 60 * 1024;
+
+/// Pause sending new body chunks once the data-channel's send buffer
+/// exceeds this high-water mark (1 MiB). Resume when it drains under
+/// the low-water mark. Prevents "Failure to send data" from the SCTP
+/// transport when the application outruns the peer's receive window.
+const SCTP_BUFFER_HIGH_WATER: usize = 1024 * 1024;
+const SCTP_BUFFER_LOW_WATER: usize = 256 * 1024;
+
+/// Emit a forwarder response split across frames of at most
+/// [`SCTP_SAFE_CHUNK_BYTES`] bytes per `RESPONSE_BODY`, with
+/// `buffered_amount`-based backpressure so a large body does not
+/// overrun the SCTP send buffer.
 async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(), webrtc::Error> {
     send_frame(
         dc,
@@ -1302,13 +1329,41 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
     )
     .await?;
 
+    // Wire up a drain-notify: the SCTP stack fires
+    // `on_buffered_amount_low` when the buffered byte count drops
+    // below our threshold. We wait on that notify after every
+    // chunk that pushes us over the high-water mark.
+    let drain_notify: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+    dc.set_buffered_amount_low_threshold(SCTP_BUFFER_LOW_WATER)
+        .await;
+    {
+        let drain_notify = drain_notify.clone();
+        dc.on_buffered_amount_low(Box::new(move || {
+            let drain_notify = drain_notify.clone();
+            Box::pin(async move {
+                drain_notify.notify_waiters();
+            })
+        }))
+        .await;
+    }
+
     let body = resp.body;
     let mut offset = 0;
     while offset < body.len() {
-        let end = (offset + MAX_PAYLOAD_LEN).min(body.len());
+        // Backpressure: if the DC buffer is above the high-water
+        // mark, wait for the low-threshold callback before enqueuing
+        // another chunk. 50 ms fallback poll so we don't deadlock
+        // if the callback is ever missed.
+        while dc.buffered_amount().await > SCTP_BUFFER_HIGH_WATER {
+            let wait = drain_notify.notified();
+            tokio::pin!(wait);
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut wait).await;
+        }
+
+        let end = (offset + SCTP_SAFE_CHUNK_BYTES).min(body.len());
         let slice = body.slice(offset..end);
         let body_frame = Frame::new(FrameType::ResponseBody, slice.to_vec())
-            .expect("chunk length bounded by MAX_PAYLOAD_LEN");
+            .expect("chunk length bounded by SCTP_SAFE_CHUNK_BYTES");
         send_frame(dc, body_frame).await?;
         offset = end;
     }
