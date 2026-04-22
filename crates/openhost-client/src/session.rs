@@ -15,8 +15,8 @@
 //! one DC is not yet supported end-to-end).
 
 use crate::error::{ClientError, Result};
-use bytes::Bytes;
-use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use openhost_core::wire::{Frame, FrameType, FRAME_V2_HEADER_LEN, MAX_PAYLOAD_LEN};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -58,7 +58,8 @@ impl OpenhostSession {
     /// `body` may be empty.
     pub async fn request(&self, head_bytes: &[u8], body: Bytes) -> Result<ClientResponse> {
         // Send REQUEST_HEAD.
-        let mut wire: Vec<u8> = Vec::new();
+        let mut wire: Vec<u8> =
+            Vec::with_capacity(head_bytes.len() + body.len() + 2 * FRAME_V2_HEADER_LEN);
         Frame::new(FrameType::RequestHead, head_bytes.to_vec())
             .map_err(|e| ClientError::HttpRoundTrip(format!("build REQUEST_HEAD: {e}")))?
             .encode(&mut wire);
@@ -159,7 +160,7 @@ impl Drop for OpenhostSession {
 /// Inbound frame reader. Wraps the DC's `on_message` buffer + a
 /// `Notify` the reader awaits when it runs out of frames to decode.
 pub struct SessionInboundReader {
-    buffer: Arc<Mutex<Vec<u8>>>,
+    buffer: Arc<Mutex<BytesMut>>,
     notify: Arc<Notify>,
 }
 
@@ -174,7 +175,7 @@ impl SessionInboundReader {
     /// lost-wakeup for exactly that race window, and the binding
     /// handshake's first frame is the common case where it fires.
     pub(crate) fn install(dc: &Arc<RTCDataChannel>) -> Self {
-        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::new()));
         let notify: Arc<Notify> = Arc::new(Notify::new());
         let buf_for_msg = Arc::clone(&buffer);
         let notify_for_msg = Arc::clone(&notify);
@@ -182,7 +183,7 @@ impl SessionInboundReader {
             let buf = Arc::clone(&buf_for_msg);
             let notify = Arc::clone(&notify_for_msg);
             Box::pin(async move {
-                buf.lock().await.extend_from_slice(&msg.data);
+                buf.lock().await.put_slice(&msg.data);
                 notify.notify_one();
             })
         }));
@@ -199,7 +200,7 @@ impl SessionInboundReader {
                 let mut buf = self.buffer.lock().await;
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                        buf.advance(consumed);
                         return Ok(frame);
                     }
                     Ok(None) => {
