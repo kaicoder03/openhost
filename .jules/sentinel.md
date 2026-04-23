@@ -1,0 +1,4 @@
+## 2025-05-14 - Harden HTTP/1.1 Request Head Parser
+**Vulnerability:** Hand-rolled HTTP parser was too permissive, accepting obsolete line folding, whitespace before colons, and bare CR/LF, which are prohibited by RFC 7230.
+**Learning:** Hand-rolled parsers for complex protocols like HTTP often miss security-critical validation rules specified in RFCs, potentially leading to request smuggling or other desynchronization attacks when paired with an upstream server.
+**Prevention:** Always validate HTTP header field names and values strictly according to RFC 7230 §3.2.4 and §3.5. Specifically, reject any whitespace between the field name and colon, reject obsolete line folding (starting a header line with whitespace), and reject bare CR or LF octets. Trimming trailing OWS from values is also required.

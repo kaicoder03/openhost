@@ -354,6 +354,11 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
     let request_line = lines
         .next()
         .ok_or(ForwardError::HeadParse("empty request head"))?;
+    if request_line.contains(['\r', '\n']) {
+        return Err(ForwardError::HeadParse(
+            "bare CR or LF in request line is not allowed",
+        ));
+    }
 
     let mut parts = request_line.split(' ');
     let method_str = parts
@@ -380,12 +385,27 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.contains(['\r', '\n']) {
+            return Err(ForwardError::HeadParse(
+                "bare CR or LF in header line is not allowed",
+            ));
+        }
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding is not supported",
+            ));
+        }
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace before colon is not allowed",
+            ));
+        }
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` around the value.
+        let value = line[colon + 1..].trim();
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +802,50 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the
+        // header field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(m) if m.contains("whitespace before colon")),
+            "expected 'whitespace before colon' error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_whitespace_from_values() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com \r\n\r\n";
+        let (_, _, h) = parse_request_head(raw).unwrap();
+        assert_eq!(h.get("host").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obsolete_line_folding() {
+        // RFC 7230 §3.2.4: "A proxy or gateway that receives an obs-fold
+        // MUST [...] reject the message by sending a 400 (Bad Request)"
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n Folded: yes\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(m) if m.contains("obsolete line folding")),
+            "expected 'obsolete line folding' error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_rejects_bare_lf() {
+        // RFC 7230 §3.2.4: "A recipient MUST parse an HTTP message as a
+        // sequence of OCTETs [...] A recipient SHOULD treat a bare LF
+        // [...] as an error."
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\nEvil: yes\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(m) if m.contains("bare CR or LF")),
+            "expected 'bare CR or LF' error, got: {err:?}"
+        );
     }
 
     // --- Response head encoder --------------------------------------
