@@ -4,12 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!--
-  CORS-enabled pkarr relay the web app speaks to. Baked-in at
-  deploy time so GitHub Pages (or any other static host) doesn't
-  need a JS rebuild to switch endpoints — change this meta tag
-  and re-upload.
+  Public pkarr relay the web app speaks to. CORS is wildcard-open
+  so a page served from GitHub Pages (or any other static host) can
+  PUT + GET directly. Swap this for a self-hosted relay by editing
+  the `content` attribute — no JS rebuild required.
 -->
-<meta name="oh-relay" content="https://tunes-sims-pension-alabama.trycloudflare.com">
+<meta name="oh-relay" content="https://pkarr.pubky.app">
 <title>oh — receive a file</title>
 <style>
   :root {
