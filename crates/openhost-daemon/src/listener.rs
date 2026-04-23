@@ -1426,7 +1426,8 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
 
 /// Encode one frame and send it as its own data-channel message.
 async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<(), webrtc::Error> {
-    let mut buf = Vec::with_capacity(openhost_core::wire::FRAME_V2_HEADER_LEN + frame.payload.len());
+    let mut buf =
+        Vec::with_capacity(openhost_core::wire::FRAME_V2_HEADER_LEN + frame.payload.len());
     frame.encode(&mut buf);
     dc.send(&Bytes::from(buf)).await?;
     Ok(())
