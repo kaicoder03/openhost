@@ -61,7 +61,8 @@ mod tests {
         assert!(out.contains(&code.to_words()), "words must appear");
         // The QR uses Unicode block chars — assert we produced some.
         assert!(
-            out.chars().any(|c| matches!(c, '▀' | '▄' | '█' | ' ' | '\n')),
+            out.chars()
+                .any(|c| matches!(c, '▀' | '▄' | '█' | ' ' | '\n')),
             "QR block-char rendering must appear",
         );
     }

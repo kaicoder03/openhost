@@ -307,7 +307,9 @@ mod tests {
     async fn ok_response_carries_sha256_header() {
         let blob = FileBlob {
             bytes: Bytes::from_static(b"abc"),
-            sha256: String::from("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            sha256: String::from(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
             filename: "abc.txt".to_owned(),
             path: PathBuf::new(),
         };

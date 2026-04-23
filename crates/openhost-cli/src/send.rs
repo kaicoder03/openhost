@@ -21,8 +21,8 @@
 
 use anyhow::{Context, Result};
 use openhost_daemon::config::{
-    BindingModeConfig, Config, DtlsConfig, ForwardConfig, IdentityConfig, IdentityStore,
-    LogConfig, OfferPollConfig, PairingConfig, PkarrConfig, TurnConfig,
+    BindingModeConfig, Config, DtlsConfig, ForwardConfig, IdentityConfig, IdentityStore, LogConfig,
+    OfferPollConfig, PairingConfig, PkarrConfig, TurnConfig,
 };
 use openhost_daemon::App;
 use openhost_peer::{PairingCode, Roles};
@@ -110,11 +110,10 @@ pub async fn run(file: PathBuf) -> Result<()> {
     )
     .expect("Ed25519 verifying keys are always valid PublicKey bytes")
     .to_zbase32();
-    let sender_pk_zbase32 = openhost_core::identity::PublicKey::from_bytes(
-        &roles.sender().verifying_key().to_bytes(),
-    )
-    .expect("Ed25519 verifying keys are always valid PublicKey bytes")
-    .to_zbase32();
+    let sender_pk_zbase32 =
+        openhost_core::identity::PublicKey::from_bytes(&roles.sender().verifying_key().to_bytes())
+            .expect("Ed25519 verifying keys are always valid PublicKey bytes")
+            .to_zbase32();
 
     let cfg = build_config(
         &identity_path,

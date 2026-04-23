@@ -37,14 +37,12 @@ const RECV_DIAL_TIMEOUT: Duration = Duration::from_secs(120);
 ///   a filename from the server's `Content-Disposition` header (or
 ///   fall back to `openhost-transfer.bin` in the CWD).
 pub async fn run(code_str: &str, out: Option<PathBuf>) -> Result<()> {
-    let code = PairingCode::parse(code_str)
-        .map_err(|e| anyhow!("parse pairing code: {e}"))?;
+    let code = PairingCode::parse(code_str).map_err(|e| anyhow!("parse pairing code: {e}"))?;
     let roles = Roles::derive(&code);
 
-    let sender_pk = openhost_core::identity::PublicKey::from_bytes(
-        &roles.sender().verifying_key().to_bytes(),
-    )
-    .map_err(|e| anyhow!("sender pubkey from roles: {e}"))?;
+    let sender_pk =
+        openhost_core::identity::PublicKey::from_bytes(&roles.sender().verifying_key().to_bytes())
+            .map_err(|e| anyhow!("sender pubkey from roles: {e}"))?;
     let sender_pk_zbase32 = sender_pk.to_zbase32();
     let host_url = OpenhostUrl::parse(&format!("oh://{sender_pk_zbase32}/"))
         .map_err(|e| anyhow!("internal: generated oh:// URL did not parse: {e}"))?;
@@ -72,10 +70,7 @@ pub async fn run(code_str: &str, out: Option<PathBuf>) -> Result<()> {
         .build()
         .map_err(|e| anyhow!("build dialer: {e}"))?;
 
-    let session = dialer
-        .dial()
-        .await
-        .map_err(|e| anyhow!("dial: {e}"))?;
+    let session = dialer.dial().await.map_err(|e| anyhow!("dial: {e}"))?;
 
     eprintln!("oh recv: connected. Requesting file…");
 
@@ -95,11 +90,7 @@ pub async fn run(code_str: &str, out: Option<PathBuf>) -> Result<()> {
 
     let out_path = match out {
         Some(p) => p,
-        None => PathBuf::from(
-            filename_hint
-                .as_deref()
-                .unwrap_or("openhost-transfer.bin"),
-        ),
+        None => PathBuf::from(filename_hint.as_deref().unwrap_or("openhost-transfer.bin")),
     };
 
     tokio::fs::write(&out_path, &resp.body)
@@ -151,9 +142,7 @@ fn build_get_request_head() -> String {
 fn parse_http_head(head_bytes: &[u8]) -> Result<(u16, Vec<(String, String)>)> {
     let text = std::str::from_utf8(head_bytes).context("response head is not UTF-8")?;
     let mut lines = text.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("empty response head"))?;
+    let status_line = lines.next().ok_or_else(|| anyhow!("empty response head"))?;
     let mut parts = status_line.splitn(3, ' ');
     let _http_ver = parts.next();
     let status_str = parts
@@ -229,9 +218,9 @@ fn sanitise_filename(raw: &str) -> String {
 pub async fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("create parent directory: {}", parent.display())
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create parent directory: {}", parent.display()))?;
         }
     }
     Ok(())
@@ -276,7 +265,10 @@ mod tests {
 
     #[test]
     fn filename_from_cd_unquoted() {
-        let hs = vec![hdr("content-disposition", "attachment; filename=report.pdf")];
+        let hs = vec![hdr(
+            "content-disposition",
+            "attachment; filename=report.pdf",
+        )];
         assert_eq!(
             filename_from_content_disposition(&hs).as_deref(),
             Some("report.pdf")
