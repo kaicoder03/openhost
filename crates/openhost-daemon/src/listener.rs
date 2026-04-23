@@ -310,6 +310,12 @@ pub struct PassivePeer {
     /// it self-allocates a relay candidate for ICE. Empty string
     /// when the daemon wasn't started with TURN enabled.
     turn_password: String,
+    /// Additional ICE servers threaded in by the caller (e.g. `oh
+    /// send` adds a public-internet TURN from env vars so
+    /// cross-network dials can relay without the sender owning a
+    /// public IP). Always appended to the listener's own STUN +
+    /// embedded-TURN entries — never replaces them.
+    extra_ice_servers: Vec<webrtc::ice_transport::ice_server::RTCIceServer>,
     /// Localhost forwarder. `None` falls back to the PR #5 stub
     /// (`HTTP/1.1 502 Bad Gateway` on every `REQUEST_HEAD`) — a daemon
     /// without a `[forward]` config section stays serviceable as a
@@ -329,6 +335,7 @@ impl PassivePeer {
         identity: Arc<SigningKey>,
         state: Arc<SharedState>,
         forwarder: Option<Arc<Forwarder>>,
+        extra_ice_servers: Vec<webrtc::ice_transport::ice_server::RTCIceServer>,
     ) -> Result<Self, ListenerError> {
         // rustls 0.23+ requires a CryptoProvider before any TLS / DTLS
         // session is established. Install ring once per process; the
@@ -382,6 +389,7 @@ impl PassivePeer {
             skip_ice_gather: Arc::new(AtomicBool::new(false)),
             binder,
             turn_password,
+            extra_ice_servers,
             forwarder,
         })
     }
@@ -487,6 +495,10 @@ impl PassivePeer {
         if let Some(turn_srv) = self.turn_ice_server() {
             ice_servers.push(turn_srv);
         }
+        // Caller-supplied extras: e.g. a public-internet TURN on a
+        // cloud VPS so peers on unrelated NATs (phone on cellular
+        // + laptop on home WiFi) still get a reachable relay pair.
+        ice_servers.extend(self.extra_ice_servers.iter().cloned());
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
             ice_servers,

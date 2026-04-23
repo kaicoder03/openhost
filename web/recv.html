@@ -10,6 +10,16 @@
   the `content` attribute — no JS rebuild required.
 -->
 <meta name="oh-relay" content="https://pkarr.pubky.app">
+<!--
+  Public-internet TURN relay for cross-network dials (phone on
+  cellular ↔ laptop on home WiFi). `oh send` advertises a local
+  TURN bound to its LAN IP, which is unreachable from elsewhere;
+  this additional TURN on a cloud VPS is always reachable by
+  both peers. Static user/password — coturn's `lt-cred-mech`.
+-->
+<meta name="oh-public-turn-url" content="turn:3.238.149.237:3478">
+<meta name="oh-public-turn-user" content="openhost">
+<meta name="oh-public-turn-password" content="7eedd7df2a910a1acb05530865c07134">
 <title>oh — receive a file</title>
 <style>
   :root {
