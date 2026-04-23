@@ -55,6 +55,18 @@ export const BINDING_MODE_CERT_FP = 0x02;
 //      without a JS rebuild.
 //   3. `http://127.0.0.1:8080` — local dev default, matches
 //      `tools/oh-dev-relay.py`.
+/// Read the `<meta name="oh-public-turn-url">` tag (plus -user and
+/// -password) and return an RTCIceServer entry, or `null` if any of
+/// the three tags are missing.
+function publicTurnFromMeta() {
+  if (typeof document === "undefined") return null;
+  const url = document.querySelector('meta[name="oh-public-turn-url"]')?.content;
+  const user = document.querySelector('meta[name="oh-public-turn-user"]')?.content;
+  const password = document.querySelector('meta[name="oh-public-turn-password"]')?.content;
+  if (!url || !user || !password) return null;
+  return { urls: [url], username: user, credential: password };
+}
+
 function resolveDefaultRelay() {
   if (typeof window !== "undefined") {
     if (window.OH_RELAY_URL) return window.OH_RELAY_URL;
@@ -219,6 +231,15 @@ export async function dialOhUrl(ohUrl, opts = {}) {
         turnServer.urls[0],
       );
     }
+  }
+  // Public-internet TURN baked into the static deploy. Lets
+  // peers on different NATs (phone on cellular + laptop on home
+  // WiFi) relay through a shared cloud box when neither sender's
+  // own TURN (LAN-bound) is reachable.
+  const publicTurn = publicTurnFromMeta();
+  if (publicTurn) {
+    iceServers.push(publicTurn);
+    console.log("openhost dialer: public TURN advertised —", publicTurn.urls[0]);
   }
   const pc = new RTCPeerConnection({ iceServers });
   const dc = pc.createDataChannel("openhost", { ordered: true });

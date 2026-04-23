@@ -393,15 +393,49 @@ async fn build_listener(
     state: Arc<SharedState>,
     forwarder: Option<Arc<Forwarder>>,
 ) -> Result<Arc<PassivePeer>> {
+    // Optional public-internet TURN (OH_PUBLIC_TURN_URL +
+    // OH_PUBLIC_TURN_USER + OH_PUBLIC_TURN_PASSWORD). Set by
+    // callers like `oh send` so peers on different NATs can
+    // always reach each other via a shared relay. Missing any
+    // of the three env vars disables the entry — the listener
+    // falls back to STUN + (optionally) its own embedded TURN.
+    let extra = public_turn_from_env();
     let peer = PassivePeer::new(
         cert.certificate.clone(),
         cert.fingerprint_sha256,
         identity,
         state,
         forwarder,
+        extra,
     )
     .await?;
     Ok(Arc::new(peer))
+}
+
+/// Read the `OH_PUBLIC_TURN_*` env triplet and turn it into an ICE
+/// server entry. Returning an empty Vec (not an error) when any var
+/// is missing makes the knob fully opt-in — default behaviour is
+/// unchanged.
+fn public_turn_from_env() -> Vec<webrtc::ice_transport::ice_server::RTCIceServer> {
+    let (Ok(url), Ok(user), Ok(pass)) = (
+        std::env::var("OH_PUBLIC_TURN_URL"),
+        std::env::var("OH_PUBLIC_TURN_USER"),
+        std::env::var("OH_PUBLIC_TURN_PASSWORD"),
+    ) else {
+        return Vec::new();
+    };
+    if url.trim().is_empty() || user.trim().is_empty() || pass.trim().is_empty() {
+        return Vec::new();
+    }
+    tracing::info!(
+        url = %url,
+        "openhostd: public TURN wired from OH_PUBLIC_TURN_URL"
+    );
+    vec![webrtc::ice_transport::ice_server::RTCIceServer {
+        urls: vec![url],
+        username: user,
+        credential: pass,
+    }]
 }
 
 /// Spawn an [`OfferPoller`] from the config's `offer_poll` section.
