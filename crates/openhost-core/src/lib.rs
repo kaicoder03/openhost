@@ -15,6 +15,7 @@
 //!   construction used by the handshake.
 //! - [`wire`] — HTTP-over-DataChannel framing as specified in `spec/01-wire-format.md` §4.
 //! - [`pkarr_record`] — openhost v1 signed DNS record schema on top of Pkarr.
+//! - [`turn`] — TURN credentials and quota tokens for relay-fallback ICE.
 //!
 //! Every module has matching test vectors under `spec/test-vectors/`. Implementations in
 //! other languages are expected to pass the same vectors verbatim.
@@ -24,6 +25,7 @@ pub mod crypto;
 pub mod error;
 pub mod identity;
 pub mod pkarr_record;
+pub mod turn;
 pub mod wire;
 
 pub use error::{Error, Result};
