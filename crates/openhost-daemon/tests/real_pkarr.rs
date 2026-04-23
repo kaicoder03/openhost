@@ -38,6 +38,7 @@ fn real_config(dir: &TempDir) -> Config {
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),
             rotate_secs: 3600,
+            allowed_binding_modes: vec![], // default_allowed_binding_modes() is private, but this test doesn't dial
         },
         forward: None,
         log: LogConfig::default(),

@@ -689,7 +689,8 @@ impl Drop for PeerConnectionGuard {
 }
 
 async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<()> {
-    let mut buf = Vec::with_capacity(5 + frame.payload.len());
+    let mut buf =
+        Vec::with_capacity(openhost_core::wire::FRAME_V2_HEADER_LEN + frame.payload.len());
     frame.encode(&mut buf);
     dc.send(&Bytes::from(buf))
         .await
