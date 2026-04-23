@@ -3,6 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  CORS-enabled pkarr relay the web app speaks to. Baked-in at
+  deploy time so GitHub Pages (or any other static host) doesn't
+  need a JS rebuild to switch endpoints — change this meta tag
+  and re-upload.
+-->
+<meta name="oh-relay" content="https://tunes-sims-pension-alabama.trycloudflare.com">
 <title>oh — receive a file</title>
 <style>
   :root {

@@ -44,16 +44,28 @@ export const FRAME = Object.freeze({
 
 export const BINDING_MODE_CERT_FP = 0x02;
 
-// Web-app build: routes pkarr PUT/GET through a CORS-enabled proxy
-// hosted on the same machine as the sender. Public pkarr relays do
-// not emit `Access-Control-Allow-Origin` so a browser `fetch` from
-// e.g. `http://localhost:8000` is rejected by the same-origin policy.
-// The proxy at `OH_RELAY_URL` (window-global, settable from the page)
-// simply forwards to `relay.pkarr.org` with CORS headers added.
-const DEFAULT_RELAY = (typeof window !== "undefined" && window.OH_RELAY_URL)
-  ? [window.OH_RELAY_URL]
-  : ["http://127.0.0.1:8080"];
-const RELAYS = DEFAULT_RELAY;
+// Web-app build: browser pkarr PUT/GET can't reach the public relays
+// directly (they don't send `Access-Control-Allow-Origin`), so the
+// web app always speaks to a CORS-enabled relay of our choosing.
+//
+// Resolution order for the relay URL:
+//   1. `window.OH_RELAY_URL` — set by the page via inline script.
+//   2. `<meta name="oh-relay" content="https://…">` — lets a static
+//      deploy (GitHub Pages, Netlify, etc.) bake in the relay URL
+//      without a JS rebuild.
+//   3. `http://127.0.0.1:8080` — local dev default, matches
+//      `tools/oh-dev-relay.py`.
+function resolveDefaultRelay() {
+  if (typeof window !== "undefined") {
+    if (window.OH_RELAY_URL) return window.OH_RELAY_URL;
+    if (typeof document !== "undefined") {
+      const meta = document.querySelector('meta[name="oh-relay"]');
+      if (meta && meta.content) return meta.content.trim();
+    }
+  }
+  return "http://127.0.0.1:8080";
+}
+const RELAYS = [resolveDefaultRelay()];
 const STUN = [{ urls: "stun:stun.l.google.com:19302" }];
 
 let initPromise = null;
