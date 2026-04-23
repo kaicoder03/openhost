@@ -305,6 +305,11 @@ pub struct PassivePeer {
     /// binder signs `AuthHost` payloads and verifies `AuthClient`
     /// signatures per spec §7.1.
     binder: Arc<ChannelBinder>,
+    /// TURN credential (deterministic in the daemon's public key)
+    /// the listener presents to its OWN embedded TURN relay when
+    /// it self-allocates a relay candidate for ICE. Empty string
+    /// when the daemon wasn't started with TURN enabled.
+    turn_password: String,
     /// Localhost forwarder. `None` falls back to the PR #5 stub
     /// (`HTTP/1.1 502 Bad Gateway` on every `REQUEST_HEAD`) — a daemon
     /// without a `[forward]` config section stays serviceable as a
@@ -359,6 +364,11 @@ impl PassivePeer {
 
         let api = APIBuilder::new().with_setting_engine(engine).build();
 
+        // Pre-compute our own TURN password — deterministic in the
+        // daemon's pubkey, same value the embedded TURN server
+        // authenticates against. Cheap, and we only need it once
+        // per listener build.
+        let turn_password = crate::turn_server::password_for_daemon(&identity.public_key());
         let binder = Arc::new(ChannelBinder::new(identity));
 
         Ok(Self {
@@ -371,7 +381,23 @@ impl PassivePeer {
             binding_timeout_secs: Arc::new(AtomicU64::new(BINDING_TIMEOUT_SECS)),
             skip_ice_gather: Arc::new(AtomicBool::new(false)),
             binder,
+            turn_password,
             forwarder,
+        })
+    }
+
+    /// Build an `RTCIceServer` pointing at our OWN embedded TURN
+    /// relay if one is advertised in the shared state. Returns
+    /// `None` when `[turn] enabled = false` (or the endpoint hasn't
+    /// been set yet — rare race at startup).
+    fn turn_ice_server(
+        &self,
+    ) -> Option<webrtc::ice_transport::ice_server::RTCIceServer> {
+        let ep = self.state.turn_endpoint()?;
+        Some(webrtc::ice_transport::ice_server::RTCIceServer {
+            urls: vec![format!("turn:{}:{}", ep.ip, ep.port)],
+            username: crate::turn_server::TURN_USERNAME.to_owned(),
+            credential: self.turn_password.clone(),
         })
     }
 
@@ -451,9 +477,21 @@ impl PassivePeer {
         offer_sdp: &str,
         binding_mode: BindingMode,
     ) -> Result<AnswerBlob, ListenerError> {
+        // Build ICE servers: STUN for srflx, PLUS the daemon's own
+        // embedded TURN relay (if running) so the listener itself
+        // gathers a `relay` candidate. Without this the answer only
+        // exposes host + srflx — and Chrome on the same machine
+        // emits `.local` mDNS host candidates that webrtc-rs doesn't
+        // resolve reliably, so no (host, *) pair ever succeeds. The
+        // (relay, relay) pair via our TURN is always reachable over
+        // loopback + LAN.
+        let mut ice_servers = default_stun_servers();
+        if let Some(turn_srv) = self.turn_ice_server() {
+            ice_servers.push(turn_srv);
+        }
         let config = RTCConfiguration {
             certificates: vec![self.certificate.clone()],
-            ice_servers: default_stun_servers(),
+            ice_servers,
             ..Default::default()
         };
         let pc = Arc::new(self.api.new_peer_connection(config).await?);

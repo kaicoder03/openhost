@@ -26,6 +26,7 @@ use openhost_daemon::config::{
 };
 use openhost_daemon::App;
 use openhost_peer::{PairingCode, Roles};
+use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -59,6 +60,63 @@ const INITIAL_PUBLISH_WAIT: Duration = Duration::from_secs(5);
 ///
 /// Override with `OH_RELAYS=url1,url2,…` if you need a different
 /// mix (self-hosted relay, enterprise deployment, etc.).
+/// Discover the primary outbound IPv4 address of this host. Uses
+/// the classic "UDP connect-to-nothing" trick: we don't actually
+/// send a packet — the OS just picks the interface it would route
+/// via 8.8.8.8 and returns that interface's source IP. Works on
+/// Mac / Linux / Windows without enumerating interfaces.
+///
+/// Returns `None` when no routable IPv4 address is available
+/// (purely-IPv6 host, offline, etc.).
+fn discover_lan_ipv4() -> Option<Ipv4Addr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v) if !v.is_loopback() => Some(v),
+        _ => None,
+    }
+}
+
+/// Build the sender's embedded TURN relay config. On the sender
+/// side ICE host candidates from Chrome arrive as `.local` mDNS
+/// hostnames which webrtc-rs doesn't resolve reliably; a LAN-
+/// reachable TURN relay gives ICE a guaranteed pair to land on
+/// for both same-machine and same-subnet dials.
+///
+/// Env-var overrides:
+/// - `OH_TURN_DISABLE=1` — fall back to the no-TURN behaviour.
+/// - `OH_TURN_PUBLIC_IP=<ipv4>` — force the advertised public IP
+///   (default: the LAN IP discovered via the outbound-route trick).
+/// - `OH_TURN_PUBLIC_PORT=<port>` — force the advertised port
+///   (default: the bind port). Set when you've port-forwarded
+///   the daemon to a different external port.
+fn build_turn_config() -> TurnConfig {
+    if std::env::var("OH_TURN_DISABLE").ok().as_deref() == Some("1") {
+        return TurnConfig::default();
+    }
+    let public_ip = std::env::var("OH_TURN_PUBLIC_IP")
+        .ok()
+        .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        .or_else(discover_lan_ipv4);
+    let Some(ip) = public_ip else {
+        // No LAN IP — stay disabled rather than binding to a
+        // useless loopback-only relay.
+        return TurnConfig::default();
+    };
+    let public_port = std::env::var("OH_TURN_PUBLIC_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok());
+    TurnConfig {
+        enabled: true,
+        // Bind an OS-assigned port on all interfaces. The daemon
+        // picks the port at start-up and we advertise the same
+        // number unless OH_TURN_PUBLIC_PORT overrides it.
+        bind_addr: "0.0.0.0:0".to_string(),
+        public_ip: Some(ip),
+        public_port,
+    }
+}
+
 pub(crate) fn default_peer_relays() -> Vec<String> {
     if let Ok(s) = std::env::var("OH_RELAYS") {
         let out: Vec<String> = s
@@ -71,7 +129,10 @@ pub(crate) fn default_peer_relays() -> Vec<String> {
             return out;
         }
     }
-    vec!["https://relay.pkarr.org".to_owned()]
+    // Match the web app's baked-in relay (`web/recv.html`
+    // meta[name=oh-relay]`) so CLI senders and browser receivers
+    // publish + read from the same pkarr substrate by default.
+    vec!["https://pkarr.pubky.app".to_owned()]
 }
 
 /// Run `oh send`. Returns after the transfer completes (server
@@ -242,14 +303,20 @@ fn build_config(
             db_path: Some(pair_db_path.to_path_buf()),
             watch_debounce_ms: 250,
         },
-        // TURN disabled: a laptop behind NAT can't usefully run a
-        // TURN relay for internet peers (the bind port would need
-        // to be reachable from outside). Same-LAN transfers work
-        // via ICE host candidates; internet transfers hole-punch
-        // via STUN srflx candidates. If both peers are stuck
-        // behind symmetric NATs, the receiver's daemon (if it
-        // has a public IP, e.g. a cloud VM) is the one that
-        // should run TURN.
-        turn: TurnConfig::default(),
+        // TURN enabled on the sender's LAN IP. Chrome's WebRTC
+        // emits `<guid>.local` mDNS host candidates that webrtc-rs's
+        // resolver doesn't pick up reliably across the pkarr round-
+        // trip, so relying on host↔host pairs fails for
+        // browser↔CLI dials on the same machine. Putting a TURN
+        // server on the LAN IP means both peers always have a
+        // guaranteed-reachable `relay` candidate and ICE always
+        // finds a working pair — same machine OR same subnet.
+        //
+        // For cross-internet (browser behind a different NAT),
+        // the LAN IP isn't reachable; set OH_TURN_PUBLIC_IP to
+        // an externally reachable address + open the UDP port
+        // for that scenario. No-op disable (OH_TURN_DISABLE=1)
+        // bails out to the prior no-TURN behavior.
+        turn: build_turn_config(),
     }
 }
