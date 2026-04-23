@@ -219,6 +219,16 @@ export async function dialOhUrl(ohUrl, opts = {}) {
   await pc.setLocalDescription(offer);
   await waitForIceComplete(pc);
   const offerSdp = pc.localDescription.sdp;
+  // Log every candidate in the offer SDP. This is the ground truth
+  // for "did the browser emit a LAN host candidate" — if none appear
+  // and both peers are on the same subnet, ICE will have to rely on
+  // srflx-srflx through NAT hairpin, which most consumer routers
+  // don't perform.
+  for (const line of offerSdp.split(/\r?\n/)) {
+    if (line.startsWith("a=candidate:")) {
+      console.log("openhost dialer: offer candidate:", line);
+    }
+  }
 
   // 4. Seal + publish offer.
   const sealed = seal_offer(daemonPkZ, clientPkZ, offerSdp, BINDING_MODE_CERT_FP);
