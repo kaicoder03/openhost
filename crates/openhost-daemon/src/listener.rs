@@ -390,9 +390,7 @@ impl PassivePeer {
     /// relay if one is advertised in the shared state. Returns
     /// `None` when `[turn] enabled = false` (or the endpoint hasn't
     /// been set yet — rare race at startup).
-    fn turn_ice_server(
-        &self,
-    ) -> Option<webrtc::ice_transport::ice_server::RTCIceServer> {
+    fn turn_ice_server(&self) -> Option<webrtc::ice_transport::ice_server::RTCIceServer> {
         let ep = self.state.turn_endpoint()?;
         Some(webrtc::ice_transport::ice_server::RTCIceServer {
             urls: vec![format!("turn:{}:{}", ep.ip, ep.port)],
