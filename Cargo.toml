@@ -7,6 +7,8 @@ members = [
     "crates/openhost-pkarr",
     "crates/openhost-pkarr-wasm",
     "crates/openhost-ffi",
+    "crates/openhost-peer",
+    "crates/openhost-cli",
 ]
 
 [workspace.package]
@@ -34,6 +36,10 @@ subtle = "2"
 zbase32 = "0.1"
 base64 = "0.22"
 hex = "0.4"
+# BIP-39 mnemonic wordlist for the `openhost-peer` pairing-code
+# encoding — 12 English words → 128-bit entropy. Pure Rust, no_std
+# optional; we use default features for the English wordlist + `std`.
+bip39 = "2"
 # PR #11: zlib compression for the sealed-box inner plaintext so
 # answer SDPs fit the BEP44 1000-byte `v` cap. Pure-Rust backend via
 # miniz_oxide; no C deps.

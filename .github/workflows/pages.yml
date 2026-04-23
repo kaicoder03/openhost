@@ -6,6 +6,7 @@ on:
     paths:
       - "site/**"
       - "spec/**"
+      - "web/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -40,6 +41,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm build
+
+      # Copy the static `web/` app into the Astro build output at
+      # `/app/` so it ships under the same Pages domain as the
+      # docs site (→ `https://<user>.github.io/openhost/app/`).
+      # No JS build step — web/ is already HTML + JS + WASM.
+      - name: Copy web/ into dist
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p site/dist/app
+          cp -R web/. site/dist/app/
 
       - uses: actions/configure-pages@v5
 

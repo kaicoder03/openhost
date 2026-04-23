@@ -523,7 +523,13 @@ async fn maybe_spawn_turn(
         .map_err(|e| {
             crate::error::DaemonError::Turn(format!("failed to spawn TURN server: {e}"))
         })?;
-    let public_port = cfg.turn.public_port.unwrap_or(bind_addr.port());
+    // Use the HANDLE's bound port, not bind_addr.port(). `bind_addr`
+    // can carry `:0` (OS-assigned) in which case the real port is
+    // only known after the UDP socket is opened.
+    let public_port = cfg
+        .turn
+        .public_port
+        .unwrap_or_else(|| handle.local_addr().port());
     state.set_turn_endpoint(Some(openhost_core::pkarr_record::TurnEndpoint {
         ip: public_ip,
         port: public_port,

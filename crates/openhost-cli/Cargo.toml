@@ -1,0 +1,62 @@
+[package]
+name = "openhost-cli"
+description = "`oh` — CLI for peer-to-peer file transfer over openhost (send / recv)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oh"
+path = "src/bin/oh.rs"
+
+[dependencies]
+openhost-core = { path = "../openhost-core" }
+openhost-pkarr = { path = "../openhost-pkarr", features = ["full"] }
+openhost-peer = { path = "../openhost-peer" }
+openhost-daemon = { path = "../openhost-daemon" }
+openhost-client = { path = "../openhost-client" }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Errors + logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Local HTTP file server for the sender side
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["server", "tokio"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+tokio-util = "0.7"
+bytes = "1"
+
+# QR code rendering for pairing-code display
+qrcode = { version = "0.14", default-features = false }
+
+# Progress bar
+indicatif = "0.17"
+
+# Temp files for ephemeral keystore + cert
+tempfile = { workspace = true }
+
+# Hashing for file integrity
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Workspace keys (Ed25519 raw bytes → file)
+ed25519-dalek = { workspace = true }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

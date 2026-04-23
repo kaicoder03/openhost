@@ -89,12 +89,20 @@ impl AuthHandler for DaemonAuthHandler {
 /// A running TURN server. Drop the handle to shut down the server.
 pub struct TurnHandle {
     server: Server,
+    local_addr: SocketAddr,
 }
 
 impl TurnHandle {
     /// Stop the server and release the UDP socket.
     pub async fn shutdown(self) -> Result<(), TurnError> {
         self.server.close().await
+    }
+
+    /// Return the UDP socket address the relay is bound to. Useful
+    /// when callers passed `:0` for an OS-assigned port and need
+    /// to know the real port for their host record.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 }
 
@@ -123,8 +131,9 @@ pub async fn spawn(
     daemon_pk: &PublicKey,
 ) -> Result<TurnHandle, TurnError> {
     let conn = Arc::new(UdpSocket::bind(cfg.bind_addr).await?);
+    let local_addr = conn.local_addr()?;
     tracing::info!(
-        addr = %conn.local_addr()?,
+        addr = %local_addr,
         public_ip = %cfg.public_ip,
         "openhostd: TURN relay listening"
     );
@@ -148,7 +157,7 @@ pub async fn spawn(
     })
     .await?;
 
-    Ok(TurnHandle { server })
+    Ok(TurnHandle { server, local_addr })
 }
 
 #[cfg(test)]

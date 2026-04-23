@@ -101,6 +101,17 @@ impl SharedState {
             .expect("turn_endpoint lock poisoned") = ep;
     }
 
+    /// Current TURN endpoint advertised in the host record, if any.
+    /// Read by the listener to self-allocate a relay candidate so
+    /// browser dials have a guaranteed (relay, relay) pair even when
+    /// Chrome's `.local` mDNS host candidates fail to resolve.
+    pub fn turn_endpoint(&self) -> Option<openhost_core::pkarr_record::TurnEndpoint> {
+        *self
+            .turn_endpoint
+            .read()
+            .expect("turn_endpoint lock poisoned")
+    }
+
     /// Queue an answer entry for publication. The entry is keyed on
     /// `entry.client_hash`; a later entry for the same client overwrites
     /// the previous one.

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oh — peer-to-peer file transfer</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  body {
+    margin: 0;
+    padding: 3rem 1.5rem;
+    max-width: 42rem;
+    margin-inline: auto;
+    line-height: 1.5;
+  }
+  h1 { margin: 0 0 0.25rem; font-size: 2rem; }
+  .subtitle { color: #666; margin: 0 0 2rem; font-size: 1.1rem; }
+  h2 { font-size: 1.1rem; margin: 1.75rem 0 0.5rem; }
+  pre, code {
+    font-family: ui-monospace, monospace;
+    background: rgba(127,127,127,0.12);
+    border-radius: 0.3rem;
+  }
+  code { padding: 0.1rem 0.3rem; }
+  pre {
+    padding: 0.85rem 1rem;
+    overflow-x: auto;
+    font-size: 0.88rem;
+  }
+  .cta {
+    display: inline-block;
+    margin-top: 0.5rem;
+    padding: 0.75rem 1.5rem;
+    font-size: 1rem;
+    font-weight: 600;
+    background: #4361ee;
+    color: white;
+    text-decoration: none;
+    border-radius: 0.4rem;
+  }
+  ol { padding-left: 1.25rem; }
+  ol li { margin-bottom: 0.5rem; }
+  hr { border: 0; border-top: 1px solid rgba(127,127,127,0.2); margin: 2rem 0; }
+</style>
+</head>
+<body>
+  <h1>oh</h1>
+  <p class="subtitle">Peer-to-peer file transfer over authenticated WebRTC. No central server touches your bytes.</p>
+
+  <a class="cta" href="./recv.html">Receive a file →</a>
+
+  <h2>How it works</h2>
+  <ol>
+    <li>Someone runs <code>oh send &lt;file&gt;</code> on their machine and shares the pairing code (12 words or a <code>oh+pair://</code> URI).</li>
+    <li>You paste the code into this page (or scan the QR if they show one).</li>
+    <li>A WebRTC data channel opens between your browser and their machine — DTLS-encrypted end-to-end, no server sees the bytes.</li>
+    <li>The file streams directly and downloads.</li>
+  </ol>
+
+  <h2>Sender setup (CLI)</h2>
+  <pre>OH_RELAYS=https://pkarr.pubky.app \
+    oh send /path/to/file</pre>
+  <p>Copy the printed <code>oh+pair://…</code> URI, and share it with the receiver.</p>
+
+  <hr>
+
+  <p style="color: #888; font-size: 0.85rem;">
+    Open-source at <a href="https://github.com/kaicoder03/openhost">github.com/kaicoder03/openhost</a>.
+    Receive-only in the browser today; send-from-browser is on the roadmap.
+  </p>
+
+</body>
+</html>
