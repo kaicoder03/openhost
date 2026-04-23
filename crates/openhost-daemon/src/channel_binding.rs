@@ -42,6 +42,7 @@ use openhost_core::identity::{PublicKey, SigningKey};
 use rand_core::RngCore;
 use std::sync::Arc;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 // Wire-level constants shared with `openhost-client`'s client-side
 // binder. The canonical source is `openhost-core::channel_binding_wire`;
@@ -168,7 +169,7 @@ impl ChannelBinder {
         let signature = Signature::from_bytes(&sig_bytes);
         client_pk
             .as_dalek()
-            .verify_strict(&auth, &signature)
+            .verify_strict(auth.as_ref(), &signature)
             .map_err(|_| ChannelBindingError::VerifyFailed)?;
 
         Ok(client_pk)
@@ -190,7 +191,7 @@ impl ChannelBinder {
             &client_pk_bytes,
             nonce,
         )?;
-        let signature = self.identity.sign(&auth);
+        let signature = self.identity.sign(auth.as_ref());
         Ok(signature.to_bytes())
     }
 }
@@ -200,9 +201,9 @@ fn derive_auth(
     host_pk: &[u8; 32],
     client_pk: &[u8; 32],
     nonce: &[u8; AUTH_NONCE_LEN],
-) -> Result<[u8; 32], ChannelBindingError> {
+) -> Result<Zeroizing<[u8; 32]>, ChannelBindingError> {
     match auth_bytes_bound(exporter_secret, host_pk, client_pk, nonce) {
-        Ok(auth) => Ok(auth),
+        Ok(auth) => Ok(Zeroizing::new(auth)),
         Err(openhost_core::Error::BufferTooSmall { have, .. }) => {
             Err(ChannelBindingError::ExporterLength(have))
         }
