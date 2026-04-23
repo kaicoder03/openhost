@@ -32,6 +32,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
+use std::io::Write;
 use std::time::Duration;
 
 /// Default connect timeout when reaching the upstream. Localhost should
@@ -524,7 +525,10 @@ fn encode_response_head(
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // Bolt: Use write! to append directly to the Vec buffer, avoiding an
+    // intermediate String allocation from format!.
+    write!(out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to a Vec always succeeds");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
