@@ -23,7 +23,7 @@ use crate::channel_binding::{
 use crate::error::ListenerError;
 use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
 use crate::publish::SharedState;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
@@ -747,7 +747,9 @@ async fn wire_frame_loop(
     binding_mode: BindingMode,
     local_dtls_fp: [u8; 32],
 ) {
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // Use BytesMut for O(1) prefix removal via `advance`. Initial capacity
+    // 64 KiB covers most REQUEST_HEADs without immediate re-allocation.
+    let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::with_capacity(64 * 1024)));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
     // `Some(tx)` during an active WebSocket tunnel; `None` otherwise.
@@ -837,11 +839,12 @@ async fn wire_frame_loop(
         let forwarder = forwarder.clone();
         Box::pin(async move {
             let mut buf = buffer.lock().await;
-            buf.extend_from_slice(&msg.data);
+            buf.put_slice(&msg.data);
             loop {
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                        // O(1) consumption: avoids the O(N) shift Vec::drain would incur.
+                        buf.advance(consumed);
                         let outcome = dispatch_frame(
                             &frame,
                             &dc,
