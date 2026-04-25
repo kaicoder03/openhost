@@ -27,12 +27,12 @@ use crate::error::ForwardError;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
-use std::io::Write;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::upgrade::Upgraded;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
+use std::io::Write;
 use std::time::Duration;
 
 /// Default connect timeout when reaching the upstream. Localhost should
