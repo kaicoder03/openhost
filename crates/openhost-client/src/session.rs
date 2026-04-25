@@ -15,7 +15,7 @@
 //! one DC is not yet supported end-to-end).
 
 use crate::error::{ClientError, Result};
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,7 +159,8 @@ impl Drop for OpenhostSession {
 /// Inbound frame reader. Wraps the DC's `on_message` buffer + a
 /// `Notify` the reader awaits when it runs out of frames to decode.
 pub struct SessionInboundReader {
-    buffer: Arc<Mutex<Vec<u8>>>,
+    // Optimization: Use BytesMut for O(1) advance instead of O(N) drain.
+    buffer: Arc<Mutex<BytesMut>>,
     notify: Arc<Notify>,
 }
 
@@ -174,7 +175,8 @@ impl SessionInboundReader {
     /// lost-wakeup for exactly that race window, and the binding
     /// handshake's first frame is the common case where it fires.
     pub(crate) fn install(dc: &Arc<RTCDataChannel>) -> Self {
-        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        // Optimization: Pre-allocate 64 KiB for the inbound buffer.
+        let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::with_capacity(64 * 1024)));
         let notify: Arc<Notify> = Arc::new(Notify::new());
         let buf_for_msg = Arc::clone(&buffer);
         let notify_for_msg = Arc::clone(&notify);
@@ -182,7 +184,8 @@ impl SessionInboundReader {
             let buf = Arc::clone(&buf_for_msg);
             let notify = Arc::clone(&notify_for_msg);
             Box::pin(async move {
-                buf.lock().await.extend_from_slice(&msg.data);
+                let mut guard = buf.lock().await;
+                bytes::BufMut::put_slice(&mut *guard, &msg.data);
                 notify.notify_one();
             })
         }));
@@ -199,7 +202,8 @@ impl SessionInboundReader {
                 let mut buf = self.buffer.lock().await;
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                        // O(1) advance.
+                        buf.advance(consumed);
                         return Ok(frame);
                     }
                     Ok(None) => {

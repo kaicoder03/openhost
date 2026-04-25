@@ -32,6 +32,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
+use std::io::Write;
 use std::time::Duration;
 
 /// Default connect timeout when reaching the upstream. Localhost should
@@ -462,7 +463,9 @@ fn encode_websocket_response_head(
     }
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // Optimization: Use write! macro to avoid temporary String allocation from format!.
+    write!(out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -517,14 +520,17 @@ fn encode_response_head(
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
     // frame-split the response stream.
+    // Optimization: Use HeaderValue::from(u64) to avoid string formatting and parsing.
     headers.insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).expect("body_len is ASCII digits"),
+        HeaderValue::from(body_len as u64),
     );
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // Optimization: Use write! macro to avoid temporary String allocation from format!.
+    write!(out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
