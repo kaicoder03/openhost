@@ -54,6 +54,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "proxy-connection",
 ];
 
 /// Provenance headers the openhost client MUST NOT be able to inject into
@@ -383,9 +384,13 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
+        if name.chars().any(|c| c.is_ascii_whitespace()) {
+            return Err(ForwardError::HeadParse("invalid header name"));
+        }
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        // Trim both leading and trailing OWS.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -405,6 +410,7 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    strip_connection_headers(headers, &[]);
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -429,6 +435,7 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    strip_connection_headers(headers, &["connection", "upgrade"]);
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -445,6 +452,31 @@ fn sanitize_websocket_request_headers(
     Ok(())
 }
 
+/// RFC 7230 §6.1: "A proxy or gateway MUST parse a received Connection
+/// header field before a message is forwarded and, for each
+/// connection-option in this field, remove any header field(s) from the
+/// message with the same name as the connection-option."
+///
+/// `exclude` lists header names that should NOT be stripped even if
+/// present in the Connection header (e.g. `upgrade` / `connection`
+/// during a WebSocket handshake).
+fn strip_connection_headers(headers: &mut HeaderMap, exclude: &[&str]) {
+    let mut to_remove = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for part in s.split(',') {
+                let name = part.trim();
+                if !name.is_empty() && !exclude.iter().any(|&e| e.eq_ignore_ascii_case(name)) {
+                    to_remove.push(name.to_lowercase());
+                }
+            }
+        }
+    }
+    for name in to_remove {
+        headers.remove(name);
+    }
+}
+
 /// Re-encode an upstream WebSocket 101 response head into the bytes
 /// the listener emits as `RESPONSE_HEAD`. Keeps `Connection`,
 /// `Upgrade`, and every `Sec-WebSocket-*` header so the openhost
@@ -454,6 +486,7 @@ fn encode_websocket_response_head(
     status: StatusCode,
     mut headers: HeaderMap,
 ) -> Result<Vec<u8>, ForwardError> {
+    strip_connection_headers(&mut headers, &["connection", "upgrade"]);
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -510,6 +543,7 @@ fn encode_response_head(
     mut headers: HeaderMap,
     body_len: usize,
 ) -> Result<Vec<u8>, ForwardError> {
+    strip_connection_headers(&mut headers, &[]);
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -733,6 +767,29 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_connection_options() {
+        let mut h = fresh_headers();
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Custom, TE"),
+        );
+        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        assert!(!h.contains_key("x-custom"));
+        assert!(!h.contains_key(http::header::TE));
+    }
+
+    #[test]
+    fn sanitize_strips_proxy_connection() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
+        sanitize_request_headers(&mut h, "x").unwrap();
+        assert!(!h.contains_key("proxy-connection"));
+    }
+
+    #[test]
     fn sanitize_allows_non_websocket_upgrades_but_still_strips_upgrade_header() {
         // `Upgrade: h2c` is a legitimate HTTP/1.1 upgrade header that
         // upstream proxies might see. We don't support the upgrade
@@ -782,6 +839,26 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header field-name
+        // and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(msg) if msg.contains("invalid header name")),
+            "Expected error for whitespace before colon, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example  \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example");
     }
 
     // --- Response head encoder --------------------------------------
