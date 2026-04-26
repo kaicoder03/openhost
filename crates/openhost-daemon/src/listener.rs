@@ -23,7 +23,7 @@ use crate::channel_binding::{
 use crate::error::ListenerError;
 use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
 use crate::publish::SharedState;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
@@ -747,7 +747,9 @@ async fn wire_frame_loop(
     binding_mode: BindingMode,
     local_dtls_fp: [u8; 32],
 ) {
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // Inbound frame buffer. 64 KiB initial capacity accommodates typical
+    // HTTP request heads without immediate reallocation.
+    let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::with_capacity(64 * 1024)));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
     // `Some(tx)` during an active WebSocket tunnel; `None` otherwise.
@@ -837,11 +839,12 @@ async fn wire_frame_loop(
         let forwarder = forwarder.clone();
         Box::pin(async move {
             let mut buf = buffer.lock().await;
-            buf.extend_from_slice(&msg.data);
+            buf.put_slice(&msg.data);
             loop {
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                        // O(1) buffer advancement.
+                        buf.advance(consumed);
                         let outcome = dispatch_frame(
                             &frame,
                             &dc,
@@ -1318,7 +1321,8 @@ async fn start_websocket_tunnel(
                             break;
                         }
                     };
-                    let mut wire = Vec::with_capacity(n + 5);
+                    // Use the correct v2 header length (10 bytes).
+                    let mut wire = Vec::with_capacity(n + openhost_core::wire::FRAME_V2_HEADER_LEN);
                     frame.encode(&mut wire);
                     if dc_upstream.send(&Bytes::from(wire)).await.is_err() {
                         break;
@@ -1426,7 +1430,9 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
 
 /// Encode one frame and send it as its own data-channel message.
 async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<(), webrtc::Error> {
-    let mut buf = Vec::with_capacity(5 + frame.payload.len());
+    // Use the correct v2 header length (10 bytes) for pre-allocation.
+    let mut buf =
+        Vec::with_capacity(openhost_core::wire::FRAME_V2_HEADER_LEN + frame.payload.len());
     frame.encode(&mut buf);
     dc.send(&Bytes::from(buf)).await?;
     Ok(())
