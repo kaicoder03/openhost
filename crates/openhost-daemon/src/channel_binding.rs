@@ -42,6 +42,7 @@ use openhost_core::identity::{PublicKey, SigningKey};
 use rand_core::RngCore;
 use std::sync::Arc;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 // Wire-level constants shared with `openhost-client`'s client-side
 // binder. The canonical source is `openhost-core::channel_binding_wire`;
@@ -158,7 +159,7 @@ impl ChannelBinder {
         let client_pk = PublicKey::from_bytes(&client_pk_bytes)
             .map_err(|_| ChannelBindingError::MalformedClientPk)?;
 
-        let auth = derive_auth(
+        let mut auth = derive_auth(
             exporter_secret,
             &self.host_pk_bytes,
             &client_pk_bytes,
@@ -166,10 +167,12 @@ impl ChannelBinder {
         )?;
 
         let signature = Signature::from_bytes(&sig_bytes);
-        client_pk
-            .as_dalek()
-            .verify_strict(&auth, &signature)
-            .map_err(|_| ChannelBindingError::VerifyFailed)?;
+
+        let verify_res = client_pk.as_dalek().verify_strict(&auth, &signature);
+        // Zeroize sensitive intermediate material immediately after use.
+        auth.zeroize();
+
+        verify_res.map_err(|_| ChannelBindingError::VerifyFailed)?;
 
         Ok(client_pk)
     }
@@ -184,13 +187,16 @@ impl ChannelBinder {
         client_pk: &PublicKey,
     ) -> Result<[u8; AUTH_HOST_PAYLOAD_LEN], ChannelBindingError> {
         let client_pk_bytes = client_pk.to_bytes();
-        let auth = derive_auth(
+        let mut auth = derive_auth(
             exporter_secret,
             &self.host_pk_bytes,
             &client_pk_bytes,
             nonce,
         )?;
         let signature = self.identity.sign(&auth);
+        // Zeroize sensitive intermediate material immediately after use.
+        auth.zeroize();
+
         Ok(signature.to_bytes())
     }
 }

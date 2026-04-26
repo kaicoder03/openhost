@@ -15,6 +15,7 @@ use crate::error::{KeyStoreError, Result as DaemonResult};
 use async_trait::async_trait;
 use openhost_core::identity::{SigningKey, SIGNING_KEY_LEN};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 
 /// Crate-local result alias for keystore operations.
 pub type Result<T> = core::result::Result<T, KeyStoreError>;
@@ -61,17 +62,25 @@ impl FsKeyStore {
 #[async_trait]
 impl KeyStore for FsKeyStore {
     async fn load(&self) -> Result<Option<SigningKey>> {
-        let bytes = match tokio::fs::read(&self.path).await {
+        let mut bytes = match tokio::fs::read(&self.path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         if bytes.len() != SIGNING_KEY_LEN {
-            return Err(KeyStoreError::WrongSize { got: bytes.len() });
+            let got = bytes.len();
+            bytes.zeroize();
+            return Err(KeyStoreError::WrongSize { got });
         }
         let mut seed = [0u8; SIGNING_KEY_LEN];
         seed.copy_from_slice(&bytes);
-        Ok(Some(SigningKey::from_bytes(&seed)))
+        let sk = SigningKey::from_bytes(&seed);
+
+        // Zeroize sensitive material immediately after use.
+        bytes.zeroize();
+        seed.zeroize();
+
+        Ok(Some(sk))
     }
 
     async fn store(&self, sk: &SigningKey) -> Result<()> {
@@ -81,8 +90,11 @@ impl KeyStore for FsKeyStore {
             }
         }
 
-        let seed = sk.to_bytes();
-        write_mode_0600(&self.path, &seed).await?;
+        let mut seed = sk.to_bytes();
+        let res = write_mode_0600(&self.path, &seed).await;
+        // Zeroize sensitive material immediately after writing to disk.
+        seed.zeroize();
+        res?;
         Ok(())
     }
 }

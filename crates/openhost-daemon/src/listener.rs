@@ -44,6 +44,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use zeroize::Zeroize;
 
 /// Ensures the rustls CryptoProvider is installed exactly once per
 /// process. Required in rustls 0.23+ because the crate no longer picks
@@ -1152,7 +1153,7 @@ async fn handle_auth_client(
     binding_mode: BindingMode,
     local_dtls_fp: &[u8; 32],
 ) -> FrameOutcome {
-    let binding_secret =
+    let mut binding_secret =
         match derive_binding_secret(dtls_transport, binding_mode, local_dtls_fp).await {
             Ok(bytes) => bytes,
             Err(reason) => {
@@ -1168,9 +1169,11 @@ async fn handle_auth_client(
             }
         };
 
-    let client_pk = match binder.verify_client_sig(&binding_secret, nonce, &frame.payload) {
+    let client_pk_res = binder.verify_client_sig(&binding_secret, nonce, &frame.payload);
+    let client_pk = match client_pk_res {
         Ok(pk) => pk,
         Err(err) => {
+            binding_secret.zeroize();
             tracing::warn!(
                 ?err,
                 "openhostd: AuthClient verification failed; tearing down"
@@ -1188,7 +1191,11 @@ async fn handle_auth_client(
         }
     };
 
-    let host_sig = match binder.sign_host(&binding_secret, nonce, &client_pk) {
+    let host_sig_res = binder.sign_host(&binding_secret, nonce, &client_pk);
+    // Zeroize secret immediately after its final use.
+    binding_secret.zeroize();
+
+    let host_sig = match host_sig_res {
         Ok(sig) => sig,
         Err(err) => {
             tracing::warn!(?err, "openhostd: sign_host failed; tearing down");
