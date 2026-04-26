@@ -25,7 +25,6 @@ use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrad
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
-use zeroize::Zeroize;
 use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use std::collections::HashMap;
@@ -45,6 +44,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use zeroize::Zeroize;
 
 /// Ensures the rustls CryptoProvider is installed exactly once per
 /// process. Required in rustls 0.23+ because the crate no longer picks
