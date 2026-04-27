@@ -15,7 +15,7 @@
 #![cfg(feature = "real-network")]
 
 use openhost_daemon::config::{
-    Config, DtlsConfig, IdentityConfig, IdentityStore, LogConfig, PkarrConfig,
+    BindingModeConfig, Config, DtlsConfig, IdentityConfig, IdentityStore, LogConfig, PkarrConfig,
 };
 use openhost_daemon::App;
 use openhost_pkarr::{PkarrResolve, Resolver};
@@ -38,6 +38,7 @@ fn real_config(dir: &TempDir) -> Config {
         dtls: DtlsConfig {
             cert_path: dir.path().join("dtls.pem"),
             rotate_secs: 3600,
+            allowed_binding_modes: vec![BindingModeConfig::Exporter, BindingModeConfig::CertFp],
         },
         forward: None,
         log: LogConfig::default(),
