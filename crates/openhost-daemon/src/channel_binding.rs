@@ -40,6 +40,7 @@ use ed25519_dalek::Signature;
 use openhost_core::crypto::auth_bytes_bound;
 use openhost_core::identity::{PublicKey, SigningKey};
 use rand_core::RngCore;
+use zeroize::Zeroize;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -158,7 +159,7 @@ impl ChannelBinder {
         let client_pk = PublicKey::from_bytes(&client_pk_bytes)
             .map_err(|_| ChannelBindingError::MalformedClientPk)?;
 
-        let auth = derive_auth(
+        let mut auth = derive_auth(
             exporter_secret,
             &self.host_pk_bytes,
             &client_pk_bytes,
@@ -166,12 +167,15 @@ impl ChannelBinder {
         )?;
 
         let signature = Signature::from_bytes(&sig_bytes);
-        client_pk
+        let result = client_pk
             .as_dalek()
             .verify_strict(&auth, &signature)
-            .map_err(|_| ChannelBindingError::VerifyFailed)?;
+            .map_err(|_| ChannelBindingError::VerifyFailed);
 
-        Ok(client_pk)
+        auth.zeroize();
+        sig_bytes.zeroize();
+
+        result.map(|_| client_pk)
     }
 
     /// Produce the `AuthHost` payload: 64-byte signature over
@@ -184,13 +188,14 @@ impl ChannelBinder {
         client_pk: &PublicKey,
     ) -> Result<[u8; AUTH_HOST_PAYLOAD_LEN], ChannelBindingError> {
         let client_pk_bytes = client_pk.to_bytes();
-        let auth = derive_auth(
+        let mut auth = derive_auth(
             exporter_secret,
             &self.host_pk_bytes,
             &client_pk_bytes,
             nonce,
         )?;
         let signature = self.identity.sign(&auth);
+        auth.zeroize();
         Ok(signature.to_bytes())
     }
 }

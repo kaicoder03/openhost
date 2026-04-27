@@ -26,6 +26,7 @@ use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType};
+use zeroize::Zeroize;
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1152,7 +1153,7 @@ async fn handle_auth_client(
     binding_mode: BindingMode,
     local_dtls_fp: &[u8; 32],
 ) -> FrameOutcome {
-    let binding_secret =
+    let mut binding_secret =
         match derive_binding_secret(dtls_transport, binding_mode, local_dtls_fp).await {
             Ok(bytes) => bytes,
             Err(reason) => {
@@ -1191,6 +1192,7 @@ async fn handle_auth_client(
     let host_sig = match binder.sign_host(&binding_secret, nonce, &client_pk) {
         Ok(sig) => sig,
         Err(err) => {
+            binding_secret.zeroize();
             tracing::warn!(?err, "openhostd: sign_host failed; tearing down");
             let _ = send_error_frame(dc, "host signing failed").await;
             *binding.lock().await = BindingState::Failed;
@@ -1198,6 +1200,8 @@ async fn handle_auth_client(
             return FrameOutcome::Teardown;
         }
     };
+
+    binding_secret.zeroize();
 
     if let Err(err) = send_frame(
         dc,
