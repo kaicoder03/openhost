@@ -40,9 +40,9 @@ use ed25519_dalek::Signature;
 use openhost_core::crypto::auth_bytes_bound;
 use openhost_core::identity::{PublicKey, SigningKey};
 use rand_core::RngCore;
-use zeroize::Zeroize;
 use std::sync::Arc;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 // Wire-level constants shared with `openhost-client`'s client-side
 // binder. The canonical source is `openhost-core::channel_binding_wire`;

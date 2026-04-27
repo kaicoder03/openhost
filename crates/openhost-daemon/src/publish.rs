@@ -28,8 +28,8 @@ use openhost_pkarr::{
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use zeroize::Zeroize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 /// Domain-separation salt for the allowlist-salt derivation. Stable across
 /// openhost protocol versions so a daemon rebooted on the same identity
