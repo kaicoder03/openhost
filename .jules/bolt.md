@@ -1,0 +1,3 @@
+## 2025-05-22 - O(1) Inbound Buffering with BytesMut
+**Learning:** The previous implementation used `Vec<u8>` for inbound frame buffering, which relied on `buf.drain(..consumed)`. This is an O(N) operation as it shifts all remaining bytes in the vector. For high-throughput WebRTC data channels, this creates a significant performance bottleneck as the buffer grows or as many small frames are processed.
+**Action:** Use `bytes::BytesMut` for all inbound stream buffers. Replacing `drain` with `buf.advance(consumed)` (from the `Buf` trait) turns the operation into O(1) by simply moving a pointer. Initialize with `with_capacity(64 * 1024)` to avoid immediate reallocations for typical HTTP/1.1 heads.

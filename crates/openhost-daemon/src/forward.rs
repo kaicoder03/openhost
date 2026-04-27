@@ -26,6 +26,7 @@ use crate::config::{ForwardConfig, WebSocketConfig};
 use crate::error::ForwardError;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
+use std::io::Write;
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::upgrade::Upgraded;
@@ -462,7 +463,8 @@ fn encode_websocket_response_head(
     }
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    write!(out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -519,12 +521,13 @@ fn encode_response_head(
     // frame-split the response stream.
     headers.insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).expect("body_len is ASCII digits"),
+        HeaderValue::from(body_len as u64),
     );
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    write!(out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
