@@ -647,10 +647,22 @@ mod tests {
     #[test]
     fn sanitize_strips_headers_listed_in_connection() {
         let mut h = HeaderMap::new();
-        h.insert(http::header::CONNECTION, HeaderValue::from_static("X-Foo, X-Bar"));
-        h.insert(HeaderName::from_static("x-foo"), HeaderValue::from_static("strip-me"));
-        h.insert(HeaderName::from_static("x-bar"), HeaderValue::from_static("strip-me-too"));
-        h.insert(HeaderName::from_static("x-keep"), HeaderValue::from_static("keep-me"));
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Foo, X-Bar"),
+        );
+        h.insert(
+            HeaderName::from_static("x-foo"),
+            HeaderValue::from_static("strip-me"),
+        );
+        h.insert(
+            HeaderName::from_static("x-bar"),
+            HeaderValue::from_static("strip-me-too"),
+        );
+        h.insert(
+            HeaderName::from_static("x-keep"),
+            HeaderValue::from_static("keep-me"),
+        );
 
         sanitize_request_headers(&mut h, "127.0.0.1").unwrap();
         assert!(!h.contains_key("x-foo"));
