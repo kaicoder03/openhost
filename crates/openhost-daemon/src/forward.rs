@@ -54,6 +54,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "proxy-connection",
 ];
 
 /// Provenance headers the openhost client MUST NOT be able to inject into
@@ -405,6 +406,8 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    strip_connection_headers(headers, &[]);
+
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -429,6 +432,8 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    strip_connection_headers(headers, &["upgrade", "connection"]);
+
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -454,6 +459,8 @@ fn encode_websocket_response_head(
     status: StatusCode,
     mut headers: HeaderMap,
 ) -> Result<Vec<u8>, ForwardError> {
+    strip_connection_headers(&mut headers, &["upgrade", "connection"]);
+
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -474,6 +481,26 @@ fn encode_websocket_response_head(
 }
 
 /// Build `http://<target-authority><path>` for the outbound request.
+/// Strip headers listed in the `Connection` header per RFC 7230 §6.1.
+/// `exclude` contains lowercase header names that should NOT be stripped
+/// even if listed (e.g. `upgrade` during WebSocket handshake).
+fn strip_connection_headers(headers: &mut HeaderMap, exclude: &[&str]) {
+    let mut to_remove = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for name in s.split(',') {
+                let name = name.trim();
+                if !name.is_empty() && !exclude.iter().any(|&ex| ex.eq_ignore_ascii_case(name)) {
+                    to_remove.push(name.to_string());
+                }
+            }
+        }
+    }
+    for name in to_remove {
+        headers.remove(name);
+    }
+}
+
 fn combine_target_and_path(target: &Uri, path: &str) -> Result<Uri, ForwardError> {
     let authority = target
         .authority()
@@ -510,6 +537,8 @@ fn encode_response_head(
     mut headers: HeaderMap,
     body_len: usize,
 ) -> Result<Vec<u8>, ForwardError> {
+    strip_connection_headers(&mut headers, &[]);
+
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -602,6 +631,10 @@ mod tests {
     #[test]
     fn sanitize_strips_all_hop_by_hop_headers() {
         let mut h = fresh_headers();
+        h.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
         sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
         for name in HOP_BY_HOP_HEADERS {
             assert!(
@@ -609,6 +642,20 @@ mod tests {
                 "hop-by-hop header {name:?} survived sanitisation"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_strips_headers_listed_in_connection() {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::CONNECTION, HeaderValue::from_static("X-Foo, X-Bar"));
+        h.insert(HeaderName::from_static("x-foo"), HeaderValue::from_static("strip-me"));
+        h.insert(HeaderName::from_static("x-bar"), HeaderValue::from_static("strip-me-too"));
+        h.insert(HeaderName::from_static("x-keep"), HeaderValue::from_static("keep-me"));
+
+        sanitize_request_headers(&mut h, "127.0.0.1").unwrap();
+        assert!(!h.contains_key("x-foo"));
+        assert!(!h.contains_key("x-bar"));
+        assert!(h.contains_key("x-keep"));
     }
 
     #[test]
