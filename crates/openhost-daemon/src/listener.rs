@@ -1318,7 +1318,7 @@ async fn start_websocket_tunnel(
                             break;
                         }
                     };
-                    let mut wire = Vec::with_capacity(n + 5);
+                    let mut wire = Vec::with_capacity(n + openhost_core::wire::FRAME_V2_HEADER_LEN);
                     frame.encode(&mut wire);
                     if dc_upstream.send(&Bytes::from(wire)).await.is_err() {
                         break;
