@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
+use zeroize::Zeroizing;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::{APIBuilder, API};
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -1154,7 +1155,7 @@ async fn handle_auth_client(
 ) -> FrameOutcome {
     let binding_secret =
         match derive_binding_secret(dtls_transport, binding_mode, local_dtls_fp).await {
-            Ok(bytes) => bytes,
+            Ok(bytes) => Zeroizing::new(bytes),
             Err(reason) => {
                 tracing::warn!(
                     ?binding_mode,
