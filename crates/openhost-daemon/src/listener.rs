@@ -23,7 +23,7 @@ use crate::channel_binding::{
 use crate::error::ListenerError;
 use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
 use crate::publish::SharedState;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
 use openhost_core::wire::{Frame, FrameType};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
@@ -747,7 +747,10 @@ async fn wire_frame_loop(
     binding_mode: BindingMode,
     local_dtls_fp: [u8; 32],
 ) {
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // Inbound frame buffer using BytesMut for O(1) drain (via .advance()).
+    // Pre-allocated to 64 KiB to avoid immediate reallocations for typical
+    // HTTP/1.1 response/request heads.
+    let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::with_capacity(64 * 1024)));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
     // `Some(tx)` during an active WebSocket tunnel; `None` otherwise.
@@ -841,7 +844,8 @@ async fn wire_frame_loop(
             loop {
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                        // O(1) amortized drain by moving the internal start pointer.
+                        buf.advance(consumed);
                         let outcome = dispatch_frame(
                             &frame,
                             &dc,
