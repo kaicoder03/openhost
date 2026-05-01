@@ -350,6 +350,18 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         .ok_or(ForwardError::HeadParse("missing blank line after headers"))?;
     let head = &text[..end];
 
+    // RFC 7230 §3.5: Rejects bare LFs or CRs as line terminators in the
+    // header block to avoid request smuggling. All lines MUST end CRLF.
+    if head.contains('\n') || head.contains('\r') {
+        // Since we split by \r\n, we need to check if any bare \n or \r
+        // remain in the split segments.
+        for segment in head.split("\r\n") {
+            if segment.contains('\n') || segment.contains('\r') {
+                return Err(ForwardError::HeadParse("bare line terminator in headers"));
+            }
+        }
+    }
+
     let mut lines = head.split("\r\n");
     let request_line = lines
         .next()
@@ -380,12 +392,33 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        // RFC 7230 §3.2.4: "A server MUST reject any received request
+        // message that contains [...] obsolete line folding".
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding is not supported",
+            ));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
+
+        // RFC 7230 §3.2.4: "A server MUST reject any received request
+        // message that contains whitespace between a header field-name
+        // and colon".
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse("whitespace before colon in header"));
+        }
+
+        // RFC 7230 §3.2: Header field name is a token (no leading/trailing OWS).
+        let name = name.trim();
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        // Also trim trailing OWS from the value.
+        let value = line[colon + 1..].trim();
+
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +815,45 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "A server MUST reject any received request
+        // message that contains whitespace between a header field-name
+        // and colon"
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).expect_err("should reject whitespace before colon");
+        assert_eq!(
+            err.to_string(),
+            "inbound request head is malformed: whitespace before colon in header"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obsolete_line_folding() {
+        // RFC 7230 §3.2.4: "A server MUST reject any received request
+        // message that contains [...] obsolete line folding"
+        let raw = b"GET / HTTP/1.1\r\nHost: example\r\n Folded: yes\r\n\r\n";
+        let err = parse_request_head(raw).expect_err("should reject line folding");
+        assert_eq!(
+            err.to_string(),
+            "inbound request head is malformed: obsolete line folding is not supported"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_rejects_bare_line_feeds() {
+        // RFC 7230 §3.5: "A recipient [...] SHOULD NOT attempt to
+        // guess whether [bare LF] is intended to be a line terminator"
+        // We strictly require CRLF for the header block to avoid
+        // smuggling risks.
+        let raw = b"GET / HTTP/1.1\r\nHost: example\nEvil: smuggled\r\n\r\n";
+        let err = parse_request_head(raw).expect_err("should reject bare LF");
+        assert_eq!(
+            err.to_string(),
+            "inbound request head is malformed: bare line terminator in headers"
+        );
     }
 
     // --- Response head encoder --------------------------------------

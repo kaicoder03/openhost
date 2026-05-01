@@ -1,0 +1,4 @@
+## 2025-05-14 - HTTP Request Smuggling in Hand-rolled Forwarder
+**Vulnerability:** The hand-rolled HTTP/1.1 request parser in `forward.rs` was susceptible to request smuggling and header injection. It accepted whitespace before colons, allowed obsolete line folding, and didn't strictly validate CRLF line terminators (accepting bare LFs).
+**Learning:** Hand-rolled parsers are high-risk areas. Standard `.lines()` or simple `.split("\n")` often strip or ignore characters that are critical for HTTP protocol security. In this case, `split("\r\n")` was used but the resulting segments were not checked for "bare" `\n` or `\r`.
+**Prevention:** Use established parsing libraries when possible. If hand-rolling, strictly enforce RFC 7230: reject whitespace before colons, reject obsolete line folding (SP/HTAB at line start), and ensure every line is terminated by exactly CRLF with no intermediate bare LFs/CRs.
