@@ -1,0 +1,3 @@
+## 2025-05-15 - [Buffer and Memory Management Optimizations]
+**Learning:** Replacing `Vec<u8>::drain(..n)` with `bytes::BytesMut::advance(n)` provides a significant $O(N)$ to $O(1)$ performance boost for inbound message buffering. Additionally, avoiding temporary `String` allocations during HTTP header encoding using the `write!` macro and `HeaderValue::from(u64)` reduces GC/allocation pressure in high-frequency paths. Correctly pre-allocating `Vec::with_capacity` using known protocol constants (like `FRAME_V2_HEADER_LEN`) avoids unnecessary reallocations during frame encoding.
+**Action:** Always prefer `BytesMut` for stream-like buffering and `write!` for formatted output into existing buffers. Use protocol-specific constants for capacity hints.
