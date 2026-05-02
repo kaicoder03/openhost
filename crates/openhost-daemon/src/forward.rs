@@ -39,6 +39,11 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum permitted length for an HTTP request head (start-line +
+/// headers). 64 KiB is a standard limit that accommodates large
+/// cookies / tokens while bounding memory use.
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -54,6 +59,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "proxy-connection",
 ];
 
 /// Provenance headers the openhost client MUST NOT be able to inject into
@@ -341,6 +347,10 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Rejects HTTP/0.9, HTTP/1.0, HTTP/2+, missing blank line, and any
 /// obvious line-ending confusion (bare `\n` inside headers).
 fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), ForwardError> {
+    if bytes.len() > MAX_HEAD_BYTES {
+        return Err(ForwardError::HeadParse("request head exceeds 64KB limit"));
+    }
+
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ForwardError::HeadParse("request head is not valid UTF-8"))?;
 
@@ -349,6 +359,21 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         .find("\r\n\r\n")
         .ok_or(ForwardError::HeadParse("missing blank line after headers"))?;
     let head = &text[..end];
+
+    // RFC 7230 §3: Rejects any bare CR or LF in the header block to prevent
+    // request smuggling / line-ending confusion.
+    if head.contains('\n') || head.contains('\r') {
+        let mut lines = head.split("\r\n");
+        // We've already split by CRLF; if any line still contains \n or \r,
+        // it was a bare terminator.
+        for line in lines.by_ref() {
+            if line.contains('\n') || line.contains('\r') {
+                return Err(ForwardError::HeadParse(
+                    "request head contains bare line terminators (RFC 7230)",
+                ));
+            }
+        }
+    }
 
     let mut lines = head.split("\r\n");
     let request_line = lines
@@ -380,12 +405,31 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        // RFC 7230 §3.2.4: No leading whitespace (rejects obsolete line folding).
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "request head contains obsolete line folding (RFC 7230)",
+            ));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: No whitespace before the colon.
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace before colon in header field (RFC 7230)",
+            ));
+        }
+
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )`. Trim both ends.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
+
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -405,6 +449,8 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    strip_connection_headers(headers);
+
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -429,6 +475,21 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    // RFC 7230 §6.1: Strips headers listed in Connection, BUT preserves
+    // Connection and Upgrade themselves for the handshake.
+    if let Some(val) = headers.get(http::header::CONNECTION) {
+        if let Ok(s) = val.to_str() {
+            let names: Vec<String> = s
+                .split(',')
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty() && v != "connection" && v != "upgrade")
+                .collect();
+            for name in names {
+                headers.remove(name);
+            }
+        }
+    }
+
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -454,6 +515,19 @@ fn encode_websocket_response_head(
     status: StatusCode,
     mut headers: HeaderMap,
 ) -> Result<Vec<u8>, ForwardError> {
+    if let Some(val) = headers.get(http::header::CONNECTION) {
+        if let Ok(s) = val.to_str() {
+            let names: Vec<String> = s
+                .split(',')
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty() && v != "connection" && v != "upgrade")
+                .collect();
+            for name in names {
+                headers.remove(name);
+            }
+        }
+    }
+
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -503,6 +577,22 @@ fn combine_target_and_path(target: &Uri, path: &str) -> Result<Uri, ForwardError
         .map_err(|_| ForwardError::HeadParse("could not combine target + path into a URI"))
 }
 
+/// Strip headers listed in the `Connection` field per RFC 7230 §6.1.
+fn strip_connection_headers(headers: &mut HeaderMap) {
+    if let Some(val) = headers.get(http::header::CONNECTION) {
+        if let Ok(s) = val.to_str() {
+            let names: Vec<String> = s
+                .split(',')
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+                .collect();
+            for name in names {
+                headers.remove(name);
+            }
+        }
+    }
+}
+
 /// Encode the upstream response's status + headers into the wire form the
 /// openhost client expects inside the `RESPONSE_HEAD` frame.
 fn encode_response_head(
@@ -510,6 +600,8 @@ fn encode_response_head(
     mut headers: HeaderMap,
     body_len: usize,
 ) -> Result<Vec<u8>, ForwardError> {
+    strip_connection_headers(&mut headers);
+
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
     }
@@ -733,6 +825,52 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_dynamic_connection_headers() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Custom, Keep-Alive"),
+        );
+        h.insert(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_static("strip-me"),
+        );
+        h.insert(
+            HeaderName::from_static("keep-alive"),
+            HeaderValue::from_static("timeout=5"),
+        );
+        h.insert(
+            HeaderName::from_static("x-keep"),
+            HeaderValue::from_static("preserve-me"),
+        );
+
+        sanitize_request_headers(&mut h, "x").unwrap();
+        assert!(!h.contains_key("x-custom"));
+        assert!(!h.contains_key("keep-alive"));
+        assert!(h.contains_key("x-keep"));
+    }
+
+    #[test]
+    fn sanitize_websocket_strips_dynamic_connection_headers_but_keeps_handshake() {
+        let mut h = HeaderMap::new();
+        // RFC 7230 §6.1: Connection header itself may contain "Upgrade"
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Upgrade, X-Custom"),
+        );
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        h.insert(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_static("strip-me"),
+        );
+
+        sanitize_websocket_request_headers(&mut h, "x").unwrap();
+        assert!(h.contains_key(http::header::CONNECTION));
+        assert!(h.contains_key(http::header::UPGRADE));
+        assert!(!h.contains_key("x-custom"));
+    }
+
+    #[test]
     fn sanitize_allows_non_websocket_upgrades_but_still_strips_upgrade_header() {
         // `Upgrade: h2c` is a legitimate HTTP/1.1 upgrade header that
         // upstream proxies might see. We don't support the upgrade
@@ -782,6 +920,43 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_oversized_head() {
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        raw.extend(vec![b'X'; 64 * 1024]);
+        raw.extend_from_slice(b": val\r\n\r\n");
+        let err = parse_request_head(&raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(m) if m.contains("64KB")));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_bare_lf() {
+        let raw = b"GET / HTTP/1.1\r\nHost: localhost\nEvil: true\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(m) if m.contains("bare line terminator")));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obsolete_line_folding() {
+        let raw = b"GET / HTTP/1.1\r\nHost: localhost\r\n Line-Folded: yes\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(m) if m.contains("obsolete line folding")));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : localhost\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(m) if m.contains("whitespace before colon")));
+    }
+
+    #[test]
+    fn parse_request_head_trims_value_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost:  localhost  \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "localhost");
     }
 
     // --- Response head encoder --------------------------------------
