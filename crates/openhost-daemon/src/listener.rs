@@ -23,9 +23,9 @@ use crate::channel_binding::{
 use crate::error::ListenerError;
 use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
 use crate::publish::SharedState;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
-use openhost_core::wire::{Frame, FrameType};
+use openhost_core::wire::{Frame, FrameType, FRAME_V2_HEADER_LEN};
 use openhost_pkarr::{AnswerBlob, BindingMode, BlobCandidate, CandidateType, SetupRole};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -747,7 +747,9 @@ async fn wire_frame_loop(
     binding_mode: BindingMode,
     local_dtls_fp: [u8; 32],
 ) {
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // ⚡ Bolt: Use BytesMut for inbound buffering to replace O(N)
+    // Vec::drain with O(1) Buf::advance.
+    let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::new()));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
     // `Some(tx)` during an active WebSocket tunnel; `None` otherwise.
@@ -841,7 +843,8 @@ async fn wire_frame_loop(
             loop {
                 match Frame::try_decode(&buf) {
                     Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                        // ⚡ Bolt: O(1) buffer advancement.
+                        buf.advance(consumed);
                         let outcome = dispatch_frame(
                             &frame,
                             &dc,
@@ -1069,7 +1072,7 @@ async fn dispatch_frame(
         }
         FrameType::Ping => {
             let pong = Frame::new(FrameType::Pong, Vec::new()).expect("Pong is empty");
-            let mut out = Vec::with_capacity(5);
+            let mut out = Vec::with_capacity(FRAME_V2_HEADER_LEN);
             pong.encode(&mut out);
             if let Err(err) = dc.send(&Bytes::from(out)).await {
                 tracing::warn!(?err, "openhostd: failed to send Pong");
@@ -1318,7 +1321,9 @@ async fn start_websocket_tunnel(
                             break;
                         }
                     };
-                    let mut wire = Vec::with_capacity(n + 5);
+                    // ⚡ Bolt: Pre-allocate exactly enough for v2 header + payload
+                    // to avoid immediate reallocation during encode().
+                    let mut wire = Vec::with_capacity(FRAME_V2_HEADER_LEN + n);
                     frame.encode(&mut wire);
                     if dc_upstream.send(&Bytes::from(wire)).await.is_err() {
                         break;
@@ -1426,7 +1431,9 @@ async fn emit_response(dc: &RTCDataChannel, resp: ForwardResponse) -> Result<(),
 
 /// Encode one frame and send it as its own data-channel message.
 async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<(), webrtc::Error> {
-    let mut buf = Vec::with_capacity(5 + frame.payload.len());
+    // ⚡ Bolt: Pre-allocate exactly enough for v2 header + payload
+    // to avoid immediate reallocation during encode().
+    let mut buf = Vec::with_capacity(FRAME_V2_HEADER_LEN + frame.payload.len());
     frame.encode(&mut buf);
     dc.send(&Bytes::from(buf)).await?;
     Ok(())
