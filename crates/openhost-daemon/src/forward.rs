@@ -350,6 +350,21 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         .ok_or(ForwardError::HeadParse("missing blank line after headers"))?;
     let head = &text[..end];
 
+    // RFC 7230 §3.5: Reject bare LFs or CRs in the header block to
+    // mitigate request smuggling.
+    if head.contains('\n') || head.contains('\r') && !head.split("\r\n").all(|l| !l.contains('\r'))
+    {
+        // This is a bit tricky because we already know they are there
+        // in the \r\n form. Let's be more precise.
+        for line in head.split("\r\n") {
+            if line.contains('\n') || line.contains('\r') {
+                return Err(ForwardError::HeadParse(
+                    "request head contains bare line terminators",
+                ));
+            }
+        }
+    }
+
     let mut lines = head.split("\r\n");
     let request_line = lines
         .next()
@@ -380,12 +395,28 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        // RFC 7230 §3.2.4: Reject obsolete line folding.
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding is unsupported",
+            ));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: No whitespace allowed before the colon.
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "invalid whitespace before colon in header",
+            ));
+        }
+
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )`
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
+
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +813,46 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        match err {
+            ForwardError::HeadParse(m) => assert!(m.contains("whitespace before colon")),
+            _ => panic!("Expected HeadParse error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn parse_request_head_rejects_bare_lf() {
+        let raw = b"GET / HTTP/1.1\r\nHeader: value\nInjected: value\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        match err {
+            ForwardError::HeadParse(m) => assert!(m.contains("bare line terminators")),
+            _ => panic!("Expected HeadParse error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn parse_request_head_rejects_bare_cr() {
+        let raw = b"GET / HTTP/1.1\r\nHeader: value\rInjected: value\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        match err {
+            ForwardError::HeadParse(m) => assert!(m.contains("bare line terminators")),
+            _ => panic!("Expected HeadParse error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obsolete_line_folding() {
+        let raw = b"GET / HTTP/1.1\r\nHeader: value\r\n folded\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        match err {
+            ForwardError::HeadParse(m) => assert!(m.contains("line folding")),
+            _ => panic!("Expected HeadParse error, got {:?}", err),
+        }
     }
 
     // --- Response head encoder --------------------------------------
