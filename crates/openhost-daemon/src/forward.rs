@@ -39,6 +39,11 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum size in bytes for the HTTP request head (request line + headers).
+/// Most web servers cap this at 8-16 KB; we allow 64 KB to be safe while
+/// still bounding memory-exhaustion DoS.
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -187,6 +192,10 @@ impl Forwarder {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
             });
+        }
+
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadParse("request head too large"));
         }
 
         let (method, path, mut headers) = parse_request_head(head_payload)?;
@@ -350,6 +359,19 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         .ok_or(ForwardError::HeadParse("missing blank line after headers"))?;
     let head = &text[..end];
 
+    // RFC 7230 §3.5: "A recipient MUST treat any [bare LF] as a line
+    // separator" is a MUST-NOT for senders; we are a strict receiver.
+    // Reject any bare CR or LF in the header block to prevent request
+    // smuggling / line-ending confusion.
+    //
+    // Since we split the block by `\r\n`, any remaining `\n` or `\r`
+    // in the resulting substrings MUST be a bare line terminator.
+    for line in head.split("\r\n") {
+        if line.contains('\n') || line.contains('\r') {
+            return Err(ForwardError::HeadParse("bare CR or LF in request head"));
+        }
+    }
+
     let mut lines = head.split("\r\n");
     let request_line = lines
         .next()
@@ -383,9 +405,17 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the
+        // header field-name and colon."
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse("whitespace before colon in header"));
+        }
+        let name = name.trim();
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        // Also trim trailing OWS to be safe.
+        let value = line[colon + 1..].trim();
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +812,59 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("whitespace before colon in header")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_bare_line_terminators() {
+        // Bare LF
+        let raw = b"GET / HTTP/1.1\r\nHost: example\n\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("bare CR or LF in request head")
+        ));
+
+        // Bare CR
+        let raw = b"GET / HTTP/1.1\r\nHost: example\r\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("bare CR or LF in request head")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example   \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example");
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_oversized_head() {
+        let cfg = ForwardConfig {
+            target: Some("http://127.0.0.1:8080".into()),
+            ..Default::default()
+        };
+        let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
+
+        // 64 KB + 1 byte
+        let long_head = vec![b'A'; MAX_HEAD_BYTES + 1];
+        let result = fwd.forward(&long_head, Bytes::new()).await;
+        assert!(matches!(
+            result,
+            Err(ForwardError::HeadParse("request head too large"))
+        ));
     }
 
     // --- Response head encoder --------------------------------------

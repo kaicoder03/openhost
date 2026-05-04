@@ -287,7 +287,15 @@ mod tests {
 
         let mut watcher =
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // FSEvents (macOS) sometimes emits a start-up event for the
+        // parent directory. Drain any early events before we write the
+        // sibling.
+        while let Ok(Some(())) =
+            tokio::time::timeout(Duration::from_millis(100), watcher.recv()).await
+        {
+            // loop
+        }
 
         fs::write(&sibling, b"unrelated").unwrap();
 
