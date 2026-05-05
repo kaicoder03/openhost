@@ -189,7 +189,9 @@ impl Forwarder {
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
         if head_payload.len() > MAX_HEAD_BYTES {
-            return Err(ForwardError::HeadParse("request head exceeded MAX_HEAD_BYTES"));
+            return Err(ForwardError::HeadParse(
+                "request head exceeded MAX_HEAD_BYTES",
+            ));
         }
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
@@ -366,7 +368,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let lines = head.split("\r\n");
         for line in lines {
             if line.contains('\r') || line.contains('\n') {
-                return Err(ForwardError::HeadParse("request head contains bare CR or LF"));
+                return Err(ForwardError::HeadParse(
+                    "request head contains bare CR or LF",
+                ));
             }
         }
     }
@@ -414,7 +418,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let name = &line[..colon];
         // RFC 7230 §3.2.4: No whitespace allowed between name and colon.
         if name.ends_with([' ', '\t']) {
-            return Err(ForwardError::HeadParse("whitespace before colon is rejected"));
+            return Err(ForwardError::HeadParse(
+                "whitespace before colon is rejected",
+            ));
         }
 
         // RFC 7230 §3.2: header value is surrounded by optional whitespace (OWS).
