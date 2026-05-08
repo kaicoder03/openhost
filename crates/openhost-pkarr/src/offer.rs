@@ -1098,17 +1098,47 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // O(M) pass over all resource records to bucket-sort answer fragments
+    // by their numeric `-<idx>` suffix.
+    let mut fragment_texts: Vec<Option<String>> = vec![None; MAX_FRAGMENT_TOTAL as usize];
+    let prefix_lc = format!("{base}-").to_lowercase();
+
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            let name_s = rr.name.to_string();
+            if let Some(rest) = name_s.to_lowercase().strip_prefix(&prefix_lc) {
+                // The name might be absolute (e.g. "_answer-<hash>-0.origin.")
+                // or just the label. We want the numeric part before the first dot.
+                let idx_part = rest.split('.').next().unwrap_or("");
+                let Ok(idx) = idx_part.parse::<u8>() else {
+                    continue;
+                };
+
+                if idx as usize >= fragment_texts.len() {
+                    // Index too high for any valid fragment set.
+                    continue;
+                }
+
+                let mut out = String::new();
+                for (key, value) in txt.iter_raw() {
+                    out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+                    if let Some(v) = value {
+                        out.push('=');
+                        out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+                    }
+                }
+
+                if fragment_texts[idx as usize].is_some() {
+                    // Multiple TXTs at the same name → malformed.
+                    return Err(PkarrError::MultipleOpenhostRecords);
+                }
+                fragment_texts[idx as usize] = Some(out);
+            }
+        }
+    }
 
     // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    let Some(first_text) = &fragment_texts[0] else {
         return Ok(None);
     };
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
@@ -1123,10 +1153,11 @@ pub fn decode_answer_fragments_from_packet(
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let text = fragment_texts[i as usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
