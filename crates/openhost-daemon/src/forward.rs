@@ -39,6 +39,11 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum permitted size for the HTTP request head (status line + headers).
+/// Matches the limit used by `openhost-pkarr` for decompressed records
+/// to prevent memory exhaustion from oversized headers.
+pub const MAX_HEAD_BYTES: usize = 64 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -70,6 +75,7 @@ type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
 
 /// One buffered HTTP response, ready for the listener to re-frame onto
 /// the data channel.
+#[derive(Debug)]
 pub struct ForwardResponse {
     /// HTTP/1.1 response head — status line + sanitised headers,
     /// terminated by `\r\n\r\n`.
@@ -83,6 +89,7 @@ pub struct ForwardResponse {
 /// Protocols`) and then tunnels raw bytes between the openhost data
 /// channel and `upstream` (a bidirectional TCP socket hyper hands off
 /// after the 101).
+#[derive(Debug)]
 pub struct WebSocketUpgrade {
     /// `HTTP/1.1 101 ...\r\n<headers>\r\n\r\n` bytes.
     pub head_bytes: Vec<u8>,
@@ -93,6 +100,7 @@ pub struct WebSocketUpgrade {
 /// What a successful `Forwarder::forward` produced: either a plain
 /// HTTP response the listener frames + re-emits, or a WebSocket
 /// upgrade the listener tunnels byte-for-byte.
+#[derive(Debug)]
 pub enum ForwardOutcome {
     /// Plain HTTP round-trip.
     Response(ForwardResponse),
@@ -183,6 +191,11 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadParse(
+                "request head exceeds MAX_HEAD_BYTES",
+            ));
+        }
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -380,12 +393,36 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        // RFC 7230 §3.2.4: Reject bare CR or LF in the header block to
+        // prevent request smuggling and line-ending confusion.
+        if line.contains(['\r', '\n']) {
+            return Err(ForwardError::HeadParse("bare CR or LF in header block"));
+        }
+
+        // RFC 7230 §3.2.4: Obsolete line folding (starting with SP or
+        // HTAB) MUST be rejected.
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding is not supported",
+            ));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: Whitespace between the field-name and colon
+        // MUST be rejected as it can be used for request smuggling.
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace before colon is not allowed",
+            ));
+        }
+
+        // RFC 7230 §3.2: OWS = *( SP / HTAB )
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
+
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +819,68 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("whitespace before colon is not allowed")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obsolete_folding() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example\r\n fold\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("obsolete line folding is not supported")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_bare_lf() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example\nEvil: yes\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        // `head.split("\r\n")` will include the bare `\n` in one of the
+        // "lines", which our new `contains` check will catch.
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("bare CR or LF in header block")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_trims_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost:  example  \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example");
+    }
+
+    #[test]
+    fn forward_rejects_oversized_head() {
+        // Need a Forwarder instance.
+        let cfg = ForwardConfig {
+            target: Some("http://127.0.0.1".into()),
+            host_override: None,
+            max_body_bytes: 1024,
+            websockets: None,
+        };
+        let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
+        let big_head = vec![b'x'; MAX_HEAD_BYTES + 1];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = fwd.forward(&big_head, Bytes::new()).await.unwrap_err();
+            assert!(matches!(
+                err,
+                ForwardError::HeadParse("request head exceeds MAX_HEAD_BYTES")
+            ));
+        });
     }
 
     // --- Response head encoder --------------------------------------
