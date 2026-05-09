@@ -198,7 +198,7 @@ impl Forwarder {
         // path below.
         if is_websocket_upgrade(&headers) {
             match self.websockets.as_ref() {
-                Some(cfg) if cfg.is_allowed(&path) => {
+                Some(cfg) if cfg.is_allowed(path) => {
                     return self
                         .forward_websocket(method, path, headers, body)
                         .await
@@ -213,7 +213,7 @@ impl Forwarder {
         // Build the outbound URI by combining the target origin with the
         // request path. The path comes from the client verbatim; no
         // rewriting this PR.
-        let target_uri = combine_target_and_path(&self.target, &path)?;
+        let target_uri = combine_target_and_path(&self.target, path)?;
 
         let mut req_builder = Request::builder().method(method).uri(target_uri);
         // Replace the HeaderMap wholesale — simpler than iterating and
@@ -285,7 +285,7 @@ impl Forwarder {
         body: Bytes,
     ) -> Result<WebSocketUpgrade, ForwardError> {
         sanitize_websocket_request_headers(&mut headers, &self.host_override)?;
-        let target_uri = combine_target_and_path(&self.target, &path)?;
+        let target_uri = combine_target_and_path(&self.target, path)?;
         let mut req_builder = Request::builder().method(method).uri(target_uri);
         if let Some(req_headers) = req_builder.headers_mut() {
             *req_headers = headers;
