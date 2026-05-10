@@ -1124,7 +1124,8 @@ pub fn decode_answer_fragments_from_packet(
                             let mut text = String::new();
                             for (key, value) in txt.iter_raw() {
                                 text.push_str(
-                                    core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?,
+                                    core::str::from_utf8(key)
+                                        .map_err(|_| PkarrError::InvalidUtf8)?,
                                 );
                                 if let Some(v) = value {
                                     text.push('=');
@@ -1167,9 +1168,11 @@ pub fn decode_answer_fragments_from_packet(
 
     // Verify all fragments are present and consistent.
     for i in 1..total {
-        let frag = buckets[i as usize].take().ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let frag = buckets[i as usize]
+            .take()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         if frag.total != total {
             return Err(PkarrError::MalformedCanonical(
                 "answer fragments disagree on chunk_total",
