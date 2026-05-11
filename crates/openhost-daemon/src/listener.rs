@@ -21,7 +21,9 @@ use crate::channel_binding::{
     EXPORTER_SECRET_LEN,
 };
 use crate::error::ListenerError;
-use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
+use crate::forward::{
+    ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade, MAX_HEAD_BYTES,
+};
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
@@ -44,6 +46,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use zeroize::Zeroize;
 
 /// Ensures the rustls CryptoProvider is installed exactly once per
 /// process. Required in rustls 0.23+ because the crate no longer picks
@@ -970,6 +973,14 @@ async fn dispatch_frame(
 
     match frame.frame_type {
         FrameType::RequestHead => {
+            if frame.payload.len() > MAX_HEAD_BYTES {
+                tracing::warn!(
+                    len = frame.payload.len(),
+                    "openhostd: REQUEST_HEAD exceeded MAX_HEAD_BYTES; tearing down"
+                );
+                let _ = send_error_frame(dc, "request head too large").await;
+                return FrameOutcome::Teardown;
+            }
             let mut req = request.lock().await;
             req.head_payload = Some(frame.payload.clone());
             req.body.clear();
@@ -1152,7 +1163,7 @@ async fn handle_auth_client(
     binding_mode: BindingMode,
     local_dtls_fp: &[u8; 32],
 ) -> FrameOutcome {
-    let binding_secret =
+    let mut binding_secret =
         match derive_binding_secret(dtls_transport, binding_mode, local_dtls_fp).await {
             Ok(bytes) => bytes,
             Err(reason) => {
@@ -1171,6 +1182,7 @@ async fn handle_auth_client(
     let client_pk = match binder.verify_client_sig(&binding_secret, nonce, &frame.payload) {
         Ok(pk) => pk,
         Err(err) => {
+            binding_secret.zeroize();
             tracing::warn!(
                 ?err,
                 "openhostd: AuthClient verification failed; tearing down"
@@ -1189,8 +1201,12 @@ async fn handle_auth_client(
     };
 
     let host_sig = match binder.sign_host(&binding_secret, nonce, &client_pk) {
-        Ok(sig) => sig,
+        Ok(sig) => {
+            binding_secret.zeroize();
+            sig
+        }
         Err(err) => {
+            binding_secret.zeroize();
             tracing::warn!(?err, "openhostd: sign_host failed; tearing down");
             let _ = send_error_frame(dc, "host signing failed").await;
             *binding.lock().await = BindingState::Failed;
