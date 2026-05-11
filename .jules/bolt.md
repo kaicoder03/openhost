@@ -1,0 +1,3 @@
+## 2026-05-11 - Answer fragment reassembly optimization
+**Learning:** Reassembling fragmented TXT records in Pkarr packets using repeated exact-name lookups leads to O(N^2) complexity, which becomes a bottleneck and DoS risk as the number of fragments approaches the protocol limit (255). Resource record names can also be absolute (trailing dot) and are case-insensitive, which requires robust string handling during a manual pass.
+**Action:** Use a single-pass O(M) bucket-sort algorithm over all resource records, stripping potential trailing dots and using case-insensitive prefix matching, to reassemble fragments efficiently.
