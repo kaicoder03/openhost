@@ -281,6 +281,40 @@ async fn forwarder_round_trip_returns_upstream_200() -> DaemonResult<()> {
 }
 
 #[tokio::test]
+async fn forwarder_request_head_exceeding_cap_triggers_error_frame_and_teardown() -> DaemonResult<()>
+{
+    let (port, _state) = spawn_upstream(UpstreamResponder::default()).await;
+    let (_tmp, app) = build_daemon(port).await;
+    let session = establish_connection(&app).await;
+
+    // Send an oversized REQUEST_HEAD.
+    let head = vec![b'x'; openhost_daemon::forward::MAX_HEAD_BYTES + 1];
+    let req_head = Frame::new(FrameType::RequestHead, head).unwrap();
+    let mut wire = Vec::new();
+    req_head.encode(&mut wire);
+    session.dc.send(&Bytes::from(wire)).await.expect("send");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let err_frame = loop {
+        let bytes = session.received.lock().await.clone();
+        if let Ok(Some((frame, _))) = Frame::try_decode(&bytes) {
+            break frame;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no frame arrived after oversized REQUEST_HEAD");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(err_frame.frame_type, FrameType::Error);
+    let diagnostic = String::from_utf8_lossy(&err_frame.payload);
+    assert!(diagnostic.contains("REQUEST_HEAD too large"));
+
+    session.close().await;
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwarder_forwards_request_body_verbatim() -> DaemonResult<()> {
     let (port, state) = spawn_upstream(UpstreamResponder::EchoBody).await;
     let (_tmp, app) = build_daemon(port).await;
