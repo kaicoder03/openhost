@@ -808,7 +808,7 @@ mod tests {
         let big_head = vec![b'A'; MAX_HEAD_BYTES + 1];
         let result = fwd.forward(&big_head, Bytes::new()).await;
         match result {
-            Err(ForwardError::HeadParse(msg)) if msg == "request head too large" => {}
+            Err(ForwardError::HeadParse("request head too large")) => {}
             other => panic!(
                 "expected HeadParse('request head too large'), got: {:?}",
                 other
