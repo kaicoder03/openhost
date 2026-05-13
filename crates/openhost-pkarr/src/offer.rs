@@ -1098,57 +1098,109 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // O(M) single-pass reassembly. We walk every resource record in the
+    // packet once, bucket-sorting fragments for the target client into
+    // a pre-allocated vector of size 256 (MAX_FRAGMENT_TOTAL + 1).
+    let mut fragments: Vec<Option<DecodedFragment>> =
+        (0..=MAX_FRAGMENT_TOTAL as usize).map(|_| None).collect();
+    let mut total_fragments: Option<u8> = None;
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    let base_lower_dash = format!("{}-", base.to_lowercase());
+
+    for rr in packet.all_resource_records() {
+        // Fast-path: openhost fragmented records always start with '_answer-'.
+        // Avoid `to_string()` and `to_lowercase()` for non-matching records.
+        let first_label = match rr.name.iter().next() {
+            Some(l) => l,
+            None => continue,
+        };
+        if !first_label.as_ref().starts_with(b"_") {
+            continue;
+        }
+
+        let name_lower = rr.name.to_string().to_lowercase();
+
+        // Exact match on the client-hash prefix. Names are case-insensitive
+        // and may be absolute (trailing dot); normalize for comparison.
+        let Some(suffix) = name_lower.strip_prefix(&base_lower_dash) else {
+            // Not for this client.
+            continue;
+        };
+
+        // Extract the index from the suffix (e.g. "0", "1", "254").
+        // absolute-form labels mean the suffix is the idx label + anything
+        // after it. split on '.' and take the first token.
+        let idx_str = suffix.split('.').next().unwrap_or(suffix);
+        let Ok(idx) = idx_str.parse::<u8>() else {
+            // Malformed index label; skip it.
+            continue;
+        };
+
+        if let RData::TXT(txt) = &rr.rdata {
+            let mut encoded = String::new();
+            for (key, value) in txt.iter_raw() {
+                encoded.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+                if let Some(v) = value {
+                    encoded.push('=');
+                    encoded.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+                }
+            }
+            let bytes = URL_SAFE_NO_PAD.decode(encoded.as_bytes())?;
+            let frag = decode_fragment(&bytes)?;
+
+            // Validation: index in the label must match index in the envelope.
+            if frag.idx != idx {
+                return Err(PkarrError::MalformedCanonical(
+                    "answer fragment idx disagrees with its DNS label suffix",
+                ));
+            }
+
+            // Validation: all fragments must agree on total.
+            if let Some(t) = total_fragments {
+                if frag.total != t {
+                    return Err(PkarrError::MalformedCanonical(
+                        "answer fragments disagree on chunk_total",
+                    ));
+                }
+            } else {
+                total_fragments = Some(frag.total);
+            }
+
+            // Store in bucket. Duplicate fragments at the same index
+            // are a protocol violation (ambiguous substrate).
+            let idx_usize = frag.idx as usize;
+            if fragments[idx_usize].is_some() {
+                return Err(PkarrError::MultipleOpenhostRecords);
+            }
+            fragments[idx_usize] = Some(frag);
+        }
+    }
+
+    let Some(total) = total_fragments else {
         return Ok(None);
     };
-    let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
-    let first = decode_fragment(&first_bytes)?;
-    if first.idx != 0 {
-        return Err(PkarrError::MalformedCanonical(
-            "answer fragment 0 carries non-zero idx",
-        ));
-    }
-    let total = first.total;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
-    fragments.push(first);
-    for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
-        let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
-        let frag = decode_fragment(&bytes)?;
-        if frag.total != total {
-            return Err(PkarrError::MalformedCanonical(
-                "answer fragments disagree on chunk_total",
-            ));
+    // Verify we have a contiguous set from 0..total.
+    let mut total_payload_len = 0usize;
+    for i in 0..total {
+        match &fragments[i as usize] {
+            Some(f) => total_payload_len += f.payload.len(),
+            None => {
+                return Err(PkarrError::MalformedCanonical(
+                    "answer fragment set is missing an idx",
+                ))
+            }
         }
-        if frag.idx != i {
-            return Err(PkarrError::MalformedCanonical(
-                "answer fragment idx disagrees with its DNS label suffix",
-            ));
-        }
-        fragments.push(frag);
     }
 
-    let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
-    for frag in fragments {
-        sealed.extend_from_slice(&frag.payload);
+    // Single allocation for the final reassembled buffer.
+    let mut sealed = Vec::with_capacity(total_payload_len);
+    for i in 0..total {
+        // Safety: we verified presence in the contiguous-check loop above.
+        let f = fragments[i as usize].as_ref().unwrap();
+        sealed.extend_from_slice(&f.payload);
     }
 
-    // Use the packet timestamp as a sensible default for `created_at` —
-    // the caller can override if they track their own receipt time.
     let packet_ts_micros: u64 = packet.timestamp().into();
     Ok(Some(AnswerEntry {
         client_hash,
