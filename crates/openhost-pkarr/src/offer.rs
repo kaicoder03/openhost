@@ -528,7 +528,7 @@ fn encode_fragment(idx: u8, total: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DecodedFragment {
     idx: u8,
     total: u8,
@@ -1101,24 +1101,28 @@ pub fn decode_answer_fragments_from_packet(
     // O(M) single-pass reassembly. We walk every resource record in the
     // packet once, bucket-sorting fragments for the target client into
     // a pre-allocated vector of size 256 (MAX_FRAGMENT_TOTAL + 1).
-    let mut fragments: Vec<Option<DecodedFragment>> = vec![None; MAX_FRAGMENT_TOTAL as usize + 1];
+    let mut fragments: Vec<Option<DecodedFragment>> =
+        (0..=MAX_FRAGMENT_TOTAL as usize).map(|_| None).collect();
     let mut total_fragments: Option<u8> = None;
 
-    let base_lower = base.to_lowercase();
-    let prefix_dash = format!("{base_lower}-");
+    let base_lower_dash = format!("{}-", base.to_lowercase());
 
     for rr in packet.all_resource_records() {
-        let name = rr.name.to_string();
-        // Fast-path: most records aren't our fragments.
-        if !name.starts_with(ANSWER_TXT_PREFIX) {
+        // Fast-path: openhost fragmented records always start with '_answer-'.
+        // Avoid `to_string()` and `to_lowercase()` for non-matching records.
+        let first_label = match rr.name.iter().next() {
+            Some(l) => l,
+            None => continue,
+        };
+        if !first_label.as_ref().starts_with(b"_") {
             continue;
         }
 
+        let name_lower = rr.name.to_string().to_lowercase();
+
         // Exact match on the client-hash prefix. Names are case-insensitive
         // and may be absolute (trailing dot); normalize for comparison.
-        let name_lower = name.to_lowercase();
-
-        let Some(suffix) = name_lower.strip_prefix(&prefix_dash) else {
+        let Some(suffix) = name_lower.strip_prefix(&base_lower_dash) else {
             // Not for this client.
             continue;
         };
