@@ -39,6 +39,12 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum permitted size for an HTTP request head (request line +
+/// headers + trailing CRLF). 32KB is comfortably above the 8KB-16KB
+/// defaults of common web servers (nginx, apache) while bounding
+/// memory exhaustion DoS.
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -70,6 +76,7 @@ type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
 
 /// One buffered HTTP response, ready for the listener to re-frame onto
 /// the data channel.
+#[derive(Debug)]
 pub struct ForwardResponse {
     /// HTTP/1.1 response head — status line + sanitised headers,
     /// terminated by `\r\n\r\n`.
@@ -83,6 +90,7 @@ pub struct ForwardResponse {
 /// Protocols`) and then tunnels raw bytes between the openhost data
 /// channel and `upstream` (a bidirectional TCP socket hyper hands off
 /// after the 101).
+#[derive(Debug)]
 pub struct WebSocketUpgrade {
     /// `HTTP/1.1 101 ...\r\n<headers>\r\n\r\n` bytes.
     pub head_bytes: Vec<u8>,
@@ -93,6 +101,7 @@ pub struct WebSocketUpgrade {
 /// What a successful `Forwarder::forward` produced: either a plain
 /// HTTP response the listener frames + re-emits, or a WebSocket
 /// upgrade the listener tunnels byte-for-byte.
+#[derive(Debug)]
 pub enum ForwardOutcome {
     /// Plain HTTP round-trip.
     Response(ForwardResponse),
@@ -183,6 +192,9 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadParse("request head too large"));
+        }
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -782,6 +794,26 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_oversized_head() {
+        let cfg = ForwardConfig {
+            target: Some("http://127.0.0.1:8080".into()),
+            ..Default::default()
+        };
+        let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
+
+        // 32KB + 1 byte
+        let big_head = vec![b'A'; MAX_HEAD_BYTES + 1];
+        let result = fwd.forward(&big_head, Bytes::new()).await;
+        match result {
+            Err(ForwardError::HeadParse("request head too large")) => {}
+            other => panic!(
+                "expected HeadParse('request head too large'), got: {:?}",
+                other
+            ),
+        }
     }
 
     // --- Response head encoder --------------------------------------
