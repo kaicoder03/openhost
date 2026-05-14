@@ -32,6 +32,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
+use std::io::Write;
 use std::time::Duration;
 
 /// Default connect timeout when reaching the upstream. Localhost should
@@ -279,7 +280,7 @@ impl Forwarder {
     async fn forward_websocket(
         &self,
         method: Method,
-        path: String,
+        path: &str,
         mut headers: HeaderMap,
         body: Bytes,
     ) -> Result<WebSocketUpgrade, ForwardError> {
@@ -340,7 +341,9 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 ///
 /// Rejects HTTP/0.9, HTTP/1.0, HTTP/2+, missing blank line, and any
 /// obvious line-ending confusion (bare `\n` inside headers).
-fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), ForwardError> {
+///
+/// BOLT OPTIMIZATION: returns path as `&str` to avoid heap allocation.
+fn parse_request_head(bytes: &[u8]) -> Result<(Method, &str, HeaderMap), ForwardError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ForwardError::HeadParse("request head is not valid UTF-8"))?;
 
@@ -361,8 +364,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         .ok_or(ForwardError::HeadParse("request line missing method"))?;
     let path = parts
         .next()
-        .ok_or(ForwardError::HeadParse("request line missing path"))?
-        .to_string();
+        .ok_or(ForwardError::HeadParse("request line missing path"))?;
     let version = parts
         .next()
         .ok_or(ForwardError::HeadParse("request line missing HTTP version"))?;
@@ -462,7 +464,9 @@ fn encode_websocket_response_head(
     }
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT OPTIMIZATION: write! directly into pre-allocated Vec to avoid String allocation.
+    write!(out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -524,7 +528,9 @@ fn encode_response_head(
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT OPTIMIZATION: write! directly into pre-allocated Vec to avoid String allocation.
+    write!(out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
