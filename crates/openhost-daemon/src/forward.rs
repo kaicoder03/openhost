@@ -383,7 +383,20 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+            // field-name and colon."
+            return Err(ForwardError::HeadParse(
+                "whitespace between header name and colon",
+            ));
+        }
+        if name.starts_with([' ', '\t']) {
+            // RFC 7230 §3.2.4: Reject leading whitespace (OBS-fold).
+            return Err(ForwardError::HeadParse("leading whitespace in header name"));
+        }
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -782,6 +795,26 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_around_header_name() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header field-name
+        // and colon. [...] A proxy MUST either reject or ... [fix it]".
+        // Leading whitespace (OBS-fold) is also rejected in this implementation.
+        let cases = [
+            "GET / HTTP/1.1\r\nHost : example\r\n\r\n", // space before colon
+            "GET / HTTP/1.1\r\nHost\t: example\r\n\r\n", // tab before colon
+            "GET / HTTP/1.1\r\n Host: example\r\n\r\n", // leading space
+        ];
+
+        for case in cases {
+            let err = parse_request_head(case.as_bytes()).unwrap_err();
+            assert!(
+                matches!(err, ForwardError::HeadParse(msg) if msg.contains("invalid header name") || msg.contains("whitespace")),
+                "failed to reject case: {case:?}"
+            );
+        }
     }
 
     // --- Response head encoder --------------------------------------
