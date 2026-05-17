@@ -39,6 +39,12 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum permitted size for the `REQUEST_HEAD` payload (32KB).
+/// Prevents memory exhaustion DoS from oversized request headers.
+/// Set to 32KB to comfortably fit within common SCTP data channel
+/// message limits while allowing reasonably large headers.
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -380,10 +386,28 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        // RFC 7230 §3.2.4: No whitespace before the colon.
+        // Also reject leading whitespace (OBS-fold) as we don't support it.
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "header line contains illegal leading whitespace",
+            ));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "header name must not be followed by whitespace before the colon",
+            ));
+        }
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -761,6 +785,25 @@ mod tests {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_around_header_name() {
+        // RFC 7230 §3.2.4: No whitespace before the colon.
+        let cases = [
+            b"GET / HTTP/1.1\r\nHost : example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost\t: example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\n Host: example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\n\tHost: example\r\n\r\n".as_slice(),
+        ];
+        for case in cases {
+            let err = parse_request_head(case).unwrap_err();
+            assert!(
+                matches!(err, ForwardError::HeadParse(_)),
+                "failed to reject case: {:?}",
+                std::str::from_utf8(case)
+            );
+        }
     }
 
     #[test]
