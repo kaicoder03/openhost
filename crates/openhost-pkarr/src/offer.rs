@@ -1111,13 +1111,15 @@ pub fn decode_answer_fragments_from_packet(
         let Some(first_label) = rr.name.iter().next() else {
             continue;
         };
-        if !first_label.as_ref().starts_with(b"_") {
+        let label_bytes = first_label.as_ref();
+        if !label_bytes.starts_with(b"_") {
             continue;
         }
 
-        let name = rr.name.to_string().to_lowercase();
-        let stripped = name.strip_suffix('.').unwrap_or(&name);
-        if !stripped.starts_with(&base) {
+        // DNS labels are case-insensitive. Perform a fast case-insensitive
+        // prefix match on the first label before any full-name allocations.
+        let label_str = core::str::from_utf8(label_bytes).map_err(|_| PkarrError::InvalidUtf8)?;
+        if !label_str.to_lowercase().starts_with(&base) {
             continue;
         }
 
@@ -1134,11 +1136,9 @@ pub fn decode_answer_fragments_from_packet(
             let bytes = URL_SAFE_NO_PAD.decode(txt_val.as_bytes())?;
             let frag = decode_fragment(&bytes)?;
 
-            // Extract index from name: `base-{idx}`.
-            let Some(idx_str) = stripped
-                .strip_prefix(&base)
-                .and_then(|s| s.split('.').next())
-                .and_then(|s| s.strip_prefix('-'))
+            // Extract index from the first label: `base-{idx}`.
+            let label_lower = label_str.to_lowercase();
+            let Some(idx_str) = label_lower.strip_prefix(&base).and_then(|s| s.strip_prefix('-'))
             else {
                 continue;
             };
@@ -1181,14 +1181,12 @@ pub fn decode_answer_fragments_from_packet(
     }
 
     // Reassemble in order. We know they are all present from 0..total-1.
-    let mut total_len = 0;
-    for i in 0..total as usize {
-        total_len += buckets[i].as_ref().unwrap().payload.len();
-    }
+    // BOLT OPTIMIZATION: pre-calculate capacity and use a single allocation.
+    let total_len = buckets.iter().take(total as usize).flatten().map(|f| f.payload.len()).sum();
 
     let mut sealed = Vec::with_capacity(total_len);
-    for i in 0..total as usize {
-        sealed.extend_from_slice(&buckets[i].as_ref().unwrap().payload);
+    for frag in buckets.iter().take(total as usize).flatten() {
+        sealed.extend_from_slice(&frag.payload);
     }
 
     let packet_ts_micros: u64 = packet.timestamp().into();
