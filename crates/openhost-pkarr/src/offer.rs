@@ -1118,8 +1118,10 @@ pub fn decode_answer_fragments_from_packet(
 
         // DNS labels are case-insensitive. Perform a fast case-insensitive
         // prefix match on the first label before any full-name allocations.
-        let label_str = core::str::from_utf8(label_bytes).map_err(|_| PkarrError::InvalidUtf8)?;
-        if !label_str.to_lowercase().starts_with(&base) {
+        // `base` is guaranteed lowercase z-base-32.
+        if label_bytes.len() < base.len()
+            || !label_bytes[..base.len()].eq_ignore_ascii_case(base.as_bytes())
+        {
             continue;
         }
 
@@ -1137,9 +1139,9 @@ pub fn decode_answer_fragments_from_packet(
             let frag = decode_fragment(&bytes)?;
 
             // Extract index from the first label: `base-{idx}`.
-            let label_lower = label_str.to_lowercase();
-            let Some(idx_str) = label_lower.strip_prefix(&base).and_then(|s| s.strip_prefix('-'))
-            else {
+            let label_str =
+                core::str::from_utf8(label_bytes).map_err(|_| PkarrError::InvalidUtf8)?;
+            let Some(idx_str) = label_str[base.len()..].strip_prefix('-') else {
                 continue;
             };
             let label_idx: u8 = idx_str
@@ -1182,7 +1184,12 @@ pub fn decode_answer_fragments_from_packet(
 
     // Reassemble in order. We know they are all present from 0..total-1.
     // BOLT OPTIMIZATION: pre-calculate capacity and use a single allocation.
-    let total_len = buckets.iter().take(total as usize).flatten().map(|f| f.payload.len()).sum();
+    let total_len = buckets
+        .iter()
+        .take(total as usize)
+        .flatten()
+        .map(|f| f.payload.len())
+        .sum();
 
     let mut sealed = Vec::with_capacity(total_len);
     for frag in buckets.iter().take(total as usize).flatten() {
