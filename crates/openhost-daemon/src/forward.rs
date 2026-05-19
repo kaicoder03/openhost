@@ -462,7 +462,11 @@ fn encode_websocket_response_head(
     }
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT OPTIMIZATION: Use write! to eliminate intermediate String allocation.
+    use std::io::Write as _;
+    write!(&mut out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
+
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -524,7 +528,11 @@ fn encode_response_head(
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT OPTIMIZATION: Use write! to eliminate intermediate String allocation.
+    use std::io::Write as _;
+    write!(&mut out, "HTTP/1.1 {} {}\r\n", status.as_u16(), reason)
+        .expect("writing to Vec always succeeds");
+
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
