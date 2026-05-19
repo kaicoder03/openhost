@@ -1,0 +1,3 @@
+## 2026-05-19 - DNS label matching in Pkarr packets
+**Learning:** When using `pkarr::SignedPacket::all_resource_records()`, the returned resource record names include the full origin/zone suffix. To match records by their relative label, you must inspect only the first label (`rr.name.iter().next()`) instead of checking the full name. Additionally, DNS name comparisons should be case-insensitive using `eq_ignore_ascii_case` on the label bytes for zero-allocation matching.
+**Action:** Use `rr.name.iter().next()` and byte-level `eq_ignore_ascii_case` when scanning Pkarr packets for specific records to ensure correctness and performance.

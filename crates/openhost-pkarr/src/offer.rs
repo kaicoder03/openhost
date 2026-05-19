@@ -528,7 +528,7 @@ fn encode_fragment(idx: u8, total: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DecodedFragment {
     idx: u8,
     total: u8,
@@ -1093,62 +1093,121 @@ pub fn decode_answer_fragments_from_packet(
     client_pk: &PublicKey,
 ) -> Result<Option<AnswerEntry>> {
     let client_hash = allowlist_hash(daemon_salt, &client_pk.to_bytes());
-    let base = format!(
-        "{ANSWER_TXT_PREFIX}{}",
-        zbase32::encode_full_bytes(&client_hash)
-    );
+    let client_hash_label = zbase32::encode_full_bytes(&client_hash);
+    let base = format!("{ANSWER_TXT_PREFIX}{}", client_hash_label);
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    let mut collected = Vec::new();
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    // BOLT OPTIMIZATION: O(M) single-pass reassembly.
+    // Replaces the previous O(N*M) repeated probes with a single pass over
+    // all resource records, bucket-sorting matching fragments.
+    for rr in packet.all_resource_records() {
+        // BOLT OPTIMIZATION: Zero-allocation fast-path prefix check on the first DNS label.
+        let Some(label) = rr.name.iter().next() else {
+            continue;
+        };
+
+        let label_bytes: &[u8] = label.as_ref();
+
+        // Case-insensitive prefix check. We avoid to_string().to_lowercase()
+        // by using byte-level eq_ignore_ascii_case for zero-allocation comparison.
+        if label_bytes.len() <= base.len()
+            || !label_bytes[..base.len()].eq_ignore_ascii_case(base.as_bytes())
+        {
+            continue;
+        }
+
+        // Integrity check: must have a trailing -<idx>
+        if label_bytes[base.len()] != b'-' {
+            continue;
+        }
+
+        // Extract the numeric suffix from the label.
+        let idx_from_label: u8 = match std::str::from_utf8(&label_bytes[base.len() + 1..]) {
+            Ok(s) => match s.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        if let RData::TXT(txt) = &rr.rdata {
+            // Concatenate TXT character-strings into one base64url string.
+            // Multiple strings arise when the base64 value exceeds 255 chars.
+            let mut fragment_b64 = String::new();
+            for (key, value) in txt.iter_raw() {
+                fragment_b64
+                    .push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+                if let Some(v) = value {
+                    fragment_b64.push('=');
+                    fragment_b64
+                        .push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+                }
+            }
+
+            let fragment_bytes = URL_SAFE_NO_PAD.decode(fragment_b64.as_bytes())?;
+            let frag = decode_fragment(&fragment_bytes)?;
+
+            // Integrity check: the envelope index must match the DNS label suffix.
+            if frag.idx != idx_from_label {
+                return Err(PkarrError::MalformedCanonical(
+                    "answer fragment idx disagrees with its DNS label suffix",
+                ));
+            }
+
+            collected.push(frag);
+        }
+    }
+
+    if collected.is_empty() {
         return Ok(None);
-    };
-    let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
-    let first = decode_fragment(&first_bytes)?;
-    if first.idx != 0 {
+    }
+
+    // Sort fragments by index. Since M is very small (typically 1-3),
+    // sorting is efficient and avoids large fixed-size bucket allocations.
+    collected.sort_by_key(|f| f.idx);
+
+    // Fragment 0 must be present for a valid answer set.
+    if collected[0].idx != 0 {
+        return Ok(None);
+    }
+
+    let total = collected[0].total;
+
+    // Verify all fragments in the set are present, consistent, and unique.
+    if collected.len() != total as usize {
+        // Check for duplicates to provide the specific MultipleOpenhostRecords error.
+        for i in 1..collected.len() {
+            if collected[i].idx == collected[i - 1].idx {
+                return Err(PkarrError::MultipleOpenhostRecords);
+            }
+        }
         return Err(PkarrError::MalformedCanonical(
-            "answer fragment 0 carries non-zero idx",
+            "answer fragment set is missing an idx",
         ));
     }
-    let total = first.total;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
-    fragments.push(first);
-    for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
-        let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
-        let frag = decode_fragment(&bytes)?;
+    for (i, frag) in collected.iter().enumerate() {
+        if frag.idx != i as u8 {
+            return Err(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ));
+        }
         if frag.total != total {
             return Err(PkarrError::MalformedCanonical(
                 "answer fragments disagree on chunk_total",
             ));
         }
-        if frag.idx != i {
-            return Err(PkarrError::MalformedCanonical(
-                "answer fragment idx disagrees with its DNS label suffix",
-            ));
-        }
-        fragments.push(frag);
     }
 
-    let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
-    for frag in fragments {
+    // BOLT OPTIMIZATION: pre-calculate capacity to perform a single allocation.
+    let total_payload_len = collected.iter().map(|f| f.payload.len()).sum();
+    let mut sealed = Vec::with_capacity(total_payload_len);
+    for frag in collected {
         sealed.extend_from_slice(&frag.payload);
     }
 
-    // Use the packet timestamp as a sensible default for `created_at` —
-    // the caller can override if they track their own receipt time.
+    // Use the packet timestamp as a sensible default for created_at.
     let packet_ts_micros: u64 = packet.timestamp().into();
     Ok(Some(AnswerEntry {
         client_hash,
