@@ -380,12 +380,27 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        // RFC 7230 §3.2.4: OBS-fold (line starting with SP or HTAB) is
+        // forbidden in new implementations and must be rejected to
+        // mitigate request smuggling.
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse("header line starts with whitespace (OBS-fold)"));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+        // field-name and colon."
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse("whitespace before header colon"));
+        }
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -897,5 +912,30 @@ mod tests {
         let target: Uri = "http://127.0.0.1:8080".parse().unwrap();
         let uri = combine_target_and_path(&target, "http://evil.example/foo").unwrap();
         assert_eq!(uri.to_string(), "http://127.0.0.1:8080/foo");
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the
+        // header field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(_)),
+            "Should reject whitespace before colon"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obs_fold() {
+        // RFC 7230 §3.2.4: "A proxy MUST either reject such a message
+        // or replace each received OBS fold with one or more SP
+        // characters prior to forwarding". We choose to reject.
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n Folder: yes\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(_)),
+            "Should reject OBS-fold"
+        );
     }
 }
