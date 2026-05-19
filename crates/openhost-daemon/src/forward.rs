@@ -384,7 +384,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         // forbidden in new implementations and must be rejected to
         // mitigate request smuggling.
         if line.starts_with([' ', '\t']) {
-            return Err(ForwardError::HeadParse("header line starts with whitespace (OBS-fold)"));
+            return Err(ForwardError::HeadParse(
+                "header line starts with whitespace (OBS-fold)",
+            ));
         }
 
         let colon = line
