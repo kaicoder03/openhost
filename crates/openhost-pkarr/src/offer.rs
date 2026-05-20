@@ -1113,13 +1113,16 @@ pub fn decode_answer_fragments_from_packet(
             };
 
             // Fast-path prefix check on the raw label bytes.
-            if !first_label.as_ref().starts_with(ANSWER_TXT_PREFIX.as_bytes()) {
+            if !first_label
+                .as_ref()
+                .starts_with(ANSWER_TXT_PREFIX.as_bytes())
+            {
                 continue;
             }
 
             // Case-insensitive comparison with the expected base name.
-            let label_str = core::str::from_utf8(first_label.as_ref())
-                .map_err(|_| PkarrError::InvalidUtf8)?;
+            let label_str =
+                core::str::from_utf8(first_label.as_ref()).map_err(|_| PkarrError::InvalidUtf8)?;
 
             if !label_str.starts_with(&base) {
                 continue;
