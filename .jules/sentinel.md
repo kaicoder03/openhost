@@ -1,0 +1,4 @@
+## 2025-05-14 - Strict RFC 7230 §3.2.4 Enforcement in HTTP Forwarder
+**Vulnerability:** The hand-rolled HTTP/1.1 parser in the daemon's forwarder was too lenient, allowing whitespace between header names and colons, and accepting obsolete line folding (obs-fold).
+**Learning:** Hand-rolled parsers often default to "helpful" behavior (like `.trim()` on header names) that violates strict protocol specifications. In HTTP, this leniency is a primary vector for request smuggling and cache poisoning when proxies and backends disagree on header boundaries.
+**Prevention:** Always parse protocol-defined tokens strictly against their ABNF. Header names in RFC 7230 are `token`s which do not include whitespace. Explicitly reject `obs-fold` and whitespace-before-colon as mandated by the "MUST reject" clauses in the RFC.
