@@ -281,6 +281,49 @@ async fn forwarder_round_trip_returns_upstream_200() -> DaemonResult<()> {
 }
 
 #[tokio::test]
+async fn forwarder_request_head_exceeding_cap_triggers_error_frame_and_teardown() -> DaemonResult<()>
+{
+    // The daemon enforces a hard 32KB limit on REQUEST_HEAD frames
+    // to prevent memory exhaustion.
+    let (port, _state) = spawn_upstream(UpstreamResponder::default()).await;
+    let (_tmp, app) = build_daemon(port).await;
+    let session = establish_connection(&app).await;
+
+    // Build a massive head (32KB + 1 byte).
+    let mut head = b"GET / HTTP/1.1\r\n".to_vec();
+    while head.len() < 32 * 1024 {
+        head.extend_from_slice(b"X-Filler: 1234567890\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    assert!(head.len() > 32 * 1024);
+
+    let req_head = Frame::new(FrameType::RequestHead, head).unwrap();
+    let mut wire = Vec::new();
+    req_head.encode(&mut wire);
+    session.dc.send(&Bytes::from(wire)).await.expect("send");
+
+    // Wait for the ERROR frame.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let err_frame = loop {
+        let bytes = session.received.lock().await.clone();
+        if let Ok(Some((frame, _))) = Frame::try_decode(&bytes) {
+            break frame;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no frame arrived after oversized REQUEST_HEAD");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(err_frame.frame_type, FrameType::Error);
+    let diagnostic = String::from_utf8_lossy(&err_frame.payload);
+    assert!(diagnostic.contains("head"));
+
+    session.close().await;
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwarder_forwards_request_body_verbatim() -> DaemonResult<()> {
     let (port, state) = spawn_upstream(UpstreamResponder::EchoBody).await;
     let (_tmp, app) = build_daemon(port).await;
