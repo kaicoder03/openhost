@@ -380,10 +380,27 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.starts_with([' ', '\t']) {
+            // RFC 7230 §3.2.4: "A sender MUST NOT generate OBS-fold... a
+            // recipient MAY reject". openhost strictly rejects it.
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding (OBS-fold) is not supported",
+            ));
+        }
+
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            // RFC 7230 §3.2.4: "No whitespace is allowed between the
+            // header field-name and colon."
+            return Err(ForwardError::HeadParse(
+                "header field-name MUST NOT be followed by whitespace",
+            ));
+        }
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
