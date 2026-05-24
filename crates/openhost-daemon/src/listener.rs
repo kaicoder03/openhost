@@ -20,8 +20,10 @@ use crate::channel_binding::{
     ChannelBinder, ChannelBindingError, AUTH_NONCE_LEN, BINDING_TIMEOUT_SECS, EXPORTER_LABEL,
     EXPORTER_SECRET_LEN,
 };
-use crate::error::ListenerError;
-use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
+use crate::error::{ForwardError, ListenerError};
+use crate::forward::{
+    ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade, MAX_HEAD_BYTES,
+};
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
@@ -856,7 +858,14 @@ async fn wire_frame_loop(
                             &local_dtls_fp,
                         )
                         .await;
-                        if let FrameOutcome::Teardown = outcome {
+
+                        let is_error = if let FrameOutcome::Error(ref reason) = outcome {
+                            let _ = send_error_frame(&dc, reason).await;
+                            true
+                        } else {
+                            false
+                        };
+                        if is_error || matches!(outcome, FrameOutcome::Teardown) {
                             let _ = dc.close().await;
                             buf.clear();
                             request.lock().await.reset();
@@ -881,6 +890,9 @@ async fn wire_frame_loop(
 enum FrameOutcome {
     Continue,
     Teardown,
+    /// Protocol or security violation. `dispatch_frame` returns this to
+    /// trigger an `ERROR` frame emission before `Teardown`.
+    Error(String),
 }
 
 /// Top-level dispatch. Gates on [`BindingState`]: until the channel
@@ -927,10 +939,9 @@ async fn dispatch_frame(
                 ?frame.frame_type,
                 "openhostd: frame arrived before data channel opened; tearing down"
             );
-            let _ = send_error_frame(dc, "frame before channel opened").await;
             *binding.lock().await = BindingState::Failed;
             binding_done.notify_waiters();
-            return FrameOutcome::Teardown;
+            return FrameOutcome::Error("frame before channel opened".to_string());
         }
         BindingSnapshot::AwaitingAuthClient { nonce } => {
             if frame.frame_type != FrameType::AuthClient {
@@ -938,17 +949,12 @@ async fn dispatch_frame(
                     ?frame.frame_type,
                     "openhostd: non-AuthClient frame before binding completed; tearing down"
                 );
-                let _ = send_error_frame(
-                    dc,
-                    &format!(
-                        "expected AuthClient before any other frame (got 0x{:02x})",
-                        frame.frame_type.as_u8()
-                    ),
-                )
-                .await;
                 *binding.lock().await = BindingState::Failed;
                 binding_done.notify_waiters();
-                return FrameOutcome::Teardown;
+                return FrameOutcome::Error(format!(
+                    "expected AuthClient before any other frame (got 0x{:02x})",
+                    frame.frame_type.as_u8()
+                ));
             }
             return handle_auth_client(
                 frame,
@@ -970,6 +976,13 @@ async fn dispatch_frame(
 
     match frame.frame_type {
         FrameType::RequestHead => {
+            if frame.payload.len() > MAX_HEAD_BYTES {
+                tracing::warn!(
+                    MAX_HEAD_BYTES,
+                    "openhostd: request head exceeded cap; tearing down"
+                );
+                return FrameOutcome::Error("request head too large".to_string());
+            }
             let mut req = request.lock().await;
             req.head_payload = Some(frame.payload.clone());
             req.body.clear();
@@ -979,8 +992,7 @@ async fn dispatch_frame(
             let mut req = request.lock().await;
             if req.head_payload.is_none() {
                 tracing::warn!("openhostd: REQUEST_BODY before REQUEST_HEAD; tearing down");
-                let _ = send_error_frame(dc, "REQUEST_BODY before REQUEST_HEAD").await;
-                return FrameOutcome::Teardown;
+                return FrameOutcome::Error("REQUEST_BODY before REQUEST_HEAD".to_string());
             }
             // Always cap the accumulated body — even on the stub-502 path
             // where the bytes will be discarded on REQUEST_END. Without
@@ -991,8 +1003,7 @@ async fn dispatch_frame(
                 .unwrap_or(STUB_MAX_BODY_BYTES);
             if req.body.len().saturating_add(frame.payload.len()) > cap {
                 tracing::warn!(cap, "openhostd: request body exceeded cap; tearing down");
-                let _ = send_error_frame(dc, "request body too large").await;
-                return FrameOutcome::Teardown;
+                return FrameOutcome::Error("request body too large".to_string());
             }
             req.body.extend_from_slice(&frame.payload);
             FrameOutcome::Continue
@@ -1004,8 +1015,7 @@ async fn dispatch_frame(
                     Some(h) => (h, std::mem::take(&mut req.body)),
                     None => {
                         tracing::warn!("openhostd: REQUEST_END without REQUEST_HEAD; tearing down");
-                        let _ = send_error_frame(dc, "REQUEST_END without REQUEST_HEAD").await;
-                        return FrameOutcome::Teardown;
+                        return FrameOutcome::Error("REQUEST_END without REQUEST_HEAD".to_string());
                     }
                 }
             };
@@ -1025,6 +1035,19 @@ async fn dispatch_frame(
                             );
                             let _ = emit_stub_502(dc).await;
                         }
+                    }
+                    Err(ForwardError::HeadParse(reason)) => {
+                        tracing::warn!(
+                            reason,
+                            "openhostd: request head parse failed; tearing down"
+                        );
+                        return FrameOutcome::Error(format!("request head parse failed: {reason}"));
+                    }
+                    Err(ForwardError::HeadTooLarge { cap }) => {
+                        tracing::warn!(cap, "openhostd: request head exceeded cap; tearing down");
+                        return FrameOutcome::Error(format!(
+                            "request head exceeded {cap} byte cap"
+                        ));
                     }
                     Err(err) => {
                         tracing::warn!(?err, "openhostd: forwarder failed; replying 502");
@@ -1053,8 +1076,7 @@ async fn dispatch_frame(
                 }
                 None => {
                     tracing::warn!("openhostd: WS_FRAME before websocket upgrade; tearing down");
-                    let _ = send_error_frame(dc, "WS_FRAME before upgrade").await;
-                    FrameOutcome::Teardown
+                    FrameOutcome::Error("WS_FRAME before upgrade".to_string())
                 }
             }
         }
@@ -1064,8 +1086,7 @@ async fn dispatch_frame(
             // websocket` header. Receiving it from a client is a
             // protocol violation.
             tracing::warn!("openhostd: unexpected WS_UPGRADE frame; tearing down");
-            let _ = send_error_frame(dc, "WS_UPGRADE frames are reserved").await;
-            FrameOutcome::Teardown
+            FrameOutcome::Error("WS_UPGRADE frames are reserved".to_string())
         }
         FrameType::Ping => {
             let pong = Frame::new(FrameType::Pong, Vec::new()).expect("Pong is empty");
@@ -1095,8 +1116,7 @@ async fn dispatch_frame(
                 ?frame.frame_type,
                 "openhostd: client sent unexpected frame type; tearing down"
             );
-            let _ = send_error_frame(dc, "unexpected frame type from client").await;
-            FrameOutcome::Teardown
+            FrameOutcome::Error("unexpected frame type from client".to_string())
         }
         // Auth frames after binding is complete are a protocol violation.
         // Spec §7.1 says binding runs once per DC; a client wishing to
@@ -1106,12 +1126,10 @@ async fn dispatch_frame(
                 ?frame.frame_type,
                 "openhostd: auth frame after binding completed; tearing down"
             );
-            let _ = send_error_frame(
-                dc,
-                "auth frame after binding completed; re-binding requires a new data channel",
+            FrameOutcome::Error(
+                "auth frame after binding completed; re-binding requires a new data channel"
+                    .to_string(),
             )
-            .await;
-            FrameOutcome::Teardown
         }
     }
 }
