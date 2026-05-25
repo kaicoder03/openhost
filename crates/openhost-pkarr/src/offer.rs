@@ -1121,7 +1121,7 @@ pub fn decode_answer_fragments_from_packet(
                 })?;
 
             if let RData::TXT(txt) = &rr.rdata {
-                let mut fragment_b64 = Vec::with_capacity(txt.len());
+                let mut fragment_b64 = Vec::new();
                 for (key, value) in txt.iter_raw() {
                     fragment_b64.extend_from_slice(key);
                     if let Some(v) = value {
