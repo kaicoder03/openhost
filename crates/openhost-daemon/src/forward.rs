@@ -40,7 +40,7 @@ use std::time::Duration;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Security limit for the total size of an HTTP request head (request line
-/// + headers). Prevents memory-exhaustion DoS from peers sending unbounded
+/// plus headers). Prevents memory-exhaustion DoS from peers sending unbounded
 /// header blocks. 32KB is large enough for any reasonable set of headers
 /// while fitting comfortably in a single SCTP data-channel frame.
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
