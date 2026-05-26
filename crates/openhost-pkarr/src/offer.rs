@@ -1093,55 +1093,94 @@ pub fn decode_answer_fragments_from_packet(
     client_pk: &PublicKey,
 ) -> Result<Option<AnswerEntry>> {
     let client_hash = allowlist_hash(daemon_salt, &client_pk.to_bytes());
-    let base = format!(
-        "{ANSWER_TXT_PREFIX}{}",
+    let prefix = format!(
+        "{ANSWER_TXT_PREFIX}{}-",
         zbase32::encode_full_bytes(&client_hash)
     );
+    let prefix_bytes = prefix.as_bytes();
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // BOLT OPTIMIZATION: replace O(N*M) repeated probes with a single pass over
+    // all records. Complexity: O(N + M log M) where N is records in packet,
+    // M is fragments in the set.
+    let mut fragments: Vec<DecodedFragment> = Vec::new();
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    for rr in packet.all_resource_records() {
+        if let Some(label) = rr.name.iter().next() {
+            let label_bytes = label.as_ref();
+            if label_bytes.starts_with(prefix_bytes) {
+                if let RData::TXT(txt) = &rr.rdata {
+                    let suffix = &label_bytes[prefix_bytes.len()..];
+                    let idx = core::str::from_utf8(suffix)
+                        .map_err(|_| {
+                            PkarrError::MalformedCanonical("invalid answer fragment index")
+                        })?
+                        .parse::<u8>()
+                        .map_err(|_| {
+                            PkarrError::MalformedCanonical("invalid answer fragment index")
+                        })?;
+
+                    if fragments.iter().any(|f| f.idx == idx) {
+                        return Err(PkarrError::MultipleOpenhostRecords);
+                    }
+
+                    // BOLT OPTIMIZATION: pre-calculate capacity to avoid reallocations.
+                    let cap = txt
+                        .iter_raw()
+                        .map(|(k, v)| k.len() + v.map(|v| v.len() + 1).unwrap_or(0))
+                        .sum();
+                    let mut b64_text = String::with_capacity(cap);
+                    for (key, value) in txt.iter_raw() {
+                        b64_text.push_str(
+                            core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?,
+                        );
+                        if let Some(v) = value {
+                            b64_text.push('=');
+                            b64_text.push_str(
+                                core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?,
+                            );
+                        }
+                    }
+
+                    let bytes = URL_SAFE_NO_PAD.decode(b64_text.as_bytes())?;
+                    let frag = decode_fragment(&bytes)?;
+                    if frag.idx != idx {
+                        return Err(PkarrError::MalformedCanonical(
+                            "answer fragment idx disagrees with its DNS label suffix",
+                        ));
+                    }
+                    fragments.push(frag);
+                }
+            }
+        }
+    }
+
+    if fragments.is_empty() {
         return Ok(None);
-    };
-    let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
-    let first = decode_fragment(&first_bytes)?;
-    if first.idx != 0 {
+    }
+
+    fragments.sort_by_key(|f| f.idx);
+
+    let total = fragments[0].total;
+    if fragments.len() != total as usize {
         return Err(PkarrError::MalformedCanonical(
-            "answer fragment 0 carries non-zero idx",
+            "answer fragment set is incomplete (missing fragments)",
         ));
     }
-    let total = first.total;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
-    fragments.push(first);
-    for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
-        let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
-        let frag = decode_fragment(&bytes)?;
+    for (i, frag) in fragments.iter().enumerate() {
+        if frag.idx != i as u8 {
+            return Err(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ));
+        }
         if frag.total != total {
             return Err(PkarrError::MalformedCanonical(
                 "answer fragments disagree on chunk_total",
             ));
         }
-        if frag.idx != i {
-            return Err(PkarrError::MalformedCanonical(
-                "answer fragment idx disagrees with its DNS label suffix",
-            ));
-        }
-        fragments.push(frag);
     }
 
+    // BOLT OPTIMIZATION: pre-calculate capacity for single allocation.
     let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
     for frag in fragments {
         sealed.extend_from_slice(&frag.payload);
