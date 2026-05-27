@@ -383,7 +383,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -782,6 +782,18 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+        // field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : localhost\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(_)),
+            "expected HeadParse error for whitespace before colon, got {err:?}"
+        );
     }
 
     // --- Response head encoder --------------------------------------
