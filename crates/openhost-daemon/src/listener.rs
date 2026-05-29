@@ -700,7 +700,7 @@ fn wire_data_channel_handler(
 /// appended to on `RequestBody`, consumed on `RequestEnd`.
 #[derive(Default)]
 struct RequestInProgress {
-    head_payload: Option<Vec<u8>>,
+    head_payload: Option<Bytes>,
     body: BytesMut,
 }
 
@@ -747,7 +747,9 @@ async fn wire_frame_loop(
     binding_mode: BindingMode,
     local_dtls_fp: [u8; 32],
 ) {
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // BOLT OPTIMIZATION: use BytesMut for O(1) consumption via advance()
+    let buffer: Arc<Mutex<BytesMut>> =
+        Arc::new(Mutex::new(BytesMut::with_capacity(SCTP_SAFE_CHUNK_BYTES)));
     let request: Arc<Mutex<RequestInProgress>> = Arc::new(Mutex::new(RequestInProgress::default()));
     let binding: Arc<Mutex<BindingState>> = Arc::new(Mutex::new(BindingState::Pending));
     // `Some(tx)` during an active WebSocket tunnel; `None` otherwise.
@@ -839,9 +841,9 @@ async fn wire_frame_loop(
             let mut buf = buffer.lock().await;
             buf.extend_from_slice(&msg.data);
             loop {
-                match Frame::try_decode(&buf) {
-                    Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                // BOLT OPTIMIZATION: use try_decode_mut for O(1) consumption and zero-copy payload
+                match Frame::try_decode_mut(&mut buf) {
+                    Ok(Some(frame)) => {
                         let outcome = dispatch_frame(
                             &frame,
                             &dc,
@@ -1042,7 +1044,7 @@ async fn dispatch_frame(
             let tx_opt = ws_tunnel.lock().await.clone();
             match tx_opt {
                 Some(tx) => {
-                    if tx.send(Bytes::from(frame.payload.clone())).is_err() {
+                    if tx.send(frame.payload.clone()).is_err() {
                         // Upstream tunnel task dropped the receiver →
                         // the upgraded TCP socket closed. Tear the DC
                         // down so the client notices.
@@ -1068,7 +1070,7 @@ async fn dispatch_frame(
             FrameOutcome::Teardown
         }
         FrameType::Ping => {
-            let pong = Frame::new(FrameType::Pong, Vec::new()).expect("Pong is empty");
+            let pong = Frame::new(FrameType::Pong, Bytes::new()).expect("Pong is empty");
             let mut out = Vec::with_capacity(5);
             pong.encode(&mut out);
             if let Err(err) = dc.send(&Bytes::from(out)).await {
@@ -1201,7 +1203,7 @@ async fn handle_auth_client(
 
     if let Err(err) = send_frame(
         dc,
-        Frame::new(FrameType::AuthHost, host_sig.to_vec())
+        Frame::new(FrameType::AuthHost, Bytes::from(host_sig.to_vec()))
             .expect("64-byte host signature fits the frame cap"),
     )
     .await
@@ -1517,7 +1519,7 @@ mod tests {
 
         let (decoded_head, consumed_head) = Frame::try_decode(&wire).unwrap().unwrap();
         assert_eq!(decoded_head.frame_type, FrameType::ResponseHead);
-        assert_eq!(decoded_head.payload, RESPONSE_502_HEAD);
+        assert_eq!(decoded_head.payload, RESPONSE_502_HEAD[..]);
 
         let (decoded_end, consumed_end) =
             Frame::try_decode(&wire[consumed_head..]).unwrap().unwrap();
