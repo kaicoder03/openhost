@@ -25,10 +25,11 @@
 //! returns `Ok(None)` when more bytes are needed and `Ok(Some((frame, consumed)))`
 //! when a complete frame is available.
 //!
-//! Payloads are plain `Vec<u8>`; higher-level code interprets them according to
+//! Payloads are [`bytes::Bytes`]; higher-level code interprets them according to
 //! [`FrameType`] (e.g. HTTP header text for [`FrameType::RequestHead`]).
 
 use crate::{Error, Result};
+use bytes::{Buf, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 /// Wire header length of the legacy v1 frame: `type(1) || length(4)`.
@@ -147,21 +148,26 @@ pub struct Frame {
     /// (AuthNonce/AuthClient/AuthHost, Ping/Pong) and for legacy v1
     /// frames (synthesised during decode).
     pub request_id: u32,
-    /// Frame payload bytes (length is implicit from the `Vec`).
-    pub payload: Vec<u8>,
+    /// Frame payload bytes (length is implicit from the [`Bytes`]).
+    pub payload: Bytes,
 }
 
 impl Frame {
     /// Create a new session-scoped frame (request_id = 0). Preserved for
     /// call sites that never care about demultiplexing — auth frames,
     /// pings, legacy tests. Validates per-type payload constraints.
-    pub fn new(frame_type: FrameType, payload: Vec<u8>) -> Result<Self> {
+    pub fn new<P: Into<Bytes>>(frame_type: FrameType, payload: P) -> Result<Self> {
         Self::new_with_id(frame_type, REQUEST_ID_SESSION, payload)
     }
 
     /// Create a new frame with an explicit request_id. HTTP-transaction
     /// frames produced by the SW proxy / client session use this.
-    pub fn new_with_id(frame_type: FrameType, request_id: u32, payload: Vec<u8>) -> Result<Self> {
+    pub fn new_with_id<P: Into<Bytes>>(
+        frame_type: FrameType,
+        request_id: u32,
+        payload: P,
+    ) -> Result<Self> {
+        let payload = payload.into();
         if payload.len() > MAX_PAYLOAD_LEN {
             return Err(Error::OversizedFrame {
                 requested: payload.len(),
@@ -265,7 +271,7 @@ impl Frame {
             return Ok(None);
         }
 
-        let payload = buf[FRAME_HEADER_LEN..total].to_vec();
+        let payload = Bytes::copy_from_slice(&buf[FRAME_HEADER_LEN..total]);
         Ok(Some((
             Self {
                 frame_type,
@@ -307,7 +313,7 @@ impl Frame {
             return Ok(None);
         }
 
-        let payload = buf[FRAME_V2_HEADER_LEN..total].to_vec();
+        let payload = Bytes::copy_from_slice(&buf[FRAME_V2_HEADER_LEN..total]);
         Ok(Some((
             Self {
                 frame_type,
@@ -316,6 +322,79 @@ impl Frame {
             },
             total,
         )))
+    }
+
+    /// Try to decode one frame from the front of `buf` and advance the
+    /// buffer. Returns `Ok(Some(frame))` on success, `Ok(None)` if more
+    /// bytes are required, or `Err(_)` on malformed bytes.
+    ///
+    /// This is the preferred way to decode frames as it provides $O(1)$
+    /// consumption and zero-copy payload slicing.
+    pub fn try_decode_mut(buf: &mut BytesMut) -> Result<Option<Self>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+
+        let (header_len, length) = if buf[0] == FRAME_V2_VERSION {
+            if buf.len() < FRAME_V2_HEADER_LEN {
+                return Ok(None);
+            }
+            let length = u32::from_be_bytes(buf[6..10].try_into().unwrap()) as usize;
+            (FRAME_V2_HEADER_LEN, length)
+        } else {
+            if buf.len() < FRAME_HEADER_LEN {
+                return Ok(None);
+            }
+            let length = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
+            (FRAME_HEADER_LEN, length)
+        };
+
+        if length > MAX_PAYLOAD_LEN {
+            return Err(Error::OversizedFrame {
+                requested: length,
+                limit: MAX_PAYLOAD_LEN,
+            });
+        }
+
+        let total = header_len + length;
+        if buf.len() < total {
+            return Ok(None);
+        }
+
+        // We have a full frame. Re-run validation without slicing to
+        // avoid double-work, then advance.
+        if buf[0] == FRAME_V2_VERSION {
+            let type_byte = buf[1];
+            let request_id = u32::from_be_bytes(buf[2..6].try_into().unwrap());
+            let frame_type = FrameType::from_u8(type_byte)?;
+            if frame_type.payload_must_be_empty() && length != 0 {
+                return Err(Error::MalformedFrame(
+                    "frame type forbids payload but length is non-zero",
+                ));
+            }
+            buf.advance(FRAME_V2_HEADER_LEN);
+            let payload = buf.split_to(length).freeze();
+            Ok(Some(Self {
+                frame_type,
+                request_id,
+                payload,
+            }))
+        } else {
+            let type_byte = buf[0];
+            let frame_type = FrameType::from_u8(type_byte)?;
+            if frame_type.payload_must_be_empty() && length != 0 {
+                return Err(Error::MalformedFrame(
+                    "frame type forbids payload but length is non-zero",
+                ));
+            }
+            buf.advance(FRAME_HEADER_LEN);
+            let payload = buf.split_to(length).freeze();
+            Ok(Some(Self {
+                frame_type,
+                request_id: REQUEST_ID_SESSION,
+                payload,
+            }))
+        }
     }
 }
 
@@ -358,7 +437,7 @@ mod tests {
         let bytes = frame.encode_to_vec();
         let (decoded, _) = Frame::try_decode(&bytes).unwrap().unwrap();
         assert_eq!(decoded.request_id, id);
-        assert_eq!(decoded.payload, b"hello");
+        assert_eq!(decoded.payload, b"hello"[..]);
     }
 
     #[test]
@@ -373,7 +452,7 @@ mod tests {
         let (decoded, consumed) = Frame::try_decode(&v1).unwrap().unwrap();
         assert_eq!(decoded.frame_type, FrameType::RequestBody);
         assert_eq!(decoded.request_id, REQUEST_ID_SESSION);
-        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.payload, payload[..]);
         assert_eq!(consumed, v1.len());
     }
 
@@ -502,6 +581,43 @@ mod tests {
         let (d2, n2) = Frame::try_decode(&buf[n1..]).unwrap().unwrap();
         assert_eq!(d2, f2);
         assert_eq!(n1 + n2, buf.len());
+    }
+
+    #[test]
+    fn try_decode_mut_roundtrips() {
+        let f1 = Frame::new_with_id(FrameType::ResponseBody, 42, b"hello".to_vec()).unwrap();
+        let f2 = Frame::new(FrameType::ResponseEnd, vec![]).unwrap();
+        let mut buf = BytesMut::new();
+        let mut wire = Vec::new();
+        f1.encode(&mut wire);
+        f2.encode(&mut wire);
+        buf.extend_from_slice(&wire);
+
+        let d1 = Frame::try_decode_mut(&mut buf).unwrap().unwrap();
+        assert_eq!(d1, f1);
+        assert_eq!(d1.payload, b"hello"[..]);
+
+        let d2 = Frame::try_decode_mut(&mut buf).unwrap().unwrap();
+        assert_eq!(d2, f2);
+        assert!(d2.payload.is_empty());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn try_decode_mut_legacy_v1() {
+        let payload = b"legacy-body".to_vec();
+        let mut v1 = Vec::new();
+        v1.push(FrameType::RequestBody.as_u8());
+        v1.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        v1.extend_from_slice(&payload);
+
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&v1);
+
+        let decoded = Frame::try_decode_mut(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.frame_type, FrameType::RequestBody);
+        assert_eq!(decoded.payload, payload[..]);
+        assert!(buf.is_empty());
     }
 
     #[test]

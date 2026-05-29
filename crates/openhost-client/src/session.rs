@@ -15,7 +15,7 @@
 //! one DC is not yet supported end-to-end).
 
 use crate::error::{ClientError, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use openhost_core::wire::{Frame, FrameType, MAX_PAYLOAD_LEN};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 pub struct ClientResponse {
     /// UTF-8 HTTP/1.1 response head, CRLF-separated, terminated by a
     /// blank line.
-    pub head_bytes: Vec<u8>,
+    pub head_bytes: Bytes,
     /// Body bytes (may be empty).
     pub body: Bytes,
 }
@@ -81,7 +81,7 @@ impl OpenhostSession {
             .map_err(|e| ClientError::HttpRoundTrip(format!("send: {e}")))?;
 
         // Read until RESPONSE_END.
-        let mut head_bytes_out: Option<Vec<u8>> = None;
+        let mut head_bytes_out: Option<Bytes> = None;
         let mut body_out: Vec<u8> = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -159,7 +159,7 @@ impl Drop for OpenhostSession {
 /// Inbound frame reader. Wraps the DC's `on_message` buffer + a
 /// `Notify` the reader awaits when it runs out of frames to decode.
 pub struct SessionInboundReader {
-    buffer: Arc<Mutex<Vec<u8>>>,
+    buffer: Arc<Mutex<BytesMut>>,
     notify: Arc<Notify>,
 }
 
@@ -174,7 +174,7 @@ impl SessionInboundReader {
     /// lost-wakeup for exactly that race window, and the binding
     /// handshake's first frame is the common case where it fires.
     pub(crate) fn install(dc: &Arc<RTCDataChannel>) -> Self {
-        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let buffer: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::new()));
         let notify: Arc<Notify> = Arc::new(Notify::new());
         let buf_for_msg = Arc::clone(&buffer);
         let notify_for_msg = Arc::clone(&notify);
@@ -197,9 +197,10 @@ impl SessionInboundReader {
             // Try to decode whatever's currently buffered.
             {
                 let mut buf = self.buffer.lock().await;
-                match Frame::try_decode(&buf) {
-                    Ok(Some((frame, consumed))) => {
-                        buf.drain(..consumed);
+                // BOLT OPTIMIZATION: use try_decode_mut for O(1) consumption via advance()
+                // and zero-copy payload slicing into Bytes.
+                match Frame::try_decode_mut(&mut buf) {
+                    Ok(Some(frame)) => {
                         return Ok(frame);
                     }
                     Ok(None) => {
