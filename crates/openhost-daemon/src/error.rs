@@ -181,6 +181,13 @@ pub enum ForwardError {
     #[error("inbound request head is malformed: {0}")]
     HeadParse(&'static str),
 
+    /// Inbound request head exceeded the security limit.
+    #[error("request head exceeded {cap} byte cap")]
+    HeadTooLarge {
+        /// The limit in bytes.
+        cap: usize,
+    },
+
     /// Inbound request body exceeded the configured
     /// `forward.max_body_bytes` cap.
     #[error("request body exceeded {cap} byte cap")]
