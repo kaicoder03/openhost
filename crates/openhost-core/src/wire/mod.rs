@@ -25,10 +25,11 @@
 //! returns `Ok(None)` when more bytes are needed and `Ok(Some((frame, consumed)))`
 //! when a complete frame is available.
 //!
-//! Payloads are plain `Vec<u8>`; higher-level code interprets them according to
+//! Payloads are `bytes::Bytes`; higher-level code interprets them according to
 //! [`FrameType`] (e.g. HTTP header text for [`FrameType::RequestHead`]).
 
 use crate::{Error, Result};
+use bytes::{Buf, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 /// Wire header length of the legacy v1 frame: `type(1) || length(4)`.
@@ -147,21 +148,26 @@ pub struct Frame {
     /// (AuthNonce/AuthClient/AuthHost, Ping/Pong) and for legacy v1
     /// frames (synthesised during decode).
     pub request_id: u32,
-    /// Frame payload bytes (length is implicit from the `Vec`).
-    pub payload: Vec<u8>,
+    /// Frame payload bytes (length is implicit from the `Bytes`).
+    pub payload: Bytes,
 }
 
 impl Frame {
     /// Create a new session-scoped frame (request_id = 0). Preserved for
     /// call sites that never care about demultiplexing — auth frames,
     /// pings, legacy tests. Validates per-type payload constraints.
-    pub fn new(frame_type: FrameType, payload: Vec<u8>) -> Result<Self> {
+    pub fn new(frame_type: FrameType, payload: impl Into<Bytes>) -> Result<Self> {
         Self::new_with_id(frame_type, REQUEST_ID_SESSION, payload)
     }
 
     /// Create a new frame with an explicit request_id. HTTP-transaction
     /// frames produced by the SW proxy / client session use this.
-    pub fn new_with_id(frame_type: FrameType, request_id: u32, payload: Vec<u8>) -> Result<Self> {
+    pub fn new_with_id(
+        frame_type: FrameType,
+        request_id: u32,
+        payload: impl Into<Bytes>,
+    ) -> Result<Self> {
+        let payload = payload.into();
         if payload.len() > MAX_PAYLOAD_LEN {
             return Err(Error::OversizedFrame {
                 requested: payload.len(),
@@ -237,6 +243,83 @@ impl Frame {
         }
     }
 
+    /// Try to decode one frame from a [`BytesMut`] buffer.
+    ///
+    /// BOLT OPTIMIZATION: zero-copy payload extraction via `split_to`
+    /// and O(1) buffer consumption via `advance`. Replaces the O(N)
+    /// `Vec::drain` pattern and avoids intermediate `Vec<u8>` clones.
+    pub fn try_decode_mut(buf: &mut BytesMut) -> Result<Option<Self>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+
+        let (_version, frame_type, request_id, length, header_len) = if buf[0] == FRAME_V2_VERSION {
+            if buf.len() < FRAME_V2_HEADER_LEN {
+                return Ok(None);
+            }
+            let type_byte = buf[1];
+            let id_bytes: [u8; 4] = buf[2..6].try_into().expect("2..6 slice");
+            let len_bytes: [u8; 4] = buf[6..10].try_into().expect("6..10 slice");
+
+            let request_id = u32::from_be_bytes(id_bytes);
+            let length = u32::from_be_bytes(len_bytes) as usize;
+            let frame_type = FrameType::from_u8(type_byte)?;
+
+            (
+                FRAME_V2_VERSION,
+                frame_type,
+                request_id,
+                length,
+                FRAME_V2_HEADER_LEN,
+            )
+        } else {
+            if buf.len() < FRAME_HEADER_LEN {
+                return Ok(None);
+            }
+            let type_byte = buf[0];
+            let len_bytes: [u8; 4] = buf[1..5].try_into().expect("1..5 slice");
+
+            let length = u32::from_le_bytes(len_bytes) as usize;
+            let frame_type = FrameType::from_u8(type_byte)?;
+
+            (
+                type_byte,
+                frame_type,
+                REQUEST_ID_SESSION,
+                length,
+                FRAME_HEADER_LEN,
+            )
+        };
+
+        if length > MAX_PAYLOAD_LEN {
+            return Err(Error::OversizedFrame {
+                requested: length,
+                limit: MAX_PAYLOAD_LEN,
+            });
+        }
+
+        if frame_type.payload_must_be_empty() && length != 0 {
+            return Err(Error::MalformedFrame(
+                "frame type forbids payload but length is non-zero",
+            ));
+        }
+
+        if buf.len() < header_len + length {
+            return Ok(None);
+        }
+
+        // Consume header.
+        buf.advance(header_len);
+        // Extract payload zero-copy.
+        let payload = buf.split_to(length).freeze();
+
+        Ok(Some(Self {
+            frame_type,
+            request_id,
+            payload,
+        }))
+    }
+
     fn try_decode_v1(buf: &[u8]) -> Result<Option<(Self, usize)>> {
         if buf.len() < FRAME_HEADER_LEN {
             return Ok(None);
@@ -265,7 +348,7 @@ impl Frame {
             return Ok(None);
         }
 
-        let payload = buf[FRAME_HEADER_LEN..total].to_vec();
+        let payload = Bytes::copy_from_slice(&buf[FRAME_HEADER_LEN..total]);
         Ok(Some((
             Self {
                 frame_type,
@@ -307,7 +390,7 @@ impl Frame {
             return Ok(None);
         }
 
-        let payload = buf[FRAME_V2_HEADER_LEN..total].to_vec();
+        let payload = Bytes::copy_from_slice(&buf[FRAME_V2_HEADER_LEN..total]);
         Ok(Some((
             Self {
                 frame_type,
@@ -358,7 +441,7 @@ mod tests {
         let bytes = frame.encode_to_vec();
         let (decoded, _) = Frame::try_decode(&bytes).unwrap().unwrap();
         assert_eq!(decoded.request_id, id);
-        assert_eq!(decoded.payload, b"hello");
+        assert_eq!(decoded.payload, &b"hello"[..]);
     }
 
     #[test]
@@ -373,7 +456,7 @@ mod tests {
         let (decoded, consumed) = Frame::try_decode(&v1).unwrap().unwrap();
         assert_eq!(decoded.frame_type, FrameType::RequestBody);
         assert_eq!(decoded.request_id, REQUEST_ID_SESSION);
-        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.payload, &payload[..]);
         assert_eq!(consumed, v1.len());
     }
 
