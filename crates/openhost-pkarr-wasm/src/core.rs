@@ -486,7 +486,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<DecodedFrame>> {
         Ok(None) => Ok(None),
         Ok(Some((frame, consumed))) => Ok(Some(DecodedFrame {
             frame_type: frame.frame_type.as_u8(),
-            payload: frame.payload,
+            payload: frame.payload.to_vec(),
             consumed,
         })),
         Err(e) => Err(Error::Frame(e.to_string())),

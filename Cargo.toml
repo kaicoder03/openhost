@@ -89,6 +89,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http = "1"
 http-body-util = "0.1"
+bytes = "1"
 
 [profile.release]
 lto = "thin"
