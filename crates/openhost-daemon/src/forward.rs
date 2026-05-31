@@ -34,6 +34,12 @@ use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
 use std::time::Duration;
 
+/// Maximum permitted size of an HTTP request head (request line +
+/// headers) in bytes. 32KB is comfortably above the 8-16KB defaults of
+/// most servers while still bounding memory exhaustion and fitting
+/// within a few SCTP chunks.
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Default connect timeout when reaching the upstream. Localhost should
 /// complete in microseconds; 2 seconds is comfortably above the worst
 /// case and still bounds a misconfigured target from wedging a request.
@@ -183,6 +189,11 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadTooLarge {
+                cap: MAX_HEAD_BYTES,
+            });
+        }
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -380,12 +391,22 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding (OBS-fold) is not supported",
+            ));
+        }
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace between header name and colon is not allowed",
+            ));
+        }
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +803,39 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the
+        // header field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let result = parse_request_head(raw);
+        assert!(
+            result.is_err(),
+            "should reject whitespace before colon, but got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obs_fold() {
+        // RFC 7230 §3.2.4: "A sender MUST NOT generate obsolete
+        // line folding ... a recipient SHOULD reject it."
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n X-Fold: yes\r\n\r\n";
+        let result = parse_request_head(raw);
+        assert!(
+            result.is_err(),
+            "should reject obsolete line folding, but got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com  \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example.com");
     }
 
     // --- Response head encoder --------------------------------------
