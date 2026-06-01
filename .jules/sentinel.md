@@ -1,0 +1,4 @@
+## 2025-05-22 - HTTP Smuggling & Dynamic Hop-by-Hop Stripping
+**Vulnerability:** Lentient HTTP header parsing allowed whitespace between field-name and colon, and supported obsolete line folding (obs-fold), both of which are classic request smuggling vectors. Additionally, the forwarder did not dynamically strip hop-by-hop headers listed in the `Connection` field, violating RFC 7230 §6.1.
+**Learning:** Hand-rolled HTTP parsers must be extremely strict about OWS (optional whitespace) placement. Reusing `.trim()` on full header lines is dangerous as it hides invalid whitespace in the field-name/colon separator. Dynamic hop-by-hop stripping is a mandatory proxy requirement often overlooked in simple forwarding logic.
+**Prevention:** Always use `headers.get_all()` for the `Connection` header to catch multiple instances. Enforce explicit rejection of `obs-fold` and invalid OWS early in the parse loop.
