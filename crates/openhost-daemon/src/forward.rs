@@ -380,12 +380,24 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding (OBS-fold) is not supported",
+            ));
+        }
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "invalid header name: whitespace before colon",
+            ));
+        }
+
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` around the value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +794,35 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(msg) if msg.contains("invalid header name")),
+            "Whitespace before colon MUST be rejected; got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obs_fold() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n Foo: bar\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(msg) if msg.contains("obsolete line folding")),
+            "Obsolete line folding MUST be rejected; got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_whitespace() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com  \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example.com");
     }
 
     // --- Response head encoder --------------------------------------
