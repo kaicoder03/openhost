@@ -381,7 +381,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
     let mut headers = HeaderMap::new();
     for line in lines {
         if line.starts_with([' ', '\t']) {
-            return Err(ForwardError::HeadParse("obsolete line folding (OBS-fold) is not supported"));
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding (OBS-fold) is not supported",
+            ));
         }
         let colon = line
             .find(':')
@@ -389,7 +391,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
         let name = &line[..colon];
         if name.ends_with([' ', '\t']) {
-            return Err(ForwardError::HeadParse("invalid header name: whitespace before colon"));
+            return Err(ForwardError::HeadParse(
+                "invalid header name: whitespace before colon",
+            ));
         }
 
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` around the value.
