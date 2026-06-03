@@ -1,0 +1,3 @@
+## 2025-05-14 - Optimize DNS fragment reassembly to O(M)
+**Learning:** The `pkarr::SignedPacket::resource_records(name)` method performs a linear scan of all records in the packet. Repeatedly calling it for multiple fragment indices (e.g. `_answer-<hash>-0`, `_answer-<hash>-1`) results in an O(N*M) complexity where N is the number of fragments and M is the total number of records.
+**Action:** Use `packet.all_resource_records()` to iterate over all records exactly once. Use zero-allocation byte-level prefix checks on DNS label bytes (`Label::as_ref()`) to filter relevant records efficiently without intermediate `String` allocations or full name normalization.
