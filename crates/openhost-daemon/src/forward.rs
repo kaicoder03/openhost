@@ -39,6 +39,11 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum permitted size for the HTTP request head (request line +
+/// headers), including the trailing `\r\n\r\n`. 32KB is a standard
+/// safe limit for most proxies (e.g. Nginx defaults to 8KB-32KB).
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -183,6 +188,12 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        // Defense in depth: the listener should have already capped the
+        // REQUEST_HEAD frame, but we verify here too before parsing.
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadParse("request head exceeds 32KB limit"));
+        }
+
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -341,6 +352,10 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Rejects HTTP/0.9, HTTP/1.0, HTTP/2+, missing blank line, and any
 /// obvious line-ending confusion (bare `\n` inside headers).
 fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), ForwardError> {
+    if bytes.len() > MAX_HEAD_BYTES {
+        return Err(ForwardError::HeadParse("request head exceeds 32KB limit"));
+    }
+
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ForwardError::HeadParse("request head is not valid UTF-8"))?;
 
@@ -782,6 +797,21 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_oversized_head() {
+        // Build a head that is larger than 32KB.
+        let mut big_head = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..2000 {
+            big_head.extend_from_slice(format!("X-Header-{}: value\r\n", i).as_bytes());
+        }
+        big_head.extend_from_slice(b"\r\n");
+
+        assert!(big_head.len() > MAX_HEAD_BYTES);
+
+        let err = parse_request_head(&big_head).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(m) if m.contains("limit")));
     }
 
     // --- Response head encoder --------------------------------------
