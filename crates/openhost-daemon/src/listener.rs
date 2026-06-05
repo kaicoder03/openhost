@@ -20,7 +20,7 @@ use crate::channel_binding::{
     ChannelBinder, ChannelBindingError, AUTH_NONCE_LEN, BINDING_TIMEOUT_SECS, EXPORTER_LABEL,
     EXPORTER_SECRET_LEN,
 };
-use crate::error::ListenerError;
+use crate::error::{ForwardError, ListenerError};
 use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
@@ -970,6 +970,14 @@ async fn dispatch_frame(
 
     match frame.frame_type {
         FrameType::RequestHead => {
+            if frame.payload.len() > crate::forward::MAX_HEAD_BYTES {
+                tracing::warn!(
+                    limit = crate::forward::MAX_HEAD_BYTES,
+                    "openhostd: request head exceeded security limit; tearing down"
+                );
+                let _ = send_error_frame(dc, "request head too large").await;
+                return FrameOutcome::Teardown;
+            }
             let mut req = request.lock().await;
             req.head_payload = Some(frame.payload.clone());
             req.body.clear();
@@ -1025,6 +1033,13 @@ async fn dispatch_frame(
                             );
                             let _ = emit_stub_502(dc).await;
                         }
+                    }
+                    Err(err @ ForwardError::HeadParse(_))
+                    | Err(err @ ForwardError::HeadTooLarge { .. })
+                    | Err(err @ ForwardError::BodyTooLarge { .. }) => {
+                        tracing::warn!(?err, "openhostd: request rejected; tearing down");
+                        let _ = send_error_frame(dc, &err.to_string()).await;
+                        return FrameOutcome::Teardown;
                     }
                     Err(err) => {
                         tracing::warn!(?err, "openhostd: forwarder failed; replying 502");
