@@ -39,6 +39,11 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum permitted length for the REQUEST_HEAD frame payload.
+/// production servers (Apache/Nginx/Hyper) typically cap this at
+/// 8KB - 32KB to prevent DoS attacks.
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -70,6 +75,7 @@ type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
 
 /// One buffered HTTP response, ready for the listener to re-frame onto
 /// the data channel.
+#[derive(Debug)]
 pub struct ForwardResponse {
     /// HTTP/1.1 response head — status line + sanitised headers,
     /// terminated by `\r\n\r\n`.
@@ -90,9 +96,19 @@ pub struct WebSocketUpgrade {
     pub upstream: Upgraded,
 }
 
+impl std::fmt::Debug for WebSocketUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketUpgrade")
+            .field("head_bytes", &self.head_bytes)
+            .field("upstream", &"<redacted>")
+            .finish()
+    }
+}
+
 /// What a successful `Forwarder::forward` produced: either a plain
 /// HTTP response the listener frames + re-emits, or a WebSocket
 /// upgrade the listener tunnels byte-for-byte.
+#[derive(Debug)]
 pub enum ForwardOutcome {
     /// Plain HTTP round-trip.
     Response(ForwardResponse),
@@ -183,6 +199,14 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        // Defense-in-depth: ensure the head fits within our security
+        // limit even if the listener's primary check was bypassed.
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadTooLarge {
+                limit: MAX_HEAD_BYTES,
+            });
+        }
+
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -383,7 +407,18 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        // RFC 7230 §3.2.4: No whitespace allowed between field-name and colon.
+        // A server MUST reject any received request message that contains
+        // whitespace between a header field-name and colon.
+        let name_raw = &line[..colon];
+        if name_raw.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace between header name and colon is forbidden",
+            ));
+        }
+        let name = name_raw.trim();
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -782,6 +817,48 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_between_header_name_and_colon() {
+        // RFC 7230 §3.2.4: "A server MUST reject any received request
+        // message that contains whitespace between a header field-name
+        // and colon."
+        let cases = [
+            "GET / HTTP/1.1\r\nHost : x\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost\t: x\r\n\r\n",
+        ];
+        for raw in cases {
+            let err = parse_request_head(raw.as_bytes()).unwrap_err();
+            assert!(
+                matches!(err, ForwardError::HeadParse(m) if m.contains("whitespace")),
+                "case {raw:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_request_head_rejects_oversized_head() {
+        // Construct a head that exceeds MAX_HEAD_BYTES (32KB).
+        // Use ~2000 headers of ~20 bytes each.
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..2000 {
+            raw.extend_from_slice(format!("X-Header-{:04}: value\r\n", i).as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+
+        assert!(raw.len() > MAX_HEAD_BYTES);
+
+        // The Forwarder::forward check (defense-in-depth).
+        let cfg = ForwardConfig {
+            target: Some("http://127.0.0.1:8080".into()),
+            host_override: None,
+            max_body_bytes: 1024,
+            websockets: None,
+        };
+        let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
+        let err = fwd.forward(&raw, Bytes::new()).await.unwrap_err();
+        assert!(matches!(err, ForwardError::HeadTooLarge { limit } if limit == MAX_HEAD_BYTES));
     }
 
     // --- Response head encoder --------------------------------------
