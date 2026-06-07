@@ -1027,22 +1027,13 @@ fn build_multi_string_txt(value: &str) -> Result<TXT<'static>> {
         value.is_ascii(),
         "build_multi_string_txt expects ASCII; multi-byte UTF-8 would be split mid-code-point"
     );
-    // `simple_dns::TXT::with_string` borrows the input string for the
-    // lifetime of the returned TXT. To hand back a `TXT<'static>` we
-    // collect every chunk into an owned `Vec<String>` that outlives
-    // the loop's borrows, then call `into_owned()` at the end to
-    // internalise those borrows.
-    let chunks: Vec<String> = value
-        .as_bytes()
-        .chunks(DNS_CHARACTER_STRING_MAX)
-        .map(|c| {
-            core::str::from_utf8(c)
-                .expect("caller guaranteed ASCII")
-                .to_string()
-        })
-        .collect();
+    // BOLT OPTIMIZATION: Build the TXT record directly from slices of the
+    // input string. `into_owned()` will clone these into the final
+    // TXT<'static>, avoiding the intermediate Vec<String> and its
+    // per-chunk allocations.
     let mut txt = TXT::new();
-    for s in &chunks {
+    for chunk in value.as_bytes().chunks(DNS_CHARACTER_STRING_MAX) {
+        let s = core::str::from_utf8(chunk).expect("caller guaranteed ASCII");
         txt = txt
             .with_string(s)
             .map_err(|e| PkarrError::TxtBuildFailed(e.to_string()))?;
@@ -1098,53 +1089,96 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // BOLT OPTIMIZATION: Replace O(N*M) repeated probes with a single pass
+    // over all resource records, bucket-sorting fragments by index.
+    let mut collected: Vec<(u8, DecodedFragment)> = Vec::new();
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
-        return Ok(None);
-    };
-    let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
-    let first = decode_fragment(&first_bytes)?;
-    if first.idx != 0 {
-        return Err(PkarrError::MalformedCanonical(
-            "answer fragment 0 carries non-zero idx",
-        ));
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            // Fast-path byte check on the first label before more expensive parsing.
+            let Some(label) = rr.name.iter().next() else {
+                continue;
+            };
+            let label_bytes = label.as_ref();
+            if !label_bytes.starts_with(base.as_bytes()) {
+                continue;
+            }
+
+            // BOLT OPTIMIZATION: Use byte-level checks on the label to avoid
+            // to_string() and handle the numeric index.
+            if let Some(suffix) = label_bytes.strip_prefix(base.as_bytes()) {
+                if let Some(idx_bytes) = suffix.strip_prefix(b"-") {
+                    if let Ok(idx_s) = core::str::from_utf8(idx_bytes) {
+                        if let Ok(idx) = idx_s.parse::<u8>() {
+                            // Ensure it's a top-level record relative to the
+                            // packet origin (1 label + optional root).
+                            let count = rr.name.iter().count();
+                            if count > 2 {
+                                continue;
+                            }
+
+                            let text = collect_txt_data(txt)?;
+                            let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
+                            let frag = decode_fragment(&bytes)?;
+
+                            // Consistency check: fragment index in envelope MUST match
+                            // the index in the DNS label.
+                            if frag.idx != idx {
+                                let msg = if idx == 0 {
+                                    "answer fragment 0 carries non-zero idx"
+                                } else {
+                                    "answer fragment idx disagrees with its DNS label suffix"
+                                };
+                                return Err(PkarrError::MalformedCanonical(msg));
+                            }
+
+                            if collected.iter().any(|(i, _)| *i == idx) {
+                                return Err(PkarrError::MultipleOpenhostRecords);
+                            }
+                            collected.push((idx, frag));
+                        }
+                    }
+                }
+            }
+        }
     }
-    let total = first.total;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
-    fragments.push(first);
-    for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
-        let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
-        let frag = decode_fragment(&bytes)?;
+    if collected.is_empty() {
+        return Ok(None);
+    }
+
+    // Reassemble in order. Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
+    collected.sort_by_key(|(idx, _)| *idx);
+    if collected[0].0 != 0 {
+        return Ok(None);
+    }
+
+    let total = collected[0].1.total;
+    let mut sealed = Vec::with_capacity(collected.iter().map(|(_, f)| f.payload.len()).sum());
+    let mut current_idx = 0;
+
+    for (idx, frag) in collected {
+        if idx != current_idx {
+            return Err(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ));
+        }
         if frag.total != total {
             return Err(PkarrError::MalformedCanonical(
                 "answer fragments disagree on chunk_total",
             ));
         }
-        if frag.idx != i {
-            return Err(PkarrError::MalformedCanonical(
-                "answer fragment idx disagrees with its DNS label suffix",
-            ));
+        sealed.extend_from_slice(&frag.payload);
+        current_idx += 1;
+        if current_idx == total {
+            break;
         }
-        fragments.push(frag);
     }
 
-    let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
-    for frag in fragments {
-        sealed.extend_from_slice(&frag.payload);
+    if current_idx != total {
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment set is missing an idx",
+        ));
     }
 
     // Use the packet timestamp as a sensible default for `created_at` —
@@ -1159,7 +1193,6 @@ pub fn decode_answer_fragments_from_packet(
 
 fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String>> {
     let mut seen = 0usize;
-    let mut out = String::new();
     for rr in packet.resource_records(name) {
         if let RData::TXT(txt) = &rr.rdata {
             seen += 1;
@@ -1167,20 +1200,32 @@ fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String
                 // Multiple TXTs at the same name → malformed.
                 return Err(PkarrError::MultipleOpenhostRecords);
             }
-            for (key, value) in txt.iter_raw() {
-                out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
-                if let Some(v) = value {
-                    out.push('=');
-                    out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
-                }
-            }
+            let out = collect_txt_data(txt)?;
+            return Ok(Some(out));
         }
     }
-    if seen == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(out))
+    Ok(None)
+}
+
+/// Reassemble DNS TXT character-strings into a single String.
+/// BOLT OPTIMIZATION: Pre-calculates capacity to avoid multiple reallocations.
+fn collect_txt_data(txt: &TXT) -> Result<String> {
+    let mut total_len = 0;
+    for (key, value) in txt.iter_raw() {
+        total_len += key.len();
+        if let Some(v) = value {
+            total_len += 1 + v.len();
+        }
     }
+    let mut out = String::with_capacity(total_len);
+    for (key, value) in txt.iter_raw() {
+        out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+        if let Some(v) = value {
+            out.push('=');
+            out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+        }
+    }
+    Ok(out)
 }
 
 // ============================================================================
