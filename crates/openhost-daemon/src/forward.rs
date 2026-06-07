@@ -34,6 +34,12 @@ use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
 use std::time::Duration;
 
+/// Security limit for the total size of an inbound request's line +
+/// headers (the `REQUEST_HEAD` frame payload). 32KB is comfortably
+/// above any real-world browser request while bounding memory
+/// exhaustion by a hostile client.
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Default connect timeout when reaching the upstream. Localhost should
 /// complete in microseconds; 2 seconds is comfortably above the worst
 /// case and still bounds a misconfigured target from wedging a request.
@@ -183,6 +189,11 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadTooLarge {
+                limit: MAX_HEAD_BYTES,
+            });
+        }
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -383,9 +394,21 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header field-name
+        // and colon. [...] A recipient MUST reject any received request message
+        // that contains whitespace between a header field-name and colon".
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace between header name and colon",
+            ));
+        }
+        let name = name.trim();
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        // We trim both ends to ensure trailing OWS is also stripped.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -405,9 +428,7 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(headers, false);
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -429,12 +450,7 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        if *name == "connection" || *name == "upgrade" {
-            continue;
-        }
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(headers, true);
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -454,12 +470,7 @@ fn encode_websocket_response_head(
     status: StatusCode,
     mut headers: HeaderMap,
 ) -> Result<Vec<u8>, ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        if *name == "connection" || *name == "upgrade" {
-            continue;
-        }
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(&mut headers, true);
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
     out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
@@ -510,9 +521,7 @@ fn encode_response_head(
     mut headers: HeaderMap,
     body_len: usize,
 ) -> Result<Vec<u8>, ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(&mut headers, false);
     // Rewrite Content-Length to match the buffered body. The upstream
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
@@ -533,6 +542,47 @@ fn encode_response_head(
     }
     out.extend_from_slice(b"\r\n");
     Ok(out)
+}
+
+/// Strip hop-by-hop headers per RFC 7230 §6.1.
+///
+/// Removes the static list in [`HOP_BY_HOP_HEADERS`] plus any headers
+/// listed in the `Connection` header itself.
+///
+/// If `keep_upgrade` is true, the `Connection` and `Upgrade` headers
+/// are preserved — used by the WebSocket-upgrade path to allow the
+/// RFC 6455 handshake to complete.
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap, keep_upgrade: bool) {
+    // 1. Collect names from the `Connection` header(s).
+    let mut to_remove = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for name in s.split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
+                        to_remove.push(header_name);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Remove names from the static list.
+    for name in HOP_BY_HOP_HEADERS {
+        if keep_upgrade && (*name == "connection" || *name == "upgrade") {
+            continue;
+        }
+        headers.remove(*name);
+    }
+
+    // 3. Remove names collected from the `Connection` header.
+    for name in to_remove {
+        if keep_upgrade && (name == http::header::CONNECTION || name == http::header::UPGRADE) {
+            continue;
+        }
+        headers.remove(name);
+    }
 }
 
 /// Best-effort conversion from an `http::Error` into a stable
@@ -784,6 +834,46 @@ mod tests {
         assert!(matches!(err, ForwardError::HeadParse(_)));
     }
 
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("whitespace between header name and colon")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_trims_leading_and_trailing_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost:  example.com  \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn strip_hop_by_hop_headers_removes_headers_listed_in_connection() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Custom-Hop"),
+        );
+        h.insert(
+            HeaderName::from_static("x-custom-hop"),
+            HeaderValue::from_static("remove-me"),
+        );
+        h.insert(
+            HeaderName::from_static("x-keep-me"),
+            HeaderValue::from_static("stay"),
+        );
+
+        strip_hop_by_hop_headers(&mut h, false);
+        assert!(!h.contains_key("x-custom-hop"));
+        assert!(!h.contains_key(http::header::CONNECTION));
+        assert_eq!(h.get("x-keep-me").unwrap(), "stay");
+    }
+
     // --- Response head encoder --------------------------------------
 
     #[test]
@@ -897,5 +987,33 @@ mod tests {
         let target: Uri = "http://127.0.0.1:8080".parse().unwrap();
         let uri = combine_target_and_path(&target, "http://evil.example/foo").unwrap();
         assert_eq!(uri.to_string(), "http://127.0.0.1:8080/foo");
+    }
+
+    #[test]
+    fn parse_request_head_rejects_oversized_head() {
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..2000 {
+            raw.extend_from_slice(format!("X-Header-{}: value\r\n", i).as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+
+        // The check moved to `Forwarder::forward`, so `parse_request_head` itself
+        // doesn't enforce it anymore. We test it via a mock Forwarder if needed,
+        // but here we just verify `MAX_HEAD_BYTES` exists and is enforced in forward().
+        let fwd = Forwarder {
+            target: "http://127.0.0.1".parse().unwrap(),
+            host_override: "x".into(),
+            client: LegacyClient::builder(TokioExecutor::new()).build(HttpConnector::new()),
+            max_body_bytes: 1024,
+            websockets: None,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let res = fwd.forward(&raw, Bytes::new()).await;
+            assert!(matches!(res, Err(ForwardError::HeadTooLarge { .. })));
+        });
     }
 }
