@@ -970,6 +970,14 @@ async fn dispatch_frame(
 
     match frame.frame_type {
         FrameType::RequestHead => {
+            if frame.payload.len() > crate::forward::MAX_HEAD_BYTES {
+                tracing::warn!(
+                    limit = crate::forward::MAX_HEAD_BYTES,
+                    "openhostd: request head too large; tearing down"
+                );
+                let _ = send_error_frame(dc, "request head too large").await;
+                return FrameOutcome::Teardown;
+            }
             let mut req = request.lock().await;
             req.head_payload = Some(frame.payload.clone());
             req.body.clear();
