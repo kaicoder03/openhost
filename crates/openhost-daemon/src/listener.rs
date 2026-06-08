@@ -970,6 +970,14 @@ async fn dispatch_frame(
 
     match frame.frame_type {
         FrameType::RequestHead => {
+            if frame.payload.len() > crate::forward::MAX_HEAD_BYTES {
+                tracing::warn!(
+                    limit = crate::forward::MAX_HEAD_BYTES,
+                    "openhostd: REQUEST_HEAD exceeded limit; tearing down"
+                );
+                let _ = send_error_frame(dc, "REQUEST_HEAD too large").await;
+                return FrameOutcome::Teardown;
+            }
             let mut req = request.lock().await;
             req.head_payload = Some(frame.payload.clone());
             req.body.clear();
@@ -1027,8 +1035,26 @@ async fn dispatch_frame(
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(?err, "openhostd: forwarder failed; replying 502");
-                        let _ = emit_stub_502(dc).await;
+                        match err {
+                            // Client-side errors (malformed head, oversized head/body)
+                            // trigger an explicit ERROR frame and teardown.
+                            crate::error::ForwardError::HeadParse(_)
+                            | crate::error::ForwardError::HeadTooLarge { .. }
+                            | crate::error::ForwardError::BodyTooLarge { .. } => {
+                                tracing::warn!(
+                                    ?err,
+                                    "openhostd: client-side forwarder error; tearing down"
+                                );
+                                let _ = send_error_frame(dc, &err.to_string()).await;
+                                return FrameOutcome::Teardown;
+                            }
+                            // Upstream errors (unreachable, 502 from target) return
+                            // our own 502 stub and keep the DC alive.
+                            _ => {
+                                tracing::warn!(?err, "openhostd: forwarder failed; replying 502");
+                                let _ = emit_stub_502(dc).await;
+                            }
+                        }
                     }
                 },
                 None => {
