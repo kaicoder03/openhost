@@ -39,6 +39,12 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum permitted size of the HTTP request head (request line +
+/// headers + CRLFs). 32KB is enough for any reasonable request and
+/// protects the daemon from DoS via unbounded memory allocation during
+/// parsing.
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -183,6 +189,13 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        // Defense-in-depth: check head size before parsing even if the
+        // listener already checked it.
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadTooLarge {
+                limit: MAX_HEAD_BYTES,
+            });
+        }
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -338,9 +351,16 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// \r\n
 /// ```
 ///
-/// Rejects HTTP/0.9, HTTP/1.0, HTTP/2+, missing blank line, and any
-/// obvious line-ending confusion (bare `\n` inside headers).
+/// Rejects HTTP/0.9, HTTP/1.0, HTTP/2+, missing blank line, oversized
+/// heads, and any obvious line-ending confusion (bare `\n` inside
+/// headers).
 fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), ForwardError> {
+    if bytes.len() > MAX_HEAD_BYTES {
+        return Err(ForwardError::HeadTooLarge {
+            limit: MAX_HEAD_BYTES,
+        });
+    }
+
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ForwardError::HeadParse("request head is not valid UTF-8"))?;
 
@@ -383,9 +403,20 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+        // field-name and colon." and "A proxy MUST reject any received
+        // request message that contains whitespace between a header
+        // field-name and colon".
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace between header name and colon is forbidden",
+            ));
+        }
+
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the
+        // value, and at the end of the value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -405,9 +436,7 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(headers);
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -429,12 +458,21 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        if *name == "connection" || *name == "upgrade" {
-            continue;
+    // RFC 7230 §6.1 requires stripping even on WebSocket upgrades,
+    // but we MUST preserve the specific headers that drive the
+    // upgrade itself.
+    let dynamic = collect_dynamic_hop_by_hop(headers);
+    for name in dynamic {
+        if !name.eq_ignore_ascii_case("upgrade") && !name.eq_ignore_ascii_case("connection") {
+            headers.remove(name);
         }
-        headers.remove(*name);
     }
+    for name in HOP_BY_HOP_HEADERS {
+        if *name != "connection" && *name != "upgrade" {
+            headers.remove(*name);
+        }
+    }
+
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -443,6 +481,35 @@ fn sanitize_websocket_request_headers(
     })?;
     headers.insert(http::header::HOST, host_value);
     Ok(())
+}
+
+/// Collect names of dynamic hop-by-hop headers from the `Connection`
+/// header field(s) per RFC 7230 §6.1.
+fn collect_dynamic_hop_by_hop(headers: &HeaderMap) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for part in s.split(',') {
+                let name = part.trim();
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Strip hop-by-hop headers per RFC 7230 §6.1. Removes both the
+/// fixed set in [`HOP_BY_HOP_HEADERS`] and any dynamic headers
+/// listed in the `Connection` header itself.
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
+    for name in collect_dynamic_hop_by_hop(headers) {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(*name);
+    }
 }
 
 /// Re-encode an upstream WebSocket 101 response head into the bytes
@@ -454,12 +521,18 @@ fn encode_websocket_response_head(
     status: StatusCode,
     mut headers: HeaderMap,
 ) -> Result<Vec<u8>, ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        if *name == "connection" || *name == "upgrade" {
-            continue;
+    let dynamic = collect_dynamic_hop_by_hop(&headers);
+    for name in dynamic {
+        if !name.eq_ignore_ascii_case("upgrade") && !name.eq_ignore_ascii_case("connection") {
+            headers.remove(name);
         }
-        headers.remove(*name);
     }
+    for name in HOP_BY_HOP_HEADERS {
+        if *name != "connection" && *name != "upgrade" {
+            headers.remove(*name);
+        }
+    }
+
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
     out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
@@ -510,9 +583,8 @@ fn encode_response_head(
     mut headers: HeaderMap,
     body_len: usize,
 ) -> Result<Vec<u8>, ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(&mut headers);
+
     // Rewrite Content-Length to match the buffered body. The upstream
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
@@ -782,6 +854,79 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_oversized_head() {
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        // Add enough headers to exceed 32KB.
+        for i in 0..2000 {
+            raw.extend_from_slice(format!("X-Header-{:04}: value\r\n", i).as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+        assert!(raw.len() > MAX_HEAD_BYTES);
+
+        let err = parse_request_head(&raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadTooLarge {
+                limit: MAX_HEAD_BYTES
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("whitespace between header name and colon is forbidden")
+        ));
+
+        let raw_tab = b"GET / HTTP/1.1\r\nHost\t: example\r\n\r\n";
+        let err_tab = parse_request_head(raw_tab).unwrap_err();
+        assert!(matches!(
+            err_tab,
+            ForwardError::HeadParse("whitespace between header name and colon is forbidden")
+        ));
+    }
+
+    #[test]
+    fn parse_request_head_trims_ows_from_values() {
+        let raw = b"GET / HTTP/1.1\r\nX-Custom:   value   \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("x-custom").unwrap(), "value");
+
+        let raw_tab = b"GET / HTTP/1.1\r\nX-Tab: \tvalue\t \r\n\r\n";
+        let (_, _, headers_tab) = parse_request_head(raw_tab).unwrap();
+        assert_eq!(headers_tab.get("x-tab").unwrap(), "value");
+    }
+
+    #[test]
+    fn strip_hop_by_hop_headers_removes_dynamic_headers() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Dynamic, X-Another"),
+        );
+        h.insert(
+            HeaderName::from_static("x-dynamic"),
+            HeaderValue::from_static("strip-me"),
+        );
+        h.insert(
+            HeaderName::from_static("x-another"),
+            HeaderValue::from_static("strip-me-too"),
+        );
+        h.insert(
+            HeaderName::from_static("x-keep"),
+            HeaderValue::from_static("stay"),
+        );
+
+        strip_hop_by_hop_headers(&mut h);
+        assert!(!h.contains_key("x-dynamic"));
+        assert!(!h.contains_key("x-another"));
+        assert!(h.contains_key("x-keep"));
     }
 
     // --- Response head encoder --------------------------------------
