@@ -1,0 +1,3 @@
+## 2026-06-08 - Pkarr codec optimizations
+**Learning:** Reassembling fragmented DNS records via repeated probes with `SignedPacket::resource_records(name)` leads to O(N*M) complexity (where N is fragments and M is total records). Using a single pass over `all_resource_records()` with byte-level prefix checks is significantly more efficient for packets with many records. Additionally, building TXT records via intermediate `Vec<String>` and multiple `to_string()` calls causes redundant allocations that can be avoided by building directly from byte slices.
+**Action:** Always prefer single-pass iteration and bucket-sorting for record reassembly. Use pre-calculated capacity when reassembling DNS character-strings to avoid reallocations.
