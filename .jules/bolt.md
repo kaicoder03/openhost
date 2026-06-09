@@ -1,0 +1,3 @@
+## 2025-05-15 - DNS Fragment Reassembly Optimization
+**Learning:** Reassembling fragmented DNS records via repeated `SignedPacket::resource_records(name)` probes is O(N*M) where N is fragments and M is total records. Switching to `SignedPacket::all_resource_records()` enables O(M) reassembly but requires careful label matching because it returns absolute names (e.g., `_answer-<hash>-<idx>.<origin>`).
+**Action:** Use a single pass over `all_resource_records()` for multi-record processing. Match relative names by checking the first label's bytes and verifying it has exactly one parent label (the origin zone).
