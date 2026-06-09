@@ -39,6 +39,12 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Security limit for the request head (request line + headers +
+/// \r\n\r\n). 32KB is enough for any legitimate set of headers (browsers
+/// usually cap at 8-16KB) while bounding memory use from a malicious
+/// client.
+pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -183,6 +189,15 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        // Defense-in-depth: the listener already caps the HEAD frame,
+        // but we verify here too so a malformed listener cannot
+        // overflow our parser.
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadTooLarge {
+                limit: MAX_HEAD_BYTES,
+            });
+        }
+
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -383,9 +398,19 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+        // field-name and colon." Rejection prevents smuggling.
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace between header name and colon is forbidden",
+            ));
+        }
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        // Stripping both leading and trailing OWS is required.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +807,38 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+        // field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("whitespace between header name and colon is forbidden")
+        ));
+    }
+
+    #[test]
+    fn forwarder_rejects_oversized_head() {
+        let cfg = ForwardConfig {
+            target: Some("http://127.0.0.1:8080".into()),
+            host_override: None,
+            max_body_bytes: 1024,
+            websockets: None,
+        };
+        let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
+        let big_head = vec![b'x'; MAX_HEAD_BYTES + 1];
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let res = fwd.forward(&big_head, Bytes::new()).await;
+            assert!(matches!(res, Err(ForwardError::HeadTooLarge { .. })));
+        });
     }
 
     // --- Response head encoder --------------------------------------

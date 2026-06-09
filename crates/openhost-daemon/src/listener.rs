@@ -20,8 +20,10 @@ use crate::channel_binding::{
     ChannelBinder, ChannelBindingError, AUTH_NONCE_LEN, BINDING_TIMEOUT_SECS, EXPORTER_LABEL,
     EXPORTER_SECRET_LEN,
 };
-use crate::error::ListenerError;
-use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
+use crate::error::{ForwardError, ListenerError};
+use crate::forward::{
+    ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade, MAX_HEAD_BYTES,
+};
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
@@ -970,6 +972,14 @@ async fn dispatch_frame(
 
     match frame.frame_type {
         FrameType::RequestHead => {
+            if frame.payload.len() > MAX_HEAD_BYTES {
+                tracing::warn!(
+                    limit = MAX_HEAD_BYTES,
+                    "openhostd: REQUEST_HEAD exceeded security limit; tearing down"
+                );
+                let _ = send_error_frame(dc, "request head too large").await;
+                return FrameOutcome::Teardown;
+            }
             let mut req = request.lock().await;
             req.head_payload = Some(frame.payload.clone());
             req.body.clear();
@@ -1026,9 +1036,23 @@ async fn dispatch_frame(
                             let _ = emit_stub_502(dc).await;
                         }
                     }
+                    Err(ForwardError::HeadParse(reason)) => {
+                        tracing::warn!(
+                            reason,
+                            "openhostd: request head parse failed; tearing down"
+                        );
+                        let _ = send_error_frame(dc, reason).await;
+                        return FrameOutcome::Teardown;
+                    }
+                    Err(ForwardError::HeadTooLarge { .. }) => {
+                        tracing::warn!("openhostd: request head too large; tearing down");
+                        let _ = send_error_frame(dc, "request head too large").await;
+                        return FrameOutcome::Teardown;
+                    }
                     Err(err) => {
                         tracing::warn!(?err, "openhostd: forwarder failed; replying 502");
                         let _ = emit_stub_502(dc).await;
+                        return FrameOutcome::Continue;
                     }
                 },
                 None => {
