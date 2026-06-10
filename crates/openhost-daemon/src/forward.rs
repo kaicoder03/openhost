@@ -66,6 +66,35 @@ const PROVENANCE_HEADERS: &[&str] = &[
     "x-real-ip",
 ];
 
+/// RFC 7230 §6.1: Strip hop-by-hop headers.
+///
+/// Removes both the static list of hop-by-hop headers and any headers
+/// listed in the `Connection` header field.
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
+    // 1. Collect dynamic hop-by-hop headers from the `Connection` field.
+    let mut to_remove = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for part in s.split(',') {
+                let header_name = part.trim();
+                if !header_name.is_empty() {
+                    to_remove.push(header_name.to_lowercase());
+                }
+            }
+        }
+    }
+
+    // 2. Remove dynamic headers.
+    for name in to_remove {
+        headers.remove(name);
+    }
+
+    // 3. Remove static hop-by-hop headers.
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(*name);
+    }
+}
+
 type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
 
 /// One buffered HTTP response, ready for the listener to re-frame onto
@@ -383,7 +412,12 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "invalid whitespace before colon in header name",
+            ));
+        }
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -405,9 +439,7 @@ fn sanitize_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(headers);
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -429,12 +461,33 @@ fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
     host_override: &str,
 ) -> Result<(), ForwardError> {
+    // 1. Connection-listed headers are still hop-by-hop.
+    let mut to_remove = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for part in s.split(',') {
+                let header_name = part.trim();
+                if !header_name.is_empty()
+                    && !header_name.eq_ignore_ascii_case("connection")
+                    && !header_name.eq_ignore_ascii_case("upgrade")
+                {
+                    to_remove.push(header_name.to_lowercase());
+                }
+            }
+        }
+    }
+    for name in to_remove {
+        headers.remove(name);
+    }
+
+    // 2. Static hop-by-hop, except the two needed for WS.
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
         }
         headers.remove(*name);
     }
+
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
@@ -454,6 +507,26 @@ fn encode_websocket_response_head(
     status: StatusCode,
     mut headers: HeaderMap,
 ) -> Result<Vec<u8>, ForwardError> {
+    // 1. Connection-listed headers are still hop-by-hop.
+    let mut to_remove = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION) {
+        if let Ok(s) = value.to_str() {
+            for part in s.split(',') {
+                let header_name = part.trim();
+                if !header_name.is_empty()
+                    && !header_name.eq_ignore_ascii_case("connection")
+                    && !header_name.eq_ignore_ascii_case("upgrade")
+                {
+                    to_remove.push(header_name.to_lowercase());
+                }
+            }
+        }
+    }
+    for name in to_remove {
+        headers.remove(name);
+    }
+
+    // 2. Static hop-by-hop, except the two needed for WS.
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
             continue;
@@ -510,9 +583,7 @@ fn encode_response_head(
     mut headers: HeaderMap,
     body_len: usize,
 ) -> Result<Vec<u8>, ForwardError> {
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
-    }
+    strip_hop_by_hop_headers(&mut headers);
     // Rewrite Content-Length to match the buffered body. The upstream
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
@@ -609,6 +680,59 @@ mod tests {
                 "hop-by-hop header {name:?} survived sanitisation"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_websocket_strips_connection_listed_headers_except_ws() {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Upgrade, X-Extra"),
+        );
+        h.insert(
+            HeaderName::from_static("x-extra"),
+            HeaderValue::from_static("remove-me"),
+        );
+        h.insert(
+            HeaderName::from_static("x-keep"),
+            HeaderValue::from_static("keep-me"),
+        );
+
+        sanitize_websocket_request_headers(&mut h, "x").unwrap();
+
+        assert!(h.contains_key(http::header::UPGRADE));
+        assert!(h.contains_key(http::header::CONNECTION));
+        assert!(!h.contains_key("x-extra"));
+        assert_eq!(h.get("x-keep").unwrap(), "keep-me");
+    }
+
+    #[test]
+    fn strip_hop_by_hop_headers_removes_connection_listed_headers() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("X-Foo, X-Bar"),
+        );
+        h.insert(
+            HeaderName::from_static("x-foo"),
+            HeaderValue::from_static("remove-me"),
+        );
+        h.insert(
+            HeaderName::from_static("x-bar"),
+            HeaderValue::from_static("remove-me-too"),
+        );
+        h.insert(
+            HeaderName::from_static("x-baz"),
+            HeaderValue::from_static("keep-me"),
+        );
+
+        strip_hop_by_hop_headers(&mut h);
+
+        assert!(!h.contains_key("x-foo"));
+        assert!(!h.contains_key("x-bar"));
+        assert!(!h.contains_key(http::header::CONNECTION));
+        assert_eq!(h.get("x-baz").unwrap(), "keep-me");
     }
 
     #[test]
@@ -782,6 +906,18 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: No whitespace allowed between header name and colon.
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let result = parse_request_head(raw);
+        assert!(
+            result.is_err(),
+            "Should reject whitespace before colon, but got: {:?}",
+            result.ok()
+        );
     }
 
     // --- Response head encoder --------------------------------------
