@@ -21,7 +21,9 @@ use crate::channel_binding::{
     EXPORTER_SECRET_LEN,
 };
 use crate::error::ListenerError;
-use crate::forward::{ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade};
+use crate::forward::{
+    ForwardOutcome, ForwardResponse, Forwarder, WebSocketUpgrade, MAX_HEAD_BYTES,
+};
 use crate::publish::SharedState;
 use bytes::{Bytes, BytesMut};
 use openhost_core::identity::{PublicKey, SigningKey};
@@ -970,6 +972,14 @@ async fn dispatch_frame(
 
     match frame.frame_type {
         FrameType::RequestHead => {
+            if frame.payload.len() > MAX_HEAD_BYTES {
+                tracing::warn!(
+                    limit = MAX_HEAD_BYTES,
+                    "openhostd: REQUEST_HEAD exceeded security cap; tearing down"
+                );
+                let _ = send_error_frame(dc, "REQUEST_HEAD exceeds 32KB security limit").await;
+                return FrameOutcome::Teardown;
+            }
             let mut req = request.lock().await;
             req.head_payload = Some(frame.payload.clone());
             req.body.clear();
