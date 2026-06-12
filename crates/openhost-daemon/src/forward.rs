@@ -39,6 +39,10 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum allowed size for the `REQUEST_HEAD` payload (32 KiB).
+/// Enforced as a defense-in-depth security limit per spec §7.12.
+pub const MAX_HEAD_BYTES: usize = 32768;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -183,6 +187,12 @@ impl Forwarder {
         head_payload: &[u8],
         body: Bytes,
     ) -> Result<ForwardOutcome, ForwardError> {
+        if head_payload.len() > MAX_HEAD_BYTES {
+            return Err(ForwardError::HeadTooLarge {
+                limit: MAX_HEAD_BYTES,
+            });
+        }
+
         if body.len() > self.max_body_bytes {
             return Err(ForwardError::BodyTooLarge {
                 cap: self.max_body_bytes,
@@ -383,7 +393,13 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name_raw = &line[..colon];
+        if name_raw.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace between header name and colon is prohibited (RFC 7230 §3.2.4)",
+            ));
+        }
+        let name = name_raw.trim();
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -761,6 +777,49 @@ mod tests {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        let reason = match err {
+            ForwardError::HeadParse(r) => r,
+            _ => panic!("expected HeadParse error"),
+        };
+        assert!(reason.contains("whitespace between header name and colon"));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_oversized_head() {
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        // Add enough headers to exceed 32 KiB.
+        for i in 0..2000 {
+            raw.extend_from_slice(format!("X-Header-{:04}: value\r\n", i).as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+
+        // parse_request_head itself doesn't check MAX_HEAD_BYTES,
+        // but Forwarder::forward does.
+        let cfg = ForwardConfig {
+            target: Some("http://127.0.0.1:8080".into()),
+            host_override: None,
+            max_body_bytes: 1024,
+            websockets: None,
+        };
+        let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
+        let res = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap()
+            .block_on(fwd.forward(&raw, Bytes::new()));
+
+        match res {
+            Err(ForwardError::HeadTooLarge { limit }) => assert_eq!(limit, MAX_HEAD_BYTES),
+            Err(e) => panic!("expected HeadTooLarge, got error: {:?}", e),
+            Ok(_) => panic!("expected HeadTooLarge, got Ok"),
+        }
     }
 
     #[test]
