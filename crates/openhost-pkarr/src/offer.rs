@@ -1098,19 +1098,82 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // BOLT OPTIMIZATION: O(N) single-pass fragment collection.
+    // Replaces the per-fragment `collect_single_txt` probes (O(N*M)) with a single
+    // pass over all resource records, bucket-sorting them by index.
+    let mut fragment_texts: Vec<Option<String>> = vec![None; MAX_FRAGMENT_TOTAL as usize + 1];
+    let mut found_any = false;
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    // Use byte-level matching on labels to avoid String allocations and
+    // handle absolute names correctly.
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            let mut labels = rr.name.iter();
+            let Some(first_label) = labels.next() else {
+                continue;
+            };
+
+            // BOLT OPTIMIZATION: Fast-path check on the first label bytes.
+            let label_bytes: &[u8] = first_label.as_ref();
+            if !label_bytes.starts_with(b"_") {
+                continue;
+            }
+
+            if let Some(suffix) = label_bytes.strip_prefix(base.as_bytes()) {
+                if let Some(idx_bytes) = suffix.strip_prefix(b"-") {
+                    if let Ok(idx_str) = core::str::from_utf8(idx_bytes) {
+                        if let Ok(idx) = idx_str.parse::<u8>() {
+                            // Ensure the record name is exactly relative to the origin.
+                            // In Pkarr, names are relative to the pubkey origin (1 label).
+                            // So we expect exactly one more label after our fragment label.
+                            if labels.count() != 1 {
+                                continue;
+                            }
+
+                            let mut out = String::new();
+                            // BOLT OPTIMIZATION: Pre-calculate capacity to avoid reallocations.
+                            let total_len: usize = txt
+                                .iter_raw()
+                                .map(|(k, v)| k.len() + v.map(|b| b.len() + 1).unwrap_or(0))
+                                .sum();
+                            out.reserve(total_len);
+
+                            for (key, value) in txt.iter_raw() {
+                                out.push_str(
+                                    core::str::from_utf8(key)
+                                        .map_err(|_| PkarrError::InvalidUtf8)?,
+                                );
+                                if let Some(v) = value {
+                                    out.push('=');
+                                    out.push_str(
+                                        core::str::from_utf8(v)
+                                            .map_err(|_| PkarrError::InvalidUtf8)?,
+                                    );
+                                }
+                            }
+
+                            if fragment_texts[idx as usize].is_some() {
+                                // Multiple TXTs at the same name → malformed.
+                                return Err(PkarrError::MultipleOpenhostRecords);
+                            }
+                            fragment_texts[idx as usize] = Some(out);
+                            found_any = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !found_any {
+        return Ok(None);
+    }
+
+    // Now reassemble using the bucketed fragments. Missing idx=0 ⇒ no answer for us.
+    let Some(first_text) = fragment_texts[0].as_ref() else {
         return Ok(None);
     };
+
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
     let first = decode_fragment(&first_bytes)?;
     if first.idx != 0 {
@@ -1123,10 +1186,11 @@ pub fn decode_answer_fragments_from_packet(
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let text = fragment_texts[i as usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
@@ -1135,6 +1199,7 @@ pub fn decode_answer_fragments_from_packet(
             ));
         }
         if frag.idx != i {
+            // Defense-in-depth against payload/suffix mismatch.
             return Err(PkarrError::MalformedCanonical(
                 "answer fragment idx disagrees with its DNS label suffix",
             ));
