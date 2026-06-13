@@ -189,6 +189,13 @@ pub enum ForwardError {
         cap: usize,
     },
 
+    /// Inbound `REQUEST_HEAD` exceeded the 32 KiB security limit.
+    #[error("request head exceeded {limit} byte security limit")]
+    HeadTooLarge {
+        /// The security limit in bytes.
+        limit: usize,
+    },
+
     /// Request asserts `Upgrade: websocket` but no `[forward.websockets]`
     /// allowlist is configured, or the target path is not on it. Operators
     /// who want to allow WebSocket upgrades per spec §4.2 must add the

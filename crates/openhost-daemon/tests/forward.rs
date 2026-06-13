@@ -424,6 +424,51 @@ async fn forwarder_upstream_unreachable_returns_502() -> DaemonResult<()> {
 }
 
 #[tokio::test]
+async fn forwarder_request_head_exceeds_cap_rejects_and_tears_down() -> DaemonResult<()> {
+    // Heads larger than MAX_HEAD_BYTES (32 KiB) are rejected by the
+    // listener early as a DoS mitigation.
+    use openhost_daemon::forward::MAX_HEAD_BYTES;
+
+    let (port, _state) = spawn_upstream(UpstreamResponder::default()).await;
+    let (_tmp, app) = build_daemon(port).await;
+    let session = establish_connection(&app).await;
+
+    // Build a head that's just over the limit.
+    let mut large_head = b"GET / HTTP/1.1\r\n".to_vec();
+    while large_head.len() <= MAX_HEAD_BYTES {
+        large_head.extend_from_slice(b"X-Filler: 1234567890abcdef\r\n");
+    }
+    large_head.extend_from_slice(b"\r\n");
+
+    let req_head = Frame::new(FrameType::RequestHead, large_head).unwrap();
+    let req_end = Frame::new(FrameType::RequestEnd, vec![]).unwrap();
+    let mut wire = Vec::new();
+    req_head.encode(&mut wire);
+    req_end.encode(&mut wire);
+    session.dc.send(&Bytes::from(wire)).await.expect("send");
+
+    // Wait for the ERROR frame.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let err_frame = loop {
+        let bytes = session.received.lock().await.clone();
+        if let Ok(Some((frame, _))) = Frame::try_decode(&bytes) {
+            break frame;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no frame arrived after oversized REQUEST_HEAD");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(err_frame.frame_type, FrameType::Error);
+    let diagnostic = String::from_utf8_lossy(&err_frame.payload);
+    assert!(diagnostic.contains("HEAD"));
+
+    session.close().await;
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwarder_request_body_exceeding_cap_triggers_error_frame_and_teardown() -> DaemonResult<()>
 {
     // Configure a tiny 256-byte cap so the test doesn't have to allocate
