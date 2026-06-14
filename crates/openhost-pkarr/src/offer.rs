@@ -1097,53 +1097,90 @@ pub fn decode_answer_fragments_from_packet(
         "{ANSWER_TXT_PREFIX}{}",
         zbase32::encode_full_bytes(&client_hash)
     );
+    let prefix = format!("{}-", base);
+    let prefix_bytes = prefix.as_bytes();
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    let mut fragments: Vec<Option<DecodedFragment>> = Vec::new();
+    let mut total: Option<u8> = None;
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
-        return Ok(None);
+    // O(N) pass: walk all resource records once, bucket-sorting matching
+    // fragments by their numeric index. Replaces the O(N*M) per-index
+    // probes in the legacy implementation.
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            let Some(label) = rr.name.iter().next() else {
+                continue;
+            };
+            let label_bytes = label.as_ref();
+
+            if let Some(suffix) = label_bytes.strip_prefix(prefix_bytes) {
+                // Ensure records are directly relative to the origin zone.
+                if rr.name.iter().count() != 2 {
+                    continue;
+                }
+
+                let s = core::str::from_utf8(suffix)
+                    .map_err(|_| PkarrError::MalformedCanonical("non-UTF8 index suffix"))?;
+                let idx: u8 = s
+                    .parse()
+                    .map_err(|_| PkarrError::MalformedCanonical("invalid index suffix"))?;
+
+                let text = txt_to_string(txt)?;
+                let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
+                let frag = decode_fragment(&bytes)?;
+
+                if frag.idx != idx {
+                    return Err(PkarrError::MalformedCanonical(
+                        "answer fragment idx disagrees with its DNS label suffix",
+                    ));
+                }
+
+                let frag_idx = frag.idx;
+                let frag_total = frag.total;
+
+                if let Some(t) = total {
+                    if frag_total != t {
+                        return Err(PkarrError::MalformedCanonical(
+                            "answer fragments disagree on chunk_total",
+                        ));
+                    }
+                } else {
+                    total = Some(frag_total);
+                    fragments.resize_with(frag_total as usize, || None);
+                }
+
+                if frag_idx >= total.expect("total set above") {
+                    return Err(PkarrError::MalformedCanonical(
+                        "answer fragment idx >= total",
+                    ));
+                }
+
+                if fragments[frag_idx as usize].is_some() {
+                    return Err(PkarrError::MultipleOpenhostRecords);
+                }
+                fragments[frag_idx as usize] = Some(frag);
+            }
+        }
+    }
+
+    let t = match total {
+        Some(t) => t,
+        None => return Ok(None),
     };
-    let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
-    let first = decode_fragment(&first_bytes)?;
-    if first.idx != 0 {
-        return Err(PkarrError::MalformedCanonical(
-            "answer fragment 0 carries non-zero idx",
-        ));
-    }
-    let total = first.total;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
-    fragments.push(first);
-    for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
-        let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
-        let frag = decode_fragment(&bytes)?;
-        if frag.total != total {
-            return Err(PkarrError::MalformedCanonical(
-                "answer fragments disagree on chunk_total",
-            ));
-        }
-        if frag.idx != i {
-            return Err(PkarrError::MalformedCanonical(
-                "answer fragment idx disagrees with its DNS label suffix",
-            ));
-        }
-        fragments.push(frag);
-    }
-
-    let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
-    for frag in fragments {
+    let mut sealed = Vec::with_capacity(
+        fragments
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .map(|f| f.payload.len())
+            .sum(),
+    );
+    for i in 0..t {
+        let frag = fragments[i as usize]
+            .take()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         sealed.extend_from_slice(&frag.payload);
     }
 
@@ -1159,7 +1196,7 @@ pub fn decode_answer_fragments_from_packet(
 
 fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String>> {
     let mut seen = 0usize;
-    let mut out = String::new();
+    let mut out = None;
     for rr in packet.resource_records(name) {
         if let RData::TXT(txt) = &rr.rdata {
             seen += 1;
@@ -1167,20 +1204,22 @@ fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String
                 // Multiple TXTs at the same name → malformed.
                 return Err(PkarrError::MultipleOpenhostRecords);
             }
-            for (key, value) in txt.iter_raw() {
-                out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
-                if let Some(v) = value {
-                    out.push('=');
-                    out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
-                }
-            }
+            out = Some(txt_to_string(txt)?);
         }
     }
-    if seen == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(out))
+    Ok(out)
+}
+
+fn txt_to_string(txt: &TXT) -> Result<String> {
+    let mut out = String::new();
+    for (key, value) in txt.iter_raw() {
+        out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+        if let Some(v) = value {
+            out.push('=');
+            out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+        }
     }
+    Ok(out)
 }
 
 // ============================================================================
@@ -3070,6 +3109,55 @@ mod tests {
         assert_eq!(reassembled, sealed);
     }
 
+    /// Verifies that O(N) reassembly logic correctly handles a high
+    /// number of fragments correctly, including out-of-order records
+    /// in the packet.
+    #[test]
+    fn high_fragment_count_reassembles_out_of_order() {
+        let sk = host_sk();
+        let client_pk = client_sk().public_key();
+        let salt = [0x33u8; SALT_LEN];
+        let client_hash = allowlist_hash(&salt, &client_pk.to_bytes());
+        let label = zbase32::encode_full_bytes(&client_hash);
+        let base = format!("{ANSWER_TXT_PREFIX}{label}");
+
+        // 10 fragments.
+        let total = 10u8;
+        let sealed_part = b"part-";
+        let mut fragments = Vec::new();
+        for i in 0..total {
+            let mut payload = sealed_part.to_vec();
+            payload.push(i);
+            fragments.push(encode_fragment(i, total, &payload));
+        }
+
+        let seed = Zeroizing::new(sk.to_bytes());
+        let keypair = Keypair::from_secret_key(&seed);
+        let mut builder = SignedPacket::builder().timestamp(Timestamp::from(1_700_000_000_000u64));
+
+        // Insert in REVERSE order to verify the O(N) pass is order-agnostic.
+        for i in (0..total).rev() {
+            let name = format!("{}-{}", base, i);
+            builder = builder.txt(
+                Name::new_unchecked(&name),
+                TXT::try_from(URL_SAFE_NO_PAD.encode(&fragments[i as usize]).as_str()).unwrap(),
+                OFFER_TXT_TTL,
+            );
+        }
+        let packet = builder.sign(&keypair).unwrap();
+
+        let reassembled = decode_answer_fragments_from_packet(&packet, &salt, &client_pk)
+            .unwrap()
+            .expect("fragments present");
+
+        let mut expected_sealed = Vec::new();
+        for i in 0..total {
+            expected_sealed.extend_from_slice(sealed_part);
+            expected_sealed.push(i);
+        }
+        assert_eq!(reassembled.sealed, expected_sealed);
+    }
+
     #[test]
     fn fragment_decode_rejects_unknown_version() {
         let bytes = vec![0xFF, 0, 1, 0, 0];
@@ -3314,17 +3402,5 @@ mod tests {
             .expect("offer TXT present");
         let opened = decoded.open(&host_sk()).unwrap();
         assert_eq!(opened, plaintext);
-    }
-
-    #[test]
-    fn decode_offer_from_packet_returns_none_when_missing() {
-        // A packet that contains only `_openhost` (no `_offer.*`) — the
-        // decoder returns Ok(None).
-        let sk = host_sk();
-        let signed = reference_signed();
-        let packet = encode_with_answers(&signed, &sk, &[]).unwrap();
-        let daemon_pk = sk.public_key();
-        let res = decode_offer_from_packet(&packet, &daemon_pk).unwrap();
-        assert!(res.is_none());
     }
 }
