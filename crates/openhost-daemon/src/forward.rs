@@ -64,6 +64,8 @@ const PROVENANCE_HEADERS: &[&str] = &[
     "x-forwarded-proto",
     "forwarded",
     "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
 ];
 
 type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
@@ -380,10 +382,22 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 
     let mut headers = HeaderMap::new();
     for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "obsolete line folding (RFC 7230 §3.2.4) is not supported",
+            ));
+        }
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        let name = &line[..colon];
+        if name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace before colon in header name (RFC 7230 §3.2.4) is not supported",
+            ));
+        }
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -593,6 +607,14 @@ mod tests {
             HeaderValue::from_static("https"),
         );
         h.insert(
+            HeaderName::from_static("true-client-ip"),
+            HeaderValue::from_static("1.1.1.1"),
+        );
+        h.insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("2.2.2.2"),
+        );
+        h.insert(
             HeaderName::from_static("x-custom"),
             HeaderValue::from_static("keep-me"),
         );
@@ -761,6 +783,26 @@ mod tests {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : localhost\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        match err {
+            ForwardError::HeadParse(m) => assert!(m.contains("whitespace before colon")),
+            _ => panic!("expected HeadParse error"),
+        }
+    }
+
+    #[test]
+    fn parse_request_head_rejects_obsolete_line_folding() {
+        let raw = b"GET / HTTP/1.1\r\nHost: localhost\r\n folded\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        match err {
+            ForwardError::HeadParse(m) => assert!(m.contains("obsolete line folding")),
+            _ => panic!("expected HeadParse error"),
+        }
     }
 
     #[test]
