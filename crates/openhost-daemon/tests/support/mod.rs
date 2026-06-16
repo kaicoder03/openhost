@@ -12,7 +12,7 @@
 #![allow(dead_code)] // different test files use different helpers
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ed25519_dalek::Signer as _;
 use openhost_core::crypto::auth_bytes_bound;
 use openhost_core::identity::{PublicKey, SigningKey};
@@ -118,7 +118,7 @@ impl Resolve for ScriptedResolve {
 pub struct ClientSession {
     pub client_pc: Arc<RTCPeerConnection>,
     pub dc: Arc<RTCDataChannel>,
-    pub received: Arc<Mutex<Vec<u8>>>,
+    pub received: Arc<Mutex<BytesMut>>,
     pub client_sk: SigningKey,
     pub client_pk: PublicKey,
     pub host_pk: PublicKey,
@@ -251,7 +251,7 @@ pub async fn establish_connection_opts(
         }));
     }
 
-    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let received: Arc<Mutex<BytesMut>> = Arc::new(Mutex::new(BytesMut::new()));
     let (dc_open_tx, mut dc_open_rx) = mpsc::channel::<()>(1);
 
     let dc = client_pc
@@ -273,7 +273,7 @@ pub async fn establish_connection_opts(
         let received = Arc::clone(&received_for_dc);
         Box::pin(async move {
             let mut buf = received.lock().await;
-            buf.extend_from_slice(&msg.data);
+            buf.put_slice(&msg.data);
         })
     }));
 
@@ -434,10 +434,10 @@ async fn wait_and_drain_auth_host(session: &ClientSession) {
     }
 }
 
-async fn drain_prefix(received: &Mutex<Vec<u8>>, n: usize) {
+async fn drain_prefix(received: &Mutex<BytesMut>, n: usize) {
     let mut buf = received.lock().await;
     let take = n.min(buf.len());
-    buf.drain(..take);
+    buf.advance(take);
 }
 
 async fn sign_auth_client(
