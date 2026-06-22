@@ -1098,19 +1098,57 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    let base_with_dash = format!("{base}-");
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    // Single pass over all resource records to collect fragments into buckets
+    // by their numeric `-<idx>` suffix. $O(N)$ complexity replaces the $O(N^2)$
+    // pathological case in the fragmented reassembly loop.
+    let mut buckets: [Option<String>; 256] = const { [const { None }; 256] };
+    let mut any = false;
+
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            // DNS names in Pkarr are fully qualified; we isolate the first
+            // label to compare against our expected `_answer-<hash>-<idx>`.
+            let name_str = rr.name.to_string();
+            let first_label = name_str.split('.').next().unwrap_or("");
+
+            if let Some(idx_s) = first_label.strip_prefix(&base_with_dash) {
+                let idx: u8 = idx_s.parse().map_err(|_| {
+                    PkarrError::MalformedCanonical("invalid answer fragment index in DNS label")
+                })?;
+
+                if buckets[idx as usize].is_some() {
+                    // Multiple TXT records at the same fragment name is a
+                    // protocol violation; reassembly must be unambiguous.
+                    return Err(PkarrError::MultipleOpenhostRecords);
+                }
+
+                // Concatenate character-strings within the TXT RR.
+                let mut out = String::new();
+                for (key, value) in txt.iter_raw() {
+                    out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+                    if let Some(v) = value {
+                        out.push('=');
+                        out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+                    }
+                }
+                buckets[idx as usize] = Some(out);
+                any = true;
+            }
+        }
+    }
+
+    if !any {
         return Ok(None);
+    }
+
+    // Reassembly starts at index 0. If missing, we have no valid answer.
+    let first_text = match &buckets[0] {
+        Some(t) => t,
+        None => return Ok(None),
     };
+
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
     let first = decode_fragment(&first_bytes)?;
     if first.idx != 0 {
@@ -1118,15 +1156,17 @@ pub fn decode_answer_fragments_from_packet(
             "answer fragment 0 carries non-zero idx",
         ));
     }
-    let total = first.total;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
+    let total = first.total;
+    let mut fragments = Vec::with_capacity(total as usize);
     fragments.push(first);
+
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let text = buckets[i as usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
