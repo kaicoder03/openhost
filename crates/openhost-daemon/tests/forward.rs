@@ -317,6 +317,8 @@ async fn forwarder_strips_hop_by_hop_and_provenance_before_upstream() -> DaemonR
                  Transfer-Encoding: chunked\r\n\
                  X-Forwarded-For: 10.0.0.1\r\n\
                  X-Real-IP: 10.0.0.2\r\n\
+                 True-Client-IP: 10.0.0.3\r\n\
+                 CF-Connecting-IP: 10.0.0.4\r\n\
                  Forwarded: by=attacker\r\n\
                  X-Custom: retained\r\n\
                  \r\n";
@@ -340,6 +342,8 @@ async fn forwarder_strips_hop_by_hop_and_provenance_before_upstream() -> DaemonR
         "x-forwarded-proto",
         "forwarded",
         "x-real-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
     ];
     for bad in banned {
         assert!(

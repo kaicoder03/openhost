@@ -64,6 +64,8 @@ const PROVENANCE_HEADERS: &[&str] = &[
     "x-forwarded-proto",
     "forwarded",
     "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
 ];
 
 type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
@@ -591,6 +593,14 @@ mod tests {
         h.insert(
             HeaderName::from_static("x-forwarded-proto"),
             HeaderValue::from_static("https"),
+        );
+        h.insert(
+            HeaderName::from_static("true-client-ip"),
+            HeaderValue::from_static("9.10.11.12"),
+        );
+        h.insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("13.14.15.16"),
         );
         h.insert(
             HeaderName::from_static("x-custom"),
