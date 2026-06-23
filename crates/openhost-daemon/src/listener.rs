@@ -1027,8 +1027,25 @@ async fn dispatch_frame(
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(?err, "openhostd: forwarder failed; replying 502");
-                        let _ = emit_stub_502(dc).await;
+                        // ForwardError variants HeadParse, HeadTooLarge,
+                        // BodyTooLarge, and WebSocketUnsupported represent
+                        // violations by the client. Per spec §5, we send
+                        // an ERROR frame and tear down.
+                        use crate::error::ForwardError;
+                        match &err {
+                            ForwardError::HeadParse(_)
+                            | ForwardError::HeadTooLarge { .. }
+                            | ForwardError::BodyTooLarge { .. }
+                            | ForwardError::WebSocketUnsupported => {
+                                tracing::warn!(?err, "openhostd: client-side forward error; tearing down");
+                                let _ = send_error_frame(dc, &err.to_string()).await;
+                                return FrameOutcome::Teardown;
+                            }
+                            _ => {
+                                tracing::warn!(?err, "openhostd: upstream forward error; replying 502");
+                                let _ = emit_stub_502(dc).await;
+                            }
+                        }
                     }
                 },
                 None => {

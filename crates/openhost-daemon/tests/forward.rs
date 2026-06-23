@@ -281,6 +281,49 @@ async fn forwarder_round_trip_returns_upstream_200() -> DaemonResult<()> {
 }
 
 #[tokio::test]
+async fn forwarder_request_head_exceeds_cap_rejects_and_tears_down() -> DaemonResult<()> {
+    // 32 KiB security limit is hardcoded in `forward.rs`.
+    let (port, _state) = spawn_upstream(UpstreamResponder::default()).await;
+    let (_tmp, app) = build_daemon(port).await;
+    let session = establish_connection(&app).await;
+
+    // Send a 33 KiB REQUEST_HEAD.
+    let mut big_head = b"GET / HTTP/1.1\r\nX-Padding: ".to_vec();
+    big_head.extend(std::iter::repeat(b'a').take(33 * 1024));
+    big_head.extend_from_slice(b"\r\n\r\n");
+
+    let req_head = Frame::new(FrameType::RequestHead, big_head).unwrap();
+    let req_end = Frame::new(FrameType::RequestEnd, vec![]).unwrap();
+    let mut wire = Vec::new();
+    req_head.encode(&mut wire);
+    req_end.encode(&mut wire);
+    session.dc.send(&Bytes::from(wire)).await.expect("send");
+
+    // Wait for the ERROR frame.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let err_frame = loop {
+        let bytes = session.received.lock().await.clone();
+        if let Ok(Some((frame, _))) = Frame::try_decode(&bytes) {
+            break frame;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no frame arrived after oversized REQUEST_HEAD");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(err_frame.frame_type, FrameType::Error);
+    let diagnostic = String::from_utf8_lossy(&err_frame.payload);
+    assert!(
+        diagnostic.contains("head exceeded"),
+        "ERROR diagnostic should mention head size limit; got {diagnostic:?}"
+    );
+
+    session.close().await;
+    app.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwarder_forwards_request_body_verbatim() -> DaemonResult<()> {
     let (port, state) = spawn_upstream(UpstreamResponder::EchoBody).await;
     let (_tmp, app) = build_daemon(port).await;
