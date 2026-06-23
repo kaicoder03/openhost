@@ -1037,12 +1037,18 @@ async fn dispatch_frame(
                             | ForwardError::HeadTooLarge { .. }
                             | ForwardError::BodyTooLarge { .. }
                             | ForwardError::WebSocketUnsupported => {
-                                tracing::warn!(?err, "openhostd: client-side forward error; tearing down");
+                                tracing::warn!(
+                                    ?err,
+                                    "openhostd: client-side forward error; tearing down"
+                                );
                                 let _ = send_error_frame(dc, &err.to_string()).await;
                                 return FrameOutcome::Teardown;
                             }
                             _ => {
-                                tracing::warn!(?err, "openhostd: upstream forward error; replying 502");
+                                tracing::warn!(
+                                    ?err,
+                                    "openhostd: upstream forward error; replying 502"
+                                );
                                 let _ = emit_stub_502(dc).await;
                             }
                         }

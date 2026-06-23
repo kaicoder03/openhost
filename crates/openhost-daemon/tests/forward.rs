@@ -289,7 +289,7 @@ async fn forwarder_request_head_exceeds_cap_rejects_and_tears_down() -> DaemonRe
 
     // Send a 33 KiB REQUEST_HEAD.
     let mut big_head = b"GET / HTTP/1.1\r\nX-Padding: ".to_vec();
-    big_head.extend(std::iter::repeat(b'a').take(33 * 1024));
+    big_head.extend(std::iter::repeat_n(b'a', 33 * 1024));
     big_head.extend_from_slice(b"\r\n\r\n");
 
     let req_head = Frame::new(FrameType::RequestHead, big_head).unwrap();

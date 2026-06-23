@@ -783,7 +783,7 @@ mod tests {
     fn parse_request_head_rejects_oversized_head() {
         // Build a 33 KiB head — 1 KiB over the limit.
         let mut raw = b"GET / HTTP/1.1\r\nX-Padding: ".to_vec();
-        raw.extend(std::iter::repeat(b'a').take(33 * 1024));
+        raw.extend(std::iter::repeat_n(b'a', 33 * 1024));
         raw.extend_from_slice(b"\r\n\r\n");
 
         let err = parse_request_head(&raw).unwrap_err();
