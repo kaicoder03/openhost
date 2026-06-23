@@ -1152,9 +1152,11 @@ pub fn decode_answer_fragments_from_packet(
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let text = buckets[i as usize].as_ref().ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let text = buckets[i as usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
