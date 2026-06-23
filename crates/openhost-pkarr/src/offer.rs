@@ -1098,17 +1098,46 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    let mut buckets: [Option<String>; 256] = const { [const { None }; 256] };
+
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            // Match `_answer-<hash>-<idx>`. We avoid `rr.name.to_string()`
+            // to save allocations, instead splitting the name labels.
+            let labels = rr.name.get_labels();
+            let Some(label) = labels.first() else {
+                continue;
+            };
+            let label_str = core::str::from_utf8(label.as_ref()).unwrap_or("");
+
+            if let Some(suffix) = label_str.strip_prefix(&base) {
+                if let Some(rest) = suffix.strip_prefix('-') {
+                    if let Ok(idx) = rest.parse::<u8>() {
+                        if buckets[idx as usize].is_some() {
+                            return Err(PkarrError::MultipleOpenhostRecords);
+                        }
+
+                        let mut out = String::new();
+                        for (key, value) in txt.iter_raw() {
+                            out.push_str(
+                                core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?,
+                            );
+                            if let Some(v) = value {
+                                out.push('=');
+                                out.push_str(
+                                    core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?,
+                                );
+                            }
+                        }
+                        buckets[idx as usize] = Some(out);
+                    }
+                }
+            }
+        }
+    }
 
     // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    let Some(first_text) = buckets[0].as_ref() else {
         return Ok(None);
     };
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
@@ -1123,8 +1152,7 @@ pub fn decode_answer_fragments_from_packet(
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
+        let text = buckets[i as usize].as_ref().ok_or(PkarrError::MalformedCanonical(
             "answer fragment set is missing an idx",
         ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
@@ -1135,6 +1163,8 @@ pub fn decode_answer_fragments_from_packet(
             ));
         }
         if frag.idx != i {
+            // This shouldn't happen with the bucket-sort logic unless
+            // the fragment payload itself is corrupt.
             return Err(PkarrError::MalformedCanonical(
                 "answer fragment idx disagrees with its DNS label suffix",
             ));
