@@ -39,6 +39,11 @@ use std::time::Duration;
 /// case and still bounds a misconfigured target from wedging a request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum size of the HTTP request head (request line + headers) in bytes.
+/// RFC 7230 does not set a limit, but most servers cap it at 8-16 KiB.
+/// We use 32 KiB as a generous security upper bound.
+const MAX_HEAD_BYTES: usize = 32 * 1024;
+
 /// Hop-by-hop header names per RFC 7230 §6.1. Must be stripped from
 /// both inbound requests (before dispatch to upstream) and outbound
 /// responses (before re-framing to the openhost client).
@@ -64,6 +69,8 @@ const PROVENANCE_HEADERS: &[&str] = &[
     "x-forwarded-proto",
     "forwarded",
     "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
 ];
 
 type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
@@ -341,6 +348,12 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Rejects HTTP/0.9, HTTP/1.0, HTTP/2+, missing blank line, and any
 /// obvious line-ending confusion (bare `\n` inside headers).
 fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), ForwardError> {
+    if bytes.len() > MAX_HEAD_BYTES {
+        return Err(ForwardError::HeadTooLarge {
+            limit: MAX_HEAD_BYTES,
+        });
+    }
+
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ForwardError::HeadParse("request head is not valid UTF-8"))?;
 
@@ -383,7 +396,10 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header field-name
+        // and colon." We parse the name verbatim; `HeaderName::from_bytes`
+        // correctly rejects names containing whitespace.
+        let name = &line[..colon];
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -760,6 +776,26 @@ mod tests {
     fn parse_request_head_rejects_wrong_version() {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_oversized_head() {
+        // Build a 33 KiB head — 1 KiB over the limit.
+        let mut raw = b"GET / HTTP/1.1\r\nX-Padding: ".to_vec();
+        raw.extend(std::iter::repeat_n(b'a', 33 * 1024));
+        raw.extend_from_slice(b"\r\n\r\n");
+
+        let err = parse_request_head(&raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadTooLarge { limit: 32768 }));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: whitespace before colon is illegal.
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        // `HeaderName::from_bytes` will reject the "Host " (with trailing space).
         assert!(matches!(err, ForwardError::HeadParse(_)));
     }
 
