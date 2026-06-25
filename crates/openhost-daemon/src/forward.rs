@@ -783,7 +783,10 @@ mod tests {
         // RFC 7230 §3.2.4: no whitespace between field-name and colon.
         let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
-        assert!(matches!(err, ForwardError::HeadParse("invalid header name")));
+        assert!(matches!(
+            err,
+            ForwardError::HeadParse("invalid header name")
+        ));
     }
 
     #[test]
