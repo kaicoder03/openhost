@@ -64,6 +64,9 @@ const PROVENANCE_HEADERS: &[&str] = &[
     "x-forwarded-proto",
     "forwarded",
     "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "x-forwarded-port",
 ];
 
 type HyperClient = LegacyClient<HttpConnector, Full<Bytes>>;
@@ -383,7 +386,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -593,6 +596,18 @@ mod tests {
             HeaderValue::from_static("https"),
         );
         h.insert(
+            HeaderName::from_static("true-client-ip"),
+            HeaderValue::from_static("1.2.3.4"),
+        );
+        h.insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("5.6.7.8"),
+        );
+        h.insert(
+            HeaderName::from_static("x-forwarded-port"),
+            HeaderValue::from_static("443"),
+        );
+        h.insert(
             HeaderName::from_static("x-custom"),
             HeaderValue::from_static("keep-me"),
         );
@@ -761,6 +776,14 @@ mod tests {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: no whitespace between field-name and colon.
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse("invalid header name")));
     }
 
     #[test]
