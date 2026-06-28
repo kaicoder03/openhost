@@ -1,0 +1,3 @@
+## 2025-05-15 - [Buffer Management and Header Construction]
+**Learning:** `Vec::drain(..n)` is an $O(N)$ operation because it requires shifting all remaining elements to the front of the vector. For inbound network buffers that accumulate data, this can lead to $O(N^2)$ complexity. `BytesMut::advance(n)` from the `bytes` crate provides $O(1)$ buffer consumption by adjusting an internal offset. Additionally, `HeaderValue::from(u64)` is more efficient than `u16_val.to_string().parse()` or `HeaderValue::from_str(&val.to_string())` as it avoids intermediate string allocations.
+**Action:** Use `BytesMut` for network buffers and `HeaderValue::from(u64)` for numeric headers like `Content-Length`.
