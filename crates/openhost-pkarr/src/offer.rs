@@ -1126,7 +1126,8 @@ pub fn decode_answer_fragments_from_packet(
 
         // All fragments for a single client in one packet MUST share the
         // same name suffix (the origin/pubkey labels).
-        let current_suffix: Vec<Vec<u8>> = labels.iter().skip(1).map(|l| l.as_ref().to_vec()).collect();
+        let current_suffix: Vec<Vec<u8>> =
+            labels.iter().skip(1).map(|l| l.as_ref().to_vec()).collect();
         if let Some(ref suffix) = expected_suffix {
             if *suffix != current_suffix {
                 continue;
