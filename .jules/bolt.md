@@ -1,0 +1,3 @@
+## 2025-05-15 - [Optimized Pkarr Answer Fragment Reassembly]
+**Learning:** Initializing large arrays of non-`Copy` types (e.g., `[Option<Vec<u8>>; 256]`) in this Rust 1.85 environment requires nested inline `const` blocks: `const { [const { None }; 256] }`. Additionally, reconstructing Pkarr fragments from DNS TXT records should use `iter_raw()` to concatenate character-strings into a `Vec<u8>` to avoid intermediate UTF-8 validation and multiple allocations.
+**Action:** Use nested `const` blocks for array initialization and pre-calculate final buffer capacity when reassembling fragmented data.
