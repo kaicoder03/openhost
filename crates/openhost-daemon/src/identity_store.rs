@@ -15,6 +15,7 @@ use crate::error::{KeyStoreError, Result as DaemonResult};
 use async_trait::async_trait;
 use openhost_core::identity::{SigningKey, SIGNING_KEY_LEN};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Crate-local result alias for keystore operations.
 pub type Result<T> = core::result::Result<T, KeyStoreError>;
@@ -66,10 +67,12 @@ impl KeyStore for FsKeyStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
+        let bytes = Zeroizing::new(bytes);
+
         if bytes.len() != SIGNING_KEY_LEN {
             return Err(KeyStoreError::WrongSize { got: bytes.len() });
         }
-        let mut seed = [0u8; SIGNING_KEY_LEN];
+        let mut seed = Zeroizing::new([0u8; SIGNING_KEY_LEN]);
         seed.copy_from_slice(&bytes);
         Ok(Some(SigningKey::from_bytes(&seed)))
     }
@@ -81,8 +84,8 @@ impl KeyStore for FsKeyStore {
             }
         }
 
-        let seed = sk.to_bytes();
-        write_mode_0600(&self.path, &seed).await?;
+        let seed = Zeroizing::new(sk.to_bytes());
+        write_mode_0600(&self.path, seed.as_ref()).await?;
         Ok(())
     }
 }
