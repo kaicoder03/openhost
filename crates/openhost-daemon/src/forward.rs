@@ -383,7 +383,17 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header
+        // field-name and colon. [...] A server MUST reject any received
+        // request message that contains whitespace between a header
+        // field-name and colon with a response code of 400 (Bad Request)."
+        //
+        // By NOT calling .trim() here, HeaderName::from_bytes will fail
+        // if trailing whitespace exists, correctly triggering a 400-level
+        // error in the caller.
+        let name = &line[..colon];
+
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
         let value = line[colon + 1..].trim_start_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -782,6 +792,16 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let res = parse_request_head(raw);
+        assert!(
+            res.is_err(),
+            "RFC 7230 §3.2.4: request with whitespace before colon MUST be rejected"
+        );
     }
 
     // --- Response head encoder --------------------------------------
