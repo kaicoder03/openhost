@@ -1,0 +1,4 @@
+## 2026-07-02 - HTTP Header Parsing Vulnerability (RFC 7230 §3.2.4)
+**Vulnerability:** Hand-rolled HTTP/1.1 parsers often incorrectly trim whitespace before the colon in header fields. RFC 7230 §3.2.4 explicitly forbids whitespace between the field-name and the colon, requiring servers to reject such requests. Allowing this whitespace can enable HTTP Request Smuggling attacks.
+**Learning:** Using `.trim()` on header names in a manual parser is a security anti-pattern. While it seems helpful for robustness, it violates the strict requirements of the HTTP specification.
+**Prevention:** In manual HTTP parsers, avoid automatic trimming of field-names. Rely on strict validation libraries (like the Rust `http` crate's `HeaderName`) to reject invalid tokens, and ensure both leading and trailing whitespace are removed from field-values (OWS).
