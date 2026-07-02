@@ -287,10 +287,18 @@ mod tests {
 
         let mut watcher =
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Give the backend a moment to start and settle. On macOS, FSEvents
+        // can be noisy during startup or batch the initial setup write
+        // with the sibling write if they happen too close together.
+        tokio::time::sleep(Duration::from_millis(250)).await;
 
         fs::write(&sibling, b"unrelated").unwrap();
 
+        // On macOS, FSEvents might occasionally report a directory-level
+        // event that contains the sibling, but our bridge filters by
+        // exact filename. If we still see an event here, it means the
+        // filter or the test timing is failing.
         let res = tokio::time::timeout(Duration::from_millis(500), watcher.recv()).await;
         assert!(
             res.is_err(),
