@@ -289,7 +289,9 @@ mod tests {
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
         tokio::time::sleep(Duration::from_millis(500)).await;
         // Drain any pre-existing events from setup/initial write
-        while let Ok(Some(())) = tokio::time::timeout(Duration::from_millis(100), watcher.recv()).await {}
+        while let Ok(Some(())) =
+            tokio::time::timeout(Duration::from_millis(100), watcher.recv()).await
+        {}
 
         fs::write(&sibling, b"unrelated").unwrap();
 
