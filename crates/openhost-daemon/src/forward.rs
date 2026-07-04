@@ -383,9 +383,10 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        // RFC 7230 §3.2.4: No whitespace allowed before the colon.
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` around the value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -462,7 +463,13 @@ fn encode_websocket_response_head(
     }
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT: manual byte extensions avoid the format! macro and intermediate string allocations.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(status.as_str().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
+
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -491,13 +498,18 @@ fn combine_target_and_path(target: &Uri, path: &str) -> Result<Uri, ForwardError
         path
     };
 
-    let path_and_query = if path_str.is_empty() || !path_str.starts_with('/') {
-        format!("/{path_str}")
-    } else {
-        path_str.to_string()
-    };
+    let mut path_and_query = String::with_capacity(path_str.len() + 1);
+    if path_str.is_empty() || !path_str.starts_with('/') {
+        path_and_query.push('/');
+    }
+    path_and_query.push_str(path_str);
 
-    let uri_str = format!("http://{authority}{path_and_query}");
+    // BOLT: pre-calculating capacity and pushing avoids multiple allocations inside format!.
+    let authority_str = authority.as_str();
+    let mut uri_str = String::with_capacity(7 + authority_str.len() + path_and_query.len());
+    uri_str.push_str("http://");
+    uri_str.push_str(authority_str);
+    uri_str.push_str(&path_and_query);
     uri_str
         .parse()
         .map_err(|_| ForwardError::HeadParse("could not combine target + path into a URI"))
@@ -517,14 +529,21 @@ fn encode_response_head(
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
     // frame-split the response stream.
+    // BOLT: HeaderValue::from(u64) avoids a string allocation + parse.
     headers.insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).expect("body_len is ASCII digits"),
+        HeaderValue::from(body_len as u64),
     );
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT: manual byte extensions avoid the format! macro and intermediate string allocations.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(status.as_str().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
+
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -897,5 +916,21 @@ mod tests {
         let target: Uri = "http://127.0.0.1:8080".parse().unwrap();
         let uri = combine_target_and_path(&target, "http://evil.example/foo").unwrap();
         assert_eq!(uri.to_string(), "http://127.0.0.1:8080/foo");
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: No whitespace allowed before the colon.
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_whitespace_from_values() {
+        // RFC 7230 §3.2.4: OWS (SP/HTAB) around value must be trimmed.
+        let raw = b"GET / HTTP/1.1\r\nHost: example  \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example");
     }
 }

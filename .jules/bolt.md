@@ -1,0 +1,3 @@
+## 2025-05-14 - Optimized HTTP forwarder and URI construction
+**Learning:** Using `format!` in hot paths like HTTP forwarding and URI construction introduces intermediate string allocations and uses the formatting engine's overhead. Manual byte slice extension for status lines and `String::with_capacity` followed by `push_str` for URI construction is significantly more efficient. Additionally, `HeaderValue::from(u64)` is superior to the `to_string().parse()` pattern for `Content-Length` as it avoids intermediate string allocations.
+**Action:** Prefer manual buffer management and capacity pre-calculation in hot paths. Use specialized `From` implementations for `HeaderValue` where available to avoid redundant string work.
