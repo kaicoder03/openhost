@@ -383,9 +383,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -519,7 +519,7 @@ fn encode_response_head(
     // frame-split the response stream.
     headers.insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).expect("body_len is ASCII digits"),
+        HeaderValue::from(body_len as u64),
     );
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
@@ -782,6 +782,30 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: No whitespace allowed between header name and colon.
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::HeadParse(_)),
+            "expected error for whitespace before colon, got Ok"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_whitespace_from_values() {
+        // RFC 7230 §3.2: OWS (Optional WhiteSpace) should be trimmed from both
+        // ends of the header value.
+        let raw = b"GET / HTTP/1.1\r\nHost: example  \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(
+            headers.get("host").unwrap().to_str().unwrap(),
+            "example",
+            "trailing whitespace should be trimmed from header value"
+        );
     }
 
     // --- Response head encoder --------------------------------------
