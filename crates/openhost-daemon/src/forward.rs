@@ -106,7 +106,7 @@ pub struct Forwarder {
     /// Upstream origin; scheme is guaranteed `http`.
     target: Uri,
     /// Value the outbound `Host` header is pinned to.
-    host_override: String,
+    host_override: HeaderValue,
     /// Shared hyper client. Cloneable; we never hold it across requests
     /// so the internal connection pool is the only piece of state that
     /// lives between calls.
@@ -141,10 +141,11 @@ impl Forwarder {
             .ok_or_else(|| ForwardError::TargetParse("target is missing an authority".into()))?
             .to_string();
 
-        let host_override = cfg
-            .host_override
-            .clone()
-            .unwrap_or_else(|| authority.clone());
+        let host_override_str = cfg.host_override.as_ref().unwrap_or(&authority);
+
+        let host_override = HeaderValue::from_str(host_override_str).map_err(|_| {
+            ForwardError::TargetParse("host_override is not a valid header value".to_string())
+        })?;
 
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
@@ -217,15 +218,15 @@ impl Forwarder {
         let mut req_builder = Request::builder().method(method).uri(target_uri);
         // Replace the HeaderMap wholesale — simpler than iterating and
         // inserting one-by-one, and guaranteed to honour sanitisation.
+        //
+        // BOLT: Consolidating consecutive headers_mut() calls into a
+        // single block reduces mutable HeaderMap lookups.
         if let Some(req_headers) = req_builder.headers_mut() {
             *req_headers = headers;
-        }
-
-        // Tell hyper not to pool this connection. The data-channel
-        // session may never make another request; reusing the TCP
-        // handle risks leaking state if the upstream had side effects
-        // tied to the connection.
-        if let Some(req_headers) = req_builder.headers_mut() {
+            // Tell hyper not to pool this connection. The data-channel
+            // session may never make another request; reusing the TCP
+            // handle risks leaking state if the upstream had side effects
+            // tied to the connection.
             req_headers.insert(http::header::CONNECTION, HeaderValue::from_static("close"));
         }
 
@@ -403,7 +404,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 /// before this runs.
 fn sanitize_request_headers(
     headers: &mut HeaderMap,
-    host_override: &str,
+    host_override: &HeaderValue,
 ) -> Result<(), ForwardError> {
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
@@ -412,10 +413,7 @@ fn sanitize_request_headers(
         headers.remove(*name);
     }
 
-    let host_value = HeaderValue::from_str(host_override).map_err(|_| {
-        ForwardError::HeadParse("configured host_override is not a valid header value")
-    })?;
-    headers.insert(http::header::HOST, host_value);
+    headers.insert(http::header::HOST, host_override.clone());
 
     Ok(())
 }
@@ -427,7 +425,7 @@ fn sanitize_request_headers(
 /// through unchanged (Key, Version, Protocol, Extensions).
 fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
-    host_override: &str,
+    host_override: &HeaderValue,
 ) -> Result<(), ForwardError> {
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
@@ -438,10 +436,7 @@ fn sanitize_websocket_request_headers(
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
-    let host_value = HeaderValue::from_str(host_override).map_err(|_| {
-        ForwardError::HeadParse("configured host_override is not a valid header value")
-    })?;
-    headers.insert(http::header::HOST, host_value);
+    headers.insert(http::header::HOST, host_override.clone());
     Ok(())
 }
 
@@ -462,7 +457,13 @@ fn encode_websocket_response_head(
     }
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT: Manual status line construction using status.as_str() avoids
+    // the allocation and formatting overhead of the format! macro.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(status.as_str().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -491,13 +492,18 @@ fn combine_target_and_path(target: &Uri, path: &str) -> Result<Uri, ForwardError
         path
     };
 
-    let path_and_query = if path_str.is_empty() || !path_str.starts_with('/') {
-        format!("/{path_str}")
-    } else {
-        path_str.to_string()
-    };
+    // BOLT: Manual URI construction with pre-calculated capacity
+    // avoids multiple intermediate string allocations and the
+    // formatting overhead of the format! macro.
+    let authority_str = authority.as_str();
+    let mut uri_str = String::with_capacity(7 + authority_str.len() + path_str.len() + 1);
+    uri_str.push_str("http://");
+    uri_str.push_str(authority_str);
+    if path_str.is_empty() || !path_str.starts_with('/') {
+        uri_str.push('/');
+    }
+    uri_str.push_str(path_str);
 
-    let uri_str = format!("http://{authority}{path_and_query}");
     uri_str
         .parse()
         .map_err(|_| ForwardError::HeadParse("could not combine target + path into a URI"))
@@ -517,14 +523,23 @@ fn encode_response_head(
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
     // frame-split the response stream.
+    //
+    // BOLT: HeaderValue::from(u64) avoids the intermediate String
+    // allocation of body_len.to_string().
     headers.insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).expect("body_len is ASCII digits"),
+        HeaderValue::from(body_len as u64),
     );
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // BOLT: Manual status line construction using status.as_str() avoids
+    // the allocation and formatting overhead of the format! macro.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(status.as_str().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -602,7 +617,8 @@ mod tests {
     #[test]
     fn sanitize_strips_all_hop_by_hop_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let hv = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &hv).unwrap();
         for name in HOP_BY_HOP_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -614,7 +630,8 @@ mod tests {
     #[test]
     fn sanitize_strips_all_provenance_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let hv = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &hv).unwrap();
         for name in PROVENANCE_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -626,7 +643,8 @@ mod tests {
     #[test]
     fn sanitize_preserves_benign_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let hv = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &hv).unwrap();
         assert_eq!(
             h.get("x-custom").map(|v| v.to_str().unwrap()),
             Some("keep-me")
@@ -636,7 +654,8 @@ mod tests {
     #[test]
     fn sanitize_pins_host() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let hv = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &hv).unwrap();
         assert_eq!(
             h.get(http::header::HOST).map(|v| v.to_str().unwrap()),
             Some("127.0.0.1:8080"),
@@ -655,7 +674,8 @@ mod tests {
         // RFC 7230 §6.1. The upstream never sees it.
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        sanitize_request_headers(&mut h, "x").unwrap();
+        let hv = HeaderValue::from_static("x");
+        sanitize_request_headers(&mut h, &hv).unwrap();
         assert!(!h.contains_key(http::header::UPGRADE));
     }
 
@@ -703,7 +723,8 @@ mod tests {
             HeaderName::from_static("sec-websocket-version"),
             HeaderValue::from_static("13"),
         );
-        sanitize_websocket_request_headers(&mut h, "upstream.local").unwrap();
+        let hv = HeaderValue::from_static("upstream.local");
+        sanitize_websocket_request_headers(&mut h, &hv).unwrap();
         assert!(h.contains_key(http::header::UPGRADE));
         assert!(h.contains_key(http::header::CONNECTION));
         assert!(h.contains_key("sec-websocket-key"));
@@ -727,7 +748,8 @@ mod tests {
             http::header::TRANSFER_ENCODING,
             HeaderValue::from_static("chunked"),
         );
-        sanitize_websocket_request_headers(&mut h, "x").unwrap();
+        let hv = HeaderValue::from_static("x");
+        sanitize_websocket_request_headers(&mut h, &hv).unwrap();
         assert!(!h.contains_key(http::header::TE));
         assert!(!h.contains_key(http::header::TRANSFER_ENCODING));
     }
@@ -740,7 +762,8 @@ mod tests {
         // just strip it as hop-by-hop so the upstream never sees it.
         let mut h = HeaderMap::new();
         h.insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
-        sanitize_request_headers(&mut h, "x").unwrap();
+        let hv = HeaderValue::from_static("x");
+        sanitize_request_headers(&mut h, &hv).unwrap();
         assert!(!h.contains_key(http::header::UPGRADE));
     }
 
@@ -857,7 +880,7 @@ mod tests {
             websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
-        assert_eq!(fwd.host_override, "127.0.0.1:8080");
+        assert_eq!(fwd.host_override.to_str().unwrap(), "127.0.0.1:8080");
     }
 
     #[test]
@@ -869,7 +892,7 @@ mod tests {
             websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
-        assert_eq!(fwd.host_override, "my-service.local");
+        assert_eq!(fwd.host_override.to_str().unwrap(), "my-service.local");
     }
 
     // --- combine_target_and_path ------------------------------------
