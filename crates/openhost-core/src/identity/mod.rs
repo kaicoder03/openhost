@@ -17,7 +17,7 @@ use core::fmt;
 use ed25519_dalek::{Signature, Signer, SigningKey as DalekSigningKey, VerifyingKey};
 use rand_core::CryptoRngCore;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 /// Number of raw bytes in an Ed25519 public key.
 pub const PUBLIC_KEY_LEN: usize = 32;
@@ -180,14 +180,6 @@ impl SigningKey {
 impl fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SigningKey(<redacted>)")
-    }
-}
-
-impl Zeroize for SigningKey {
-    fn zeroize(&mut self) {
-        let mut bytes = self.0.to_bytes();
-        bytes.zeroize();
-        self.0 = DalekSigningKey::from_bytes(&[0u8; SIGNING_KEY_LEN]);
     }
 }
 
