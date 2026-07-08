@@ -383,9 +383,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name = &line[..colon];
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` before and after the value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -754,6 +754,25 @@ mod tests {
         assert_eq!(path, "/foo/bar?x=1");
         assert_eq!(headers.get("host").unwrap(), "example");
         assert_eq!(headers.get("x-custom").unwrap(), "yes");
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_before_colon() {
+        // RFC 7230 §3.2.4: "No whitespace is allowed between the header field-name and colon."
+        let raw = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid header name"),
+            "Expected 'invalid header name' error for whitespace before colon, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_request_head_trims_trailing_whitespace_from_values() {
+        // RFC 7230 §3.2.4: "Optional whitespace (OWS) is allowed before and after the field-value."
+        let raw = b"GET / HTTP/1.1\r\nHost: example  \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example");
     }
 
     #[test]
