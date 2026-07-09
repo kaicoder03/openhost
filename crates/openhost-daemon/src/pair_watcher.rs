@@ -283,14 +283,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("allow.toml");
         let sibling = tmp.path().join("other.toml");
-        fs::write(&path, b"pairs = []\n").unwrap();
 
         let mut watcher =
-            PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            PairWatcher::spawn(&path, Duration::from_millis(100)).expect("watcher spawns");
+        // Give the backend plenty of time to arm on slow CI runners.
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         fs::write(&sibling, b"unrelated").unwrap();
 
+        // Use a timeout longer than the debounce window.
         let res = tokio::time::timeout(Duration::from_millis(500), watcher.recv()).await;
         assert!(
             res.is_err(),
