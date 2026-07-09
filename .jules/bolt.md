@@ -1,0 +1,3 @@
+## 2026-07-08 - String allocation optimization in HTTP forwarders
+**Learning:** Hand-rolled HTTP parsers and forwarders often suffer from "death by a thousand allocations" (DBATA). Using `HeaderValue::from(u64)` for numeric headers and ensuring `parse_request_head` returns borrows (`&str`) instead of owned `String`s significantly cleans up the hot path. Also, `http::uri::Authority` requires `.as_str()` for length and concatenation; it doesn't implement `Deref<Target=str>` or have a direct `.len()`.
+**Action:** Always check for `format!` usage in loops or request handlers and replace with `String::with_capacity` + `push_str` or `write!` macro on a pre-allocated buffer.
