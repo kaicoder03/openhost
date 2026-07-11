@@ -1170,7 +1170,7 @@ pub fn decode_answer_fragments_from_packet(
     }
 
     // Reassembly requires at least the 0th fragment.
-    let total = match (total_expected, buckets.get(0).and_then(|f| f.as_ref())) {
+    let total = match (total_expected, buckets.first().and_then(|f| f.as_ref())) {
         (Some(t), Some(_)) => t,
         _ => return Ok(None),
     };
@@ -1181,8 +1181,12 @@ pub fn decode_answer_fragments_from_packet(
         ));
     }
 
-    let mut sealed =
-        Vec::with_capacity(buckets.iter().map(|f| f.as_ref().unwrap().payload.len()).sum());
+    let mut sealed = Vec::with_capacity(
+        buckets
+            .iter()
+            .map(|f| f.as_ref().unwrap().payload.len())
+            .sum(),
+    );
     for frag_opt in buckets {
         // Safe to unwrap because we verified fragments_found == total.
         let frag = frag_opt.unwrap();
