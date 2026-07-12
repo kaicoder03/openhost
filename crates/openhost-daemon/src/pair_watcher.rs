@@ -290,8 +290,9 @@ mod tests {
 
         // Drain any "initial" events that might fire on some backends (like FSEvents)
         // when establishing the watch, ensuring we start from a clean slate.
-        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), watcher.recv()).await {
-        }
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_millis(200), watcher.recv()).await
+        {}
 
         fs::write(&sibling, b"unrelated").unwrap();
 
