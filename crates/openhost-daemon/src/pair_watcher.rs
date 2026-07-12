@@ -286,8 +286,12 @@ mod tests {
         fs::write(&path, b"pairs = []\n").unwrap();
 
         let mut watcher =
-            PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            PairWatcher::spawn(&path, Duration::from_millis(100)).expect("watcher spawns");
+
+        // Drain any "initial" events that might fire on some backends (like FSEvents)
+        // when establishing the watch, ensuring we start from a clean slate.
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), watcher.recv()).await {
+        }
 
         fs::write(&sibling, b"unrelated").unwrap();
 
