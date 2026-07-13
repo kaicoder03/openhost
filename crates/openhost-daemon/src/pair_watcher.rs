@@ -289,6 +289,14 @@ mod tests {
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Drain any startup noise (e.g. FSEvents on macOS occasionally fires
+        // for the directory being watched immediately after the watch is armed).
+        while let Ok(Some(())) =
+            tokio::time::timeout(Duration::from_millis(10), watcher.recv()).await
+        {
+            // draining...
+        }
+
         fs::write(&sibling, b"unrelated").unwrap();
 
         let res = tokio::time::timeout(Duration::from_millis(500), watcher.recv()).await;
