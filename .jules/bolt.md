@@ -1,0 +1,3 @@
+## 2026-07-10 - Optimizing HTTP forwarder hot path
+**Learning:** In high-frequency proxy logic, intermediate `String` allocations for HTTP headers (like `Content-Length`) and status lines are a significant source of overhead. Using `HeaderValue::from(u64)` and the `write!` macro directly on a `Vec<u8>` buffer eliminates these allocations. Pre-parsing configuration values like `host_override` into their final `HeaderValue` form also saves per-request validation and allocation.
+**Action:** Always look for opportunities to build binary response buffers using `write!` and pre-parsed `HeaderValue` types in performance-critical paths.
