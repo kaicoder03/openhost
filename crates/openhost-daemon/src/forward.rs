@@ -142,10 +142,7 @@ impl Forwarder {
             .ok_or_else(|| ForwardError::TargetParse("target is missing an authority".into()))?
             .to_string();
 
-        let host_override_str = cfg
-            .host_override
-            .as_deref()
-            .unwrap_or(&authority);
+        let host_override_str = cfg.host_override.as_deref().unwrap_or(&authority);
 
         let host_override = HeaderValue::from_str(host_override_str).map_err(|_| {
             ForwardError::HeadParse("configured host_override is not a valid header value")
