@@ -1,0 +1,4 @@
+## 2026-07-15 - Strict RFC 7230 Header Parsing
+**Vulnerability:** HTTP Request Smuggling hazard due to non-compliant header parsing (allowing whitespace before header colons and not trimming optional whitespace (OWS) from header values).
+**Learning:** In `crates/openhost-daemon/src/forward.rs`, `parse_request_head` previously accepted trailing whitespace before the colon by trimming the key, and only trimmed leading whitespace from the value. Since `http::HeaderValue::from_str` does not automatically strip trailing whitespace, the downstream server and forwarder could disagree on parsed header values, leading to request smuggling.
+**Prevention:** Strictly validate that the header field name does not contain space or tab characters, rejecting any whitespace before the colon, and use `.trim_matches([' ', '\t'])` to strip OWS at both ends of the header value.
