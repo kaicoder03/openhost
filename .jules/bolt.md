@@ -1,0 +1,3 @@
+## 2026-07-20 - [O(N) Single-Pass Bucket-Sort Fragment Reassembly]
+**Learning:** Sequential lookup probes (`collect_single_txt`) over a DNS packet's resource records in fragment reassembly can scale quadratically $O(N^2)$ with the number of fragments (up to 255). A single-pass traversal over all resource records that bucket-sorts the values into a stack-allocated array (avoiding heap allocations) resolves this bottleneck and guarantees a strictly $O(N)$ linear complexity.
+**Action:** Prefer single-pass filtering/sorting over repeated name-lookup probes when processing collection-like structures or arrays of elements where indices can be parsed/sorted directly.
