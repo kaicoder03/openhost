@@ -1098,19 +1098,54 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // Optimized: Single-pass over packet.all_resource_records() to bucket-sort matching names by numeric idx.
+    // Avoids walking the resource records O(N^2) times using collect_single_txt, especially for larger indices.
+    let mut buckets: Vec<Option<String>> = vec![None; 256];
+    let origin = packet.public_key().to_z32();
+    let expected_prefix = format!("{base}-");
+
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            let rr_name_str = rr.name.to_string();
+            let rr_name_trimmed = rr_name_str.strip_suffix('.').unwrap_or(&rr_name_str);
+            if let Some(suffix) = rr_name_trimmed.strip_prefix(&expected_prefix) {
+                let idx_str = match suffix.split_once('.') {
+                    Some((idx_part, rest)) => {
+                        if rest != origin {
+                            continue;
+                        }
+                        idx_part
+                    }
+                    None => suffix,
+                };
+
+                if let Ok(idx) = idx_str.parse::<u8>() {
+                    if buckets[idx as usize].is_some() {
+                        return Err(PkarrError::MultipleOpenhostRecords);
+                    }
+                    let mut out = String::new();
+                    for (key, value) in txt.iter_raw() {
+                        out.push_str(
+                            core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?,
+                        );
+                        if let Some(v) = value {
+                            out.push('=');
+                            out.push_str(
+                                core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?,
+                            );
+                        }
+                    }
+                    buckets[idx as usize] = Some(out);
+                }
+            }
+        }
+    }
 
     // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    let Some(first_text) = &buckets[0] else {
         return Ok(None);
     };
+
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
     let first = decode_fragment(&first_bytes)?;
     if first.idx != 0 {
@@ -1118,23 +1153,23 @@ pub fn decode_answer_fragments_from_packet(
             "answer fragment 0 carries non-zero idx",
         ));
     }
-    let total = first.total;
+    let total = first.total as usize;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
+    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total);
     fragments.push(first);
+    #[allow(clippy::needless_range_loop)]
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
+        let text = buckets[i].as_ref().ok_or(PkarrError::MalformedCanonical(
             "answer fragment set is missing an idx",
         ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
-        if frag.total != total {
+        if frag.total != total as u8 {
             return Err(PkarrError::MalformedCanonical(
                 "answer fragments disagree on chunk_total",
             ));
         }
-        if frag.idx != i {
+        if frag.idx != i as u8 {
             return Err(PkarrError::MalformedCanonical(
                 "answer fragment idx disagrees with its DNS label suffix",
             ));
