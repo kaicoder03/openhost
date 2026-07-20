@@ -168,13 +168,20 @@ pub fn save_atomic(path: &Path, db: &PairingDb) -> Result<(), PairingError> {
     }
     let body = toml::to_string_pretty(db)?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, body.as_bytes())?;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&tmp, perms)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true).mode(0o600);
+        let mut file = options.open(&tmp)?;
+        use std::io::Write;
+        file.write_all(body.as_bytes())?;
+        file.flush()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, body.as_bytes())?;
     }
 
     std::fs::rename(&tmp, path)?;

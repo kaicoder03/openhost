@@ -426,6 +426,24 @@ impl Config {
                     )
                     .into());
                 }
+                if let Ok(parsed_uri) = target.parse::<http::Uri>() {
+                    if parsed_uri.authority().is_none() {
+                        return Err(ConfigError::Invalid(
+                            "forward.target URI must have an authority (e.g. http://127.0.0.1:8080)",
+                        )
+                        .into());
+                    }
+                } else {
+                    return Err(ConfigError::Invalid("forward.target is not a valid URI").into());
+                }
+            }
+            if let Some(host_override) = &forward.host_override {
+                if http::header::HeaderValue::from_str(host_override).is_err() {
+                    return Err(ConfigError::Invalid(
+                        "forward.host_override must be a valid HTTP header value",
+                    )
+                    .into());
+                }
             }
             if forward.max_body_bytes == 0 {
                 return Err(ConfigError::Invalid("forward.max_body_bytes must be > 0").into());
@@ -582,6 +600,54 @@ mod tests {
         cfg.dtls.rotate_secs = 0;
         let err = cfg.validate().unwrap_err();
         assert!(format!("{err}").contains("rotate_secs"));
+    }
+
+    #[test]
+    fn rejects_invalid_forward_target_and_host_override() {
+        let mut cfg = seed_config(Path::new("/tmp"));
+
+        // Invalid target scheme (https)
+        cfg.forward = Some(ForwardConfig {
+            target: Some("https://127.0.0.1:8080".into()),
+            host_override: None,
+            max_body_bytes: 1024,
+            websockets: None,
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("forward.target must be an http:// URL"));
+
+        // Target with missing authority is parsed as invalid URI or missing authority
+        cfg.forward = Some(ForwardConfig {
+            target: Some("http://".into()),
+            host_override: None,
+            max_body_bytes: 1024,
+            websockets: None,
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("must have an authority")
+                || format!("{err}").contains("is not a valid URI")
+        );
+
+        // Target with unparseable URI
+        cfg.forward = Some(ForwardConfig {
+            target: Some("http://[::1".into()),
+            host_override: None,
+            max_body_bytes: 1024,
+            websockets: None,
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("is not a valid URI"));
+
+        // Invalid host override (contains CRLF)
+        cfg.forward = Some(ForwardConfig {
+            target: Some("http://127.0.0.1:8080".into()),
+            host_override: Some("localhost\r\nHeader: value".into()),
+            max_body_bytes: 1024,
+            websockets: None,
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("must be a valid HTTP header value"));
     }
 
     #[test]
