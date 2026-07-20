@@ -1098,19 +1098,67 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // BOLT OPTIMIZATION:
+    // Single pass over all resource records in the packet to collect and bucket-sort
+    // the fragments. This eliminates the O(N^2) complexity of multiple lookups
+    // and scans, resolving a key performance bottleneck on fragment reassembly.
+    let origin = packet.public_key().to_z32();
+    let prefix = format!("{base}-");
+    let mut seen_count = [0u8; 256];
+    let mut idx_to_txt: Vec<Option<String>> = vec![None; 256];
+
+    for rr in packet.all_resource_records() {
+        let rr_name_str = rr.name.to_string();
+        let trimmed_name = rr_name_str.strip_suffix('.').unwrap_or(&rr_name_str);
+        if let Some(suffix) = trimmed_name.strip_prefix(&prefix) {
+            let mut parts = suffix.split('.');
+            if let Some(idx_str) = parts.next() {
+                if let Ok(idx) = idx_str.parse::<u8>() {
+                    let is_match = match parts.next() {
+                        Some(rem) => rem == origin && parts.next().is_none(),
+                        None => true,
+                    };
+                    if is_match {
+                        // Robustness: explicit bounds check on fragment indices before bucket access.
+                        if (idx as usize) >= idx_to_txt.len() {
+                            return Err(PkarrError::MalformedCanonical(
+                                "answer fragment index out of bounds",
+                            ));
+                        }
+                        if let RData::TXT(txt) = &rr.rdata {
+                            seen_count[idx as usize] += 1;
+                            if seen_count[idx as usize] > 1 {
+                                // Multiple TXTs at the same name/idx → malformed.
+                                return Err(PkarrError::MultipleOpenhostRecords);
+                            }
+                            let mut out = String::new();
+                            for (key, value) in txt.iter_raw() {
+                                out.push_str(
+                                    core::str::from_utf8(key)
+                                        .map_err(|_| PkarrError::InvalidUtf8)?,
+                                );
+                                if let Some(v) = value {
+                                    out.push('=');
+                                    out.push_str(
+                                        core::str::from_utf8(v)
+                                            .map_err(|_| PkarrError::InvalidUtf8)?,
+                                    );
+                                }
+                            }
+                            idx_to_txt[idx as usize] = Some(out);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    // Backward compatibility: return Ok(None) if fragment 0 is absent.
+    let Some(first_text) = idx_to_txt[0].as_ref() else {
         return Ok(None);
     };
+
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
     let first = decode_fragment(&first_bytes)?;
     if first.idx != 0 {
@@ -1123,10 +1171,17 @@ pub fn decode_answer_fragments_from_packet(
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        // Robustness: explicit bounds check on fragment indices before bucket access.
+        if (i as usize) >= idx_to_txt.len() {
+            return Err(PkarrError::MalformedCanonical(
+                "answer fragment index out of bounds",
+            ));
+        }
+        let text = idx_to_txt[i as usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
