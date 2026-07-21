@@ -1073,6 +1073,18 @@ pub fn decode_offer_from_packet(
     Ok(Some(OfferRecord { sealed }))
 }
 
+fn extract_txt_value(txt: &pkarr::dns::rdata::TXT<'_>) -> Result<String> {
+    let mut out = String::new();
+    for (key, value) in txt.iter_raw() {
+        out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+        if let Some(v) = value {
+            out.push('=');
+            out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+        }
+    }
+    Ok(out)
+}
+
 /// Scan `packet` for fragmented `_answer-<client-hash>-<idx>` TXT
 /// records addressed to `client_pk`, reassemble them, and return the
 /// resulting [`AnswerEntry`] with the concatenated sealed ciphertext.
@@ -1098,19 +1110,44 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // Optimized: Single-pass bucket-sort over all resource records in the packet.
+    // Avoids walking the resource record list O(N) times for N fragments,
+    // which protects against O(N^2) pathologically large N and reduces overhead.
+    let origin = packet.public_key().to_z32();
+    let prefix = format!("{base}-");
+    let mut buckets: [Option<String>; 256] = core::array::from_fn(|_| None);
+    let mut has_any = false;
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            let name_str = rr.name.to_string();
+            let name_trimmed = name_str.strip_suffix('.').unwrap_or(&name_str);
+            if let Some(rest) = name_trimmed.strip_prefix(&prefix) {
+                if let Some(idx_str) = rest.strip_suffix(&origin) {
+                    if let Some(idx_str) = idx_str.strip_suffix('.') {
+                        if let Ok(idx) = idx_str.parse::<u8>() {
+                            if buckets[idx as usize].is_some() {
+                                return Err(PkarrError::MultipleOpenhostRecords);
+                            }
+                            let val = extract_txt_value(txt)?;
+                            buckets[idx as usize] = Some(val);
+                            has_any = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !has_any {
+        return Ok(None);
+    }
+
+    // Fragment 0 must exist for reassembly. Missing fragment 0 implies no answer.
+    let Some(first_text) = &buckets[0] else {
         return Ok(None);
     };
+
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
     let first = decode_fragment(&first_bytes)?;
     if first.idx != 0 {
@@ -1120,13 +1157,20 @@ pub fn decode_answer_fragments_from_packet(
     }
     let total = first.total;
 
+    if total as usize > buckets.len() {
+        return Err(PkarrError::MalformedCanonical(
+            "answer fragment total exceeds maximum allowable fragments",
+        ));
+    }
+
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let Some(text) = &buckets[i as usize] else {
+            return Err(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ));
+        };
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
