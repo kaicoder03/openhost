@@ -1,0 +1,4 @@
+## 2026-07-15 - Strict RFC 7230 Header Parsing
+**Vulnerability:** Hand-rolled HTTP request parsers that are lenient with whitespace surrounding header names (e.g., using `.trim()` on header names before validation) can accept requests containing whitespace before the colon (e.g., `Host : example.com`), which violates RFC 7230 §3.2.4 and can lead to request smuggling vulnerabilities in downstream/upstream forwarding proxies.
+**Learning:** Even though `HeaderName::from_bytes` validates header names, preprocessing them with `.trim()` masks illegal leading or trailing whitespace. RFC 7230 strictly prohibits any whitespace between the header name and the colon, while OWS is allowed (and must be trimmed) at both ends of header values.
+**Prevention:** Never use a generic `.trim()` on header names when parsing HTTP requests. Instead, explicitly check for and reject any whitespace before the colon, and only trim OWS (SP/HTAB) from the start and end of header values.
