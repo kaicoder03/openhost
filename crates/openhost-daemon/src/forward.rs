@@ -197,7 +197,7 @@ impl Forwarder {
         // path below.
         if is_websocket_upgrade(&headers) {
             match self.websockets.as_ref() {
-                Some(cfg) if cfg.is_allowed(&path) => {
+                Some(cfg) if cfg.is_allowed(path) => {
                     return self
                         .forward_websocket(method, path, headers, body)
                         .await
@@ -212,7 +212,7 @@ impl Forwarder {
         // Build the outbound URI by combining the target origin with the
         // request path. The path comes from the client verbatim; no
         // rewriting this PR.
-        let target_uri = combine_target_and_path(&self.target, &path)?;
+        let target_uri = combine_target_and_path(&self.target, path)?;
 
         let mut req_builder = Request::builder().method(method).uri(target_uri);
         // Replace the HeaderMap wholesale — simpler than iterating and
@@ -279,12 +279,12 @@ impl Forwarder {
     async fn forward_websocket(
         &self,
         method: Method,
-        path: String,
+        path: &str,
         mut headers: HeaderMap,
         body: Bytes,
     ) -> Result<WebSocketUpgrade, ForwardError> {
         sanitize_websocket_request_headers(&mut headers, &self.host_override)?;
-        let target_uri = combine_target_and_path(&self.target, &path)?;
+        let target_uri = combine_target_and_path(&self.target, path)?;
         let mut req_builder = Request::builder().method(method).uri(target_uri);
         if let Some(req_headers) = req_builder.headers_mut() {
             *req_headers = headers;
@@ -340,7 +340,7 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 ///
 /// Rejects HTTP/0.9, HTTP/1.0, HTTP/2+, missing blank line, and any
 /// obvious line-ending confusion (bare `\n` inside headers).
-fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), ForwardError> {
+fn parse_request_head(bytes: &[u8]) -> Result<(Method, &str, HeaderMap), ForwardError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ForwardError::HeadParse("request head is not valid UTF-8"))?;
 
@@ -361,8 +361,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         .ok_or(ForwardError::HeadParse("request line missing method"))?;
     let path = parts
         .next()
-        .ok_or(ForwardError::HeadParse("request line missing path"))?
-        .to_string();
+        .ok_or(ForwardError::HeadParse("request line missing path"))?;
     let version = parts
         .next()
         .ok_or(ForwardError::HeadParse("request line missing HTTP version"))?;
@@ -474,6 +473,7 @@ fn encode_websocket_response_head(
 }
 
 /// Build `http://<target-authority><path>` for the outbound request.
+/// Optimized to format the full URL string in a single step, reducing allocations.
 fn combine_target_and_path(target: &Uri, path: &str) -> Result<Uri, ForwardError> {
     let authority = target
         .authority()
@@ -491,13 +491,12 @@ fn combine_target_and_path(target: &Uri, path: &str) -> Result<Uri, ForwardError
         path
     };
 
-    let path_and_query = if path_str.is_empty() || !path_str.starts_with('/') {
-        format!("/{path_str}")
+    let uri_str = if path_str.is_empty() || !path_str.starts_with('/') {
+        format!("http://{authority}/{path_str}")
     } else {
-        path_str.to_string()
+        format!("http://{authority}{path_str}")
     };
 
-    let uri_str = format!("http://{authority}{path_and_query}");
     uri_str
         .parse()
         .map_err(|_| ForwardError::HeadParse("could not combine target + path into a URI"))
