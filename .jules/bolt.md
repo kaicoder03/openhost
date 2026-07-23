@@ -1,0 +1,3 @@
+## 2026-07-20 - [Zero-allocation path borrowing & single-allocation URI building]
+**Learning:** Returning an owned `String` from `parse_request_head` allocated unnecessarily for every request's path. Furthermore, building up the destination URI in `combine_target_and_path` using intermediary formatted strings resulted in multiple allocations per proxy request.
+**Action:** Changed `parse_request_head` to return a zero-allocation `&str` reference for the path. Simplified URI construction in `combine_target_and_path` to build the full destination URL directly in a single formatting step, reducing intermediary allocations.
