@@ -1,0 +1,4 @@
+## 2026-07-25 - Unix file creation permission race condition prevention
+**Vulnerability:** Unix file-creation permission race conditions where sensitive files (Ed25519 identity seeds, DTLS certs, and pairing allowlists) are initially created with default umask permissions before being restricted via `set_permissions`, leaving a brief Time-of-Check to Time-of-Use (TOCTOU) timing window during which other local users could read the sensitive keys or certificates.
+**Learning:** Using `set_permissions` after file creation is insecure on multi-user systems. Instead, `OpenOptions::new().mode(0o600)` must be used at creation time to ensure files are atomically created with restrictive permissions from the very first instruction.
+**Prevention:** Always use `OpenOptions` (either `std::fs` or `tokio::fs`) with `OpenOptionsExt::mode(0o600)` at creation time when writing highly sensitive files.
