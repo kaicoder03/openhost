@@ -227,19 +227,22 @@ pub async fn run(file: PathBuf) -> Result<()> {
 }
 
 async fn write_seed(path: &Path, seed: &[u8; 32]) -> Result<()> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        #[allow(unused_imports)]
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
     use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path)
+    let mut f = options
+        .open(path)
         .await
         .with_context(|| format!("create identity file: {}", path.display()))?;
     f.write_all(seed).await?;
     f.flush().await?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(path, perms).await?;
-    }
     Ok(())
 }
 
