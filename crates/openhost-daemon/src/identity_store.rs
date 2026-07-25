@@ -106,14 +106,20 @@ pub async fn load_or_create(store: &dyn KeyStore) -> DaemonResult<SigningKey> {
 /// grants.
 async fn write_mode_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, bytes).await?;
 
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(&tmp, perms).await?;
+        #[allow(unused_imports)]
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+
+    use tokio::io::AsyncWriteExt;
+    let mut file = options.open(&tmp).await?;
+    file.write_all(bytes).await?;
+    file.flush().await?;
 
     tokio::fs::rename(&tmp, path).await
 }
