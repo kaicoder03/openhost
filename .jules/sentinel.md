@@ -1,0 +1,4 @@
+## 2026-07-28 - Unix File Creation Permission Race Condition
+**Vulnerability:** When highly sensitive files (such as Ed25519 seeds, DTLS certs, allowlists) are created using default file-creation functions and then have their permissions updated using `set_permissions` afterwards, a small Time-of-Check to Time-of-Use (TOCTOU) timing window is introduced where other local users can read the sensitive file before the permissions are tightened.
+**Learning:** Standard file-creation operations on POSIX respect the current process `umask`, which often permits other local users to read created files. Tightening the permissions with `chmod` or `set_permissions` immediately after creation does not close the window between creation and permission modification.
+**Prevention:** Always create highly sensitive files atomically with `0o600` permissions (read/write by owner only) using `OpenOptions::new().mode(0o600)` at creation time, eliminating any race condition window.
