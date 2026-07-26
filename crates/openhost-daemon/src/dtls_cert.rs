@@ -144,13 +144,20 @@ async fn write_pem_bundle(path: &Path, pem: &str) -> std::io::Result<()> {
         }
     }
     let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, pem).await?;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(&tmp, perms).await?;
+        #[allow(unused_imports)]
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    use tokio::io::AsyncWriteExt as _;
+    let mut f = options.open(&tmp).await?;
+    f.write_all(pem.as_bytes()).await?;
+    f.flush().await?;
+
     tokio::fs::rename(&tmp, path).await
 }
 
