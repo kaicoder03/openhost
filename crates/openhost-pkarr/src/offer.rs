@@ -1100,67 +1100,70 @@ pub fn decode_answer_fragments_from_packet(
 
     // Optimized fragment reassembly: single-pass over the packet's resource records
     // with O(1) bucket-sort by index to prevent O(N^2) complexity in reassembly.
-    let mut buckets: Vec<Option<DecodedFragment>> = std::iter::repeat_with(|| None)
-        .take(256)
-        .collect();
+    let mut buckets: Vec<Option<DecodedFragment>> =
+        std::iter::repeat_with(|| None).take(256).collect();
     let mut chunk_total = None;
 
     for rr in packet.all_resource_records() {
         if let RData::TXT(txt) = &rr.rdata {
             let first_label_opt = rr.name.get_labels().first();
 
-            let label_str = if let Some(first_label) = first_label_opt {
-                first_label.to_string()
+            let label_bytes = if let Some(first_label) = first_label_opt {
+                first_label.as_ref()
             } else {
                 continue;
             };
 
-            if let Some(suffix) = label_str.strip_prefix(&base) {
-                if let Some(idx_str) = suffix.strip_prefix('-') {
-                    if let Ok(idx) = idx_str.parse::<usize>() {
-                        // Explicit bounds check on fragment indices before bucket access
-                        if idx >= 256 {
-                            continue;
-                        }
-
-                        let mut out = String::new();
-                        for (key, value) in txt.iter_raw() {
-                            out.push_str(
-                                core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?,
-                            );
-                            if let Some(v) = value {
-                                out.push('=');
-                                out.push_str(
-                                    core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?,
-                                );
+            if let Some(suffix_bytes) = label_bytes.strip_prefix(base.as_bytes()) {
+                if let Some(idx_bytes) = suffix_bytes.strip_prefix(b"-") {
+                    if let Ok(idx_str) = core::str::from_utf8(idx_bytes) {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            // Explicit bounds check on fragment indices before bucket access
+                            if idx >= 256 {
+                                continue;
                             }
-                        }
 
-                        let bytes = URL_SAFE_NO_PAD.decode(out.as_bytes())?;
-                        let frag = decode_fragment(&bytes)?;
+                            let mut out = String::new();
+                            for (key, value) in txt.iter_raw() {
+                                out.push_str(
+                                    core::str::from_utf8(key)
+                                        .map_err(|_| PkarrError::InvalidUtf8)?,
+                                );
+                                if let Some(v) = value {
+                                    out.push('=');
+                                    out.push_str(
+                                        core::str::from_utf8(v)
+                                            .map_err(|_| PkarrError::InvalidUtf8)?,
+                                    );
+                                }
+                            }
 
-                        if frag.idx as usize != idx {
-                            return Err(PkarrError::MalformedCanonical(
-                                "answer fragment idx disagrees with its DNS label suffix",
-                            ));
-                        }
+                            let bytes = URL_SAFE_NO_PAD.decode(out.as_bytes())?;
+                            let frag = decode_fragment(&bytes)?;
 
-                        if let Some(total) = chunk_total {
-                            if frag.total != total {
+                            if frag.idx as usize != idx {
                                 return Err(PkarrError::MalformedCanonical(
-                                    "answer fragments disagree on chunk_total",
+                                    "answer fragment idx disagrees with its DNS label suffix",
                                 ));
                             }
-                        } else {
-                            chunk_total = Some(frag.total);
-                        }
 
-                        if buckets[idx].is_some() {
-                            // Multiple TXTs at the same name -> malformed.
-                            return Err(PkarrError::MultipleOpenhostRecords);
-                        }
+                            if let Some(total) = chunk_total {
+                                if frag.total != total {
+                                    return Err(PkarrError::MalformedCanonical(
+                                        "answer fragments disagree on chunk_total",
+                                    ));
+                                }
+                            } else {
+                                chunk_total = Some(frag.total);
+                            }
 
-                        buckets[idx] = Some(frag);
+                            if buckets[idx].is_some() {
+                                // Multiple TXTs at the same name -> malformed.
+                                return Err(PkarrError::MultipleOpenhostRecords);
+                            }
+
+                            buckets[idx] = Some(frag);
+                        }
                     }
                 }
             }
