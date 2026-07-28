@@ -1,0 +1,3 @@
+## 2026-07-20 - O(N) Single-Pass Bucket-Sort Fragment Reassembly Optimization
+**Learning:** The previous implementation of `decode_answer_fragments_from_packet` used `collect_single_txt` to probe each index sequentially. This resulted in O(N^2) complexity with multiple packet scans (chunk_total scans), which becomes a bottleneck when there are many fragments (up to 255). A single-pass scan over `packet.all_resource_records()` using a bucket-sort approach achieves O(N) time complexity and avoids redundant lookups.
+**Action:** Use a single-pass iteration with bucket sort for any packet reassembly tasks where multiple related TXT records are fetched.
