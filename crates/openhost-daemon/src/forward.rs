@@ -383,9 +383,17 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name_raw = &line[..colon];
+        // RFC 7230 §3.2.4: No whitespace is allowed between the header field-name and colon.
+        // Also reject starting the header line with whitespace (reconstructed request header fields).
+        if name_raw.starts_with([' ', '\t']) || name_raw.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace surrounding header name violates RFC 7230 §3.2.4",
+            ));
+        }
+        let name = name_raw;
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` at the start and end of value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +790,39 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_header_whitespace_surrounding_name() {
+        // Space before colon
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(msg) if msg.contains("RFC 7230 §3.2.4")));
+
+        // Tab before colon
+        let raw = b"GET / HTTP/1.1\r\nHost\t: example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(msg) if msg.contains("RFC 7230 §3.2.4")));
+
+        // Space starting the header line (obvious line folding / request smuggling attempt)
+        let raw = b"GET / HTTP/1.1\r\n Host: example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(msg) if msg.contains("RFC 7230 §3.2.4")));
+
+        // Tab starting the header line
+        let raw = b"GET / HTTP/1.1\r\n\tHost: example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(msg) if msg.contains("RFC 7230 §3.2.4")));
+    }
+
+    #[test]
+    fn parse_request_head_trims_ows_from_value() {
+        let raw = b"GET / HTTP/1.1\r\nHost:  example.com \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(
+            headers.get("host").unwrap().to_str().unwrap(),
+            "example.com"
+        );
     }
 
     // --- Response head encoder --------------------------------------
