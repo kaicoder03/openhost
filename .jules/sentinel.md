@@ -1,0 +1,4 @@
+## 2026-07-28 - Strict Compliance with RFC 7230 §3.2.4 to Prevent HTTP Request Smuggling
+**Vulnerability:** HTTP forwarders parsing un-sanitized client request headers can be vulnerable to HTTP request smuggling if they permit leading/trailing whitespace surrounding header names (or before colons) and pass them upstream. A downstream proxy might split headers differently than the upstream.
+**Learning:** In the openhost daemon forwarder (`parse_request_head`), we originally trimmed spaces/tabs from header names after separating them by `:`. This deviates from RFC 7230 §3.2.4 which strictly prohibits any whitespace surrounding a header name and requires rejecting such requests.
+**Prevention:** Explicitly reject any request with whitespace preceding the colon or starting the request header line, and strictly trim Optional WhiteSpace (OWS) from both ends of header values.
