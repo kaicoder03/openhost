@@ -1,0 +1,4 @@
+## 2026-07-28 - Secure Unix File Creation
+**Vulnerability:** Unix file-creation permission race conditions (TOCTOU). When creating sensitive files (such as Ed25519 seeds, DTLS certs, and client allowlists), writing the file first and then setting permissions using `chmod` / `PermissionsExt::set_permissions` leaves a brief timing window where the file is created with default permissions (like 0644 or 0666) and can be read by other local users before permissions are narrowed.
+**Learning:** Setting the permissions on the `OpenOptions` before calling `open` / `create` sets the file creation mode atomically on Unix, closing this timing window.
+**Prevention:** Always use `std::fs::OpenOptions` or `tokio::fs::OpenOptions` with `.mode(0o600)` on Unix when creating highly sensitive files to prevent access-control race conditions.
