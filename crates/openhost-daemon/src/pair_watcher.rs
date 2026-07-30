@@ -289,7 +289,10 @@ mod tests {
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
 
         // Drain any immediate startup/noisy events (e.g. from the initial write of allow.toml)
-        while tokio::time::timeout(Duration::from_millis(100), watcher.recv()).await.is_ok() {}
+        while tokio::time::timeout(Duration::from_millis(100), watcher.recv())
+            .await
+            .is_ok()
+        {}
 
         fs::write(&sibling, b"unrelated").unwrap();
 
