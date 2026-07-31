@@ -1098,17 +1098,49 @@ pub fn decode_answer_fragments_from_packet(
         zbase32::encode_full_bytes(&client_hash)
     );
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // Optimized: O(N) single-pass bucket sort of answer fragments.
+    let mut seen_txt_counts = [0usize; 256];
+    let mut txt_contents: Vec<Option<String>> = std::iter::repeat_with(|| None).take(256).collect();
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            let first_label = rr.name.get_labels().first();
+            if let Some(label) = first_label {
+                if let Ok(label_str) = std::str::from_utf8(label.as_ref()) {
+                    let label_str = label_str.strip_suffix('.').unwrap_or(label_str);
+                    if let Some(suffix) = label_str.strip_prefix(&base) {
+                        if let Some(idx_str) = suffix.strip_prefix('-') {
+                            if let Ok(idx) = idx_str.parse::<u8>() {
+                                let idx_usize = idx as usize;
+                                seen_txt_counts[idx_usize] += 1;
+                                if seen_txt_counts[idx_usize] > 1 {
+                                    return Err(PkarrError::MultipleOpenhostRecords);
+                                }
+
+                                let mut out = String::new();
+                                for (key, value) in txt.iter_raw() {
+                                    out.push_str(
+                                        core::str::from_utf8(key)
+                                            .map_err(|_| PkarrError::InvalidUtf8)?,
+                                    );
+                                    if let Some(v) = value {
+                                        out.push('=');
+                                        out.push_str(
+                                            core::str::from_utf8(v)
+                                                .map_err(|_| PkarrError::InvalidUtf8)?,
+                                        );
+                                    }
+                                }
+                                txt_contents[idx_usize] = Some(out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(first_text) = &txt_contents[0] else {
         return Ok(None);
     };
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
@@ -1123,10 +1155,12 @@ pub fn decode_answer_fragments_from_packet(
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let i_usize = i as usize;
+        let text = txt_contents[i_usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
