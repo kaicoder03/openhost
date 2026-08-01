@@ -1,0 +1,3 @@
+## 2026-07-28 - DNS Packet Single-Pass Fragment Reassembly with O(N) Bucket Sort
+**Learning:** Sequential DNS packet record queries using `packet.resource_records(name)` scale quadratically O(N^2) in the number of fragments because each query scans all packet records, performing repetitive string formatting and allocations. By using `packet.all_resource_records()` and `get_labels().first()` with a fixed-size `Vec<Option<DecodedFragment>>` array of size 256, we can reassemble fragments in a single O(N) pass with zero string formatting/allocations on mismatching labels.
+**Action:** Always prefer single-pass linear scans over sequential multiple-probing queries for packet-level or collection-level reassembly tasks in pkarr/DNS parsing.
