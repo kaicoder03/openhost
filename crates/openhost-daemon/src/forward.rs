@@ -383,9 +383,15 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name_raw = &line[..colon];
+        if name_raw.starts_with([' ', '\t']) || name_raw.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "whitespace surrounding header name is forbidden",
+            ));
+        }
+        let name = name_raw;
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` on both ends of the value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -754,6 +760,32 @@ mod tests {
         assert_eq!(path, "/foo/bar?x=1");
         assert_eq!(headers.get("host").unwrap(), "example");
         assert_eq!(headers.get("x-custom").unwrap(), "yes");
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_surrounding_header_name() {
+        // Space before colon
+        let raw1 = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        assert!(parse_request_head(raw1).is_err());
+
+        // Tab before colon
+        let raw2 = b"GET / HTTP/1.1\r\nHost\t: example\r\n\r\n";
+        assert!(parse_request_head(raw2).is_err());
+
+        // Space before header name (leading)
+        let raw3 = b"GET / HTTP/1.1\r\n Host: example\r\n\r\n";
+        assert!(parse_request_head(raw3).is_err());
+
+        // Tab before header name (leading)
+        let raw4 = b"GET / HTTP/1.1\r\n\tHost: example\r\n\r\n";
+        assert!(parse_request_head(raw4).is_err());
+    }
+
+    #[test]
+    fn parse_request_head_trims_value_ows() {
+        let raw = b"GET / HTTP/1.1\r\nHost: \t example \t\r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example");
     }
 
     #[test]
