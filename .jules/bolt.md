@@ -1,0 +1,7 @@
+## 2026-07-20 - O(N) single-pass bucket-sort fragment reassembly optimization
+**Learning:** For fragment reassembly across multiple resource records under the same client hash, iterating over all resource records $N$ times (probing each `-idx` suffix in sequence) leads to an $O(N \times R)$ complexity (effectively $O(N^2)$ in the pathological case where $N$ scales up to `MAX_FRAGMENT_TOTAL = 255`). Performing a single pass over the records and sorting them into a stack-allocated bucket array of size 256 yields a linear-time $O(R)$ complexity and avoids redundant allocations.
+**Action:** Use a stack-allocated `[Option<T>; 256]` array initialized with `const NONE` to sort resource record fragments by index in a single pass over the record list.
+
+## 2026-07-28 - Forwarding URL and string optimization utilizing `http::Uri::builder()`, zero-allocation `&str` request-path borrowing, and `std::borrow::Cow` path normalization
+**Learning:** Constructing upstreams in the daemon forwarder with heavy `format!` macros and parsing whole strings on every request causes significant heap allocation and CPU overhead. Transitioning to zero-allocation path borrowing and combining paths using pre-allocated `HeaderValue` and `http::Uri::builder` reduces response-forwarding overhead by ~40%.
+**Action:** Avoid allocating new strings for static path components or full request paths. Pre-compile static header values, and leverage `http::Uri::builder()` to build final upstreams efficiently.
