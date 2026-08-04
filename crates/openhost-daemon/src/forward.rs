@@ -383,9 +383,14 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
+        let name = &line[..colon];
+        if name.starts_with([' ', '\t']) || name.ends_with([' ', '\t']) {
+            return Err(ForwardError::HeadParse(
+                "header name cannot contain surrounding whitespace",
+            ));
+        }
         // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -761,6 +766,36 @@ mod tests {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_around_header_name() {
+        // Space before colon
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(_)));
+
+        // Tab before colon
+        let raw = b"GET / HTTP/1.1\r\nHost\t: example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(_)));
+
+        // Leading space
+        let raw = b"GET / HTTP/1.1\r\n Host: example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(_)));
+
+        // Leading tab
+        let raw = b"GET / HTTP/1.1\r\n\tHost: example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_trims_optional_whitespace_in_values() {
+        let raw = b"GET / HTTP/1.1\r\nHost:  example.com  \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example.com");
     }
 
     #[test]
