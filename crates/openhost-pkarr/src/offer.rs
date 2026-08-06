@@ -1097,20 +1097,61 @@ pub fn decode_answer_fragments_from_packet(
         "{ANSWER_TXT_PREFIX}{}",
         zbase32::encode_full_bytes(&client_hash)
     );
+    let prefix = format!("{}-", base);
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // Optimize DNS fragment reassembly using a single pass over packet.all_resource_records()
+    // with an O(N) bucket-sort by the numeric label suffix.
+    let mut text_buckets: [Option<String>; 256] = {
+        const NONE: Option<String> = None;
+        [NONE; 256]
+    };
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            let Some(first_label) = rr.name.get_labels().first() else {
+                continue;
+            };
+
+            let label_bytes = first_label.as_ref();
+            if label_bytes.starts_with(prefix.as_bytes()) {
+                let suffix = &label_bytes[prefix.len()..];
+                let Ok(idx_str) = core::str::from_utf8(suffix) else {
+                    continue;
+                };
+                let Ok(idx) = idx_str.parse::<u8>() else {
+                    continue;
+                };
+
+                if text_buckets[idx as usize].is_some() {
+                    return Err(PkarrError::MultipleOpenhostRecords);
+                }
+
+                let mut capacity = 0;
+                for (key, value) in txt.iter_raw() {
+                    capacity += key.len();
+                    if let Some(v) = value {
+                        capacity += 1 + v.len();
+                    }
+                }
+
+                let mut out = String::with_capacity(capacity);
+                for (key, value) in txt.iter_raw() {
+                    out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+                    if let Some(v) = value {
+                        out.push('=');
+                        out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+                    }
+                }
+                text_buckets[idx as usize] = Some(out);
+            }
+        }
+    }
+
+    // Return Ok(None) if fragment 0 is absent to maintain backward compatibility.
+    let Some(first_text) = text_buckets[0].as_ref() else {
         return Ok(None);
     };
+
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
     let first = decode_fragment(&first_bytes)?;
     if first.idx != 0 {
@@ -1120,13 +1161,18 @@ pub fn decode_answer_fragments_from_packet(
     }
     let total = first.total;
 
-    let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
-    fragments.push(first);
+    let mut buckets: [Option<DecodedFragment>; 256] = {
+        const NONE: Option<DecodedFragment> = None;
+        [NONE; 256]
+    };
+    buckets[0] = Some(first);
+
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let text = text_buckets[i as usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
@@ -1139,11 +1185,17 @@ pub fn decode_answer_fragments_from_packet(
                 "answer fragment idx disagrees with its DNS label suffix",
             ));
         }
-        fragments.push(frag);
+        buckets[i as usize] = Some(frag);
     }
 
-    let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
-    for frag in fragments {
+    let mut capacity = 0;
+    for i in 0..total {
+        capacity += buckets[i as usize].as_ref().unwrap().payload.len();
+    }
+
+    let mut sealed = Vec::with_capacity(capacity);
+    for i in 0..total {
+        let frag = buckets[i as usize].take().unwrap();
         sealed.extend_from_slice(&frag.payload);
     }
 

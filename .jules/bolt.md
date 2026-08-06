@@ -1,0 +1,3 @@
+## 2026-07-28 - DNS Fragment Reassembly Bucket-Sort Optimization
+**Learning:** Iterating over `SignedPacket` resource records multiple times using filter probes like `collect_single_txt` results in O(N²) traversal overhead in pathological scenarios. Reassembling fragments using a single pass with a stack-allocated bucket array `[Option<String>; 256]` and an index suffix-matching lookup reduces complexity to O(N) and avoids unnecessary heap allocations and cloning.
+**Action:** Always prefer single-pass filtering and sorting into pre-sized array buffers over repetitive queries/filtering when dealing with serialized DNS packets or packet-like structures.
