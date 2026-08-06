@@ -386,7 +386,9 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let name_raw = &line[..colon];
         // RFC 7230 §3.2.4: Reject if whitespace exists between header-name and colon
         if name_raw.ends_with(' ') || name_raw.ends_with('\t') {
-            return Err(ForwardError::HeadParse("whitespace before colon in header name"));
+            return Err(ForwardError::HeadParse(
+                "whitespace before colon in header name",
+            ));
         }
         let name = name_raw.trim();
         if name.is_empty() {
