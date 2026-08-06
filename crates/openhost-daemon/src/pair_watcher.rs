@@ -287,7 +287,14 @@ mod tests {
 
         let mut watcher =
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Give the backend time to start and report any initial events.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Drain any start-up events (common on macOS/FSEvents).
+        while tokio::time::timeout(Duration::from_millis(200), watcher.recv())
+            .await
+            .is_ok()
+        {}
 
         fs::write(&sibling, b"unrelated").unwrap();
 
