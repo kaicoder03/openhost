@@ -1,0 +1,3 @@
+## 2026-07-28 - HTTP response encoding optimization
+**Learning:** `format!` and `.to_string()` allocations in high-throughput network routing/forwarding paths introduce massive CPU and heap allocation bottlenecks. Directly appending static bytes or pre-formatted byte chunks (using `status.as_str().as_bytes()`) and constructing integer headers directly using `HeaderValue::from(u64)` removes dynamic layout calculation, string parsing, and intermediate string allocations entirely.
+**Action:** Avoid formatting / parsing and string allocations on the forwarder's response path. Use `HeaderValue::from(u64)` and manual/sequential `extend_from_slice` buffer building.
