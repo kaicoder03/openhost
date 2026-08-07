@@ -615,6 +615,7 @@ async fn complete_binding(
             ClientBindingError::ExporterLength(exporter.len()),
         ));
     }
+    let exporter = Zeroizing::new(exporter);
 
     // Wait for AuthNonce.
     let nonce_frame = inbound.next_frame(timeout).await?;
