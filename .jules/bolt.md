@@ -1,0 +1,3 @@
+## 2026-07-28 - O(N) single-pass bucket-sort fragment reassembly optimization
+**Learning:** Reassembling fragmented DNS packets originally performed multiple linear scans with `collect_single_txt` probes. This yielded O(N²) complexity in pathological cases with up to 255 fragments. Using a single-pass loop with a stack-allocated bucket array of size 256 completely resolves this performance bottleneck without any heap allocations.
+**Action:** When scanning and reassembling resource records in a DNS packet, prefer a single-pass iteration with a pre-allocated stack bucket array rather than repeated linear lookups.
