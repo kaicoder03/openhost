@@ -1,0 +1,3 @@
+## 2026-07-20 - O(N) single-pass bucket-sort fragment reassembly optimization
+**Learning:** Walking the resource record list O(N²) times is highly inefficient in the pathological case of MAX_FRAGMENT_TOTAL=255. By using `packet.all_resource_records()` and bucket-sorting the fragments into a stack-allocated array (of size 256) by their numeric index suffix in a single O(N) pass, we completely eliminate duplicate lookup walks and minimize memory allocation overhead.
+**Action:** Always prefer a single-pass scan with a bounded stack-allocated index array/bucket list when reassembling indexed packet structures rather than doing N repeated lookups.
