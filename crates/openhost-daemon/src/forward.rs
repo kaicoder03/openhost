@@ -383,9 +383,18 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name = &line[..colon];
+        if name.starts_with(' ')
+            || name.starts_with('\t')
+            || name.ends_with(' ')
+            || name.ends_with('\t')
+        {
+            return Err(ForwardError::HeadParse(
+                "whitespace surrounding header name is forbidden by RFC 7230",
+            ));
+        }
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` at both ends of the value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -782,6 +791,36 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_surrounding_whitespace_in_header_name() {
+        // Space before the colon
+        let raw1 = b"GET / HTTP/1.1\r\nHost : example\r\n\r\n";
+        let err1 = parse_request_head(raw1).unwrap_err();
+        assert!(matches!(err1, ForwardError::HeadParse(_)));
+
+        // Tab before the colon
+        let raw2 = b"GET / HTTP/1.1\r\nHost\t: example\r\n\r\n";
+        let err2 = parse_request_head(raw2).unwrap_err();
+        assert!(matches!(err2, ForwardError::HeadParse(_)));
+
+        // Space at the start of header name
+        let raw3 = b"GET / HTTP/1.1\r\n Host: example\r\n\r\n";
+        let err3 = parse_request_head(raw3).unwrap_err();
+        assert!(matches!(err3, ForwardError::HeadParse(_)));
+
+        // Tab at the start of header name
+        let raw4 = b"GET / HTTP/1.1\r\n\tHost: example\r\n\r\n";
+        let err4 = parse_request_head(raw4).unwrap_err();
+        assert!(matches!(err4, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_trims_ows_at_both_ends_of_value() {
+        let raw = b"GET / HTTP/1.1\r\nHost:  example.com\t \r\n\r\n";
+        let (_, _, headers) = parse_request_head(raw).unwrap();
+        assert_eq!(headers.get("host").unwrap(), "example.com");
     }
 
     // --- Response head encoder --------------------------------------
