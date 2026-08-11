@@ -247,6 +247,13 @@ mod tests {
         // Give the backend a moment to start; notify-debouncer-mini's
         // first tick after `watch` is somewhat backend-dependent.
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain any startup events that may have fired on noisy OS platforms (like macOS FSEvents)
+        while tokio::time::timeout(Duration::from_millis(50), watcher.recv())
+            .await
+            .is_ok()
+        {}
+
         fs::write(&path, b"pairs = [{ pubkey = \"abc\" }]\n").unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), watcher.recv())
@@ -266,6 +273,12 @@ mod tests {
         let mut watcher =
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain any startup events that may have fired on noisy OS platforms (like macOS FSEvents)
+        while tokio::time::timeout(Duration::from_millis(50), watcher.recv())
+            .await
+            .is_ok()
+        {}
 
         fs::write(&path, b"pairs = []\n").unwrap();
 
@@ -288,6 +301,12 @@ mod tests {
         let mut watcher =
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain any startup events that may have fired on noisy OS platforms (like macOS FSEvents)
+        while tokio::time::timeout(Duration::from_millis(50), watcher.recv())
+            .await
+            .is_ok()
+        {}
 
         fs::write(&sibling, b"unrelated").unwrap();
 
