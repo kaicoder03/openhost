@@ -1097,18 +1097,39 @@ pub fn decode_answer_fragments_from_packet(
         "{ANSWER_TXT_PREFIX}{}",
         zbase32::encode_full_bytes(&client_hash)
     );
+    let prefix = format!("{base}-");
 
-    // TODO(perf): replace the per-fragment `collect_single_txt` probes
-    // with a single pass over `packet.all_resource_records()` that
-    // bucket-sorts matching names by their numeric `-<idx>` suffix.
-    // Today this walks the packet's RR list `chunk_total` times — fine
-    // for the 1–3 fragments we see in practice, O(N²) in the
-    // pathological MAX_FRAGMENT_TOTAL=255 case. Not a hotpath (one
-    // reassembly per dial attempt) so the refactor is deferred.
+    // BOLT OPTIMIZATION: Instead of walking the resource record list O(N) times per fragment probe,
+    // we make a single O(N) pass over all resource records in the packet.
+    // This avoids redundant iterations and repeatedly converting Name objects to String,
+    // using a stack-allocated bucket array to sort the discovered fragments.
+    let mut buckets: [Option<String>; 256] = {
+        const NONE: Option<String> = None;
+        [NONE; 256]
+    };
 
-    // Probe idx = 0 first. Missing zero-fragment ⇒ no answer for us.
-    let first_name = format!("{base}-0");
-    let Some(first_text) = collect_single_txt(packet, &first_name)? else {
+    for rr in packet.all_resource_records() {
+        if let RData::TXT(txt) = &rr.rdata {
+            if let Some(first_label) = rr.name.get_labels().first() {
+                if let Ok(label_str) = core::str::from_utf8(first_label.as_ref()) {
+                    if let Some(suffix) = label_str.strip_prefix(&prefix) {
+                        if let Ok(idx) = suffix.parse::<u8>() {
+                            if buckets[idx as usize].is_some() {
+                                // Multiple TXTs at the same name/idx -> malformed.
+                                return Err(PkarrError::MultipleOpenhostRecords);
+                            }
+                            // Extract multi-string TXT record value
+                            let content = extract_txt_content(txt)?;
+                            buckets[idx as usize] = Some(content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Missing zero-fragment ⇒ no answer for us.
+    let Some(first_text) = &buckets[0] else {
         return Ok(None);
     };
     let first_bytes = URL_SAFE_NO_PAD.decode(first_text.as_bytes())?;
@@ -1123,10 +1144,11 @@ pub fn decode_answer_fragments_from_packet(
     let mut fragments: Vec<DecodedFragment> = Vec::with_capacity(total as usize);
     fragments.push(first);
     for i in 1..total {
-        let name = format!("{base}-{i}");
-        let text = collect_single_txt(packet, &name)?.ok_or(PkarrError::MalformedCanonical(
-            "answer fragment set is missing an idx",
-        ))?;
+        let text = buckets[i as usize]
+            .as_ref()
+            .ok_or(PkarrError::MalformedCanonical(
+                "answer fragment set is missing an idx",
+            ))?;
         let bytes = URL_SAFE_NO_PAD.decode(text.as_bytes())?;
         let frag = decode_fragment(&bytes)?;
         if frag.total != total {
@@ -1142,6 +1164,15 @@ pub fn decode_answer_fragments_from_packet(
         fragments.push(frag);
     }
 
+    // Ensure we don't have extra fragments that are past-the-end!
+    for bucket in buckets.iter().skip(total as usize) {
+        if bucket.is_some() {
+            return Err(PkarrError::MalformedCanonical(
+                "extraneous answer fragment past chunk_total",
+            ));
+        }
+    }
+
     let mut sealed = Vec::with_capacity(fragments.iter().map(|f| f.payload.len()).sum());
     for frag in fragments {
         sealed.extend_from_slice(&frag.payload);
@@ -1155,6 +1186,18 @@ pub fn decode_answer_fragments_from_packet(
         sealed,
         created_at: packet_ts_micros / MICROS_PER_SECOND,
     }))
+}
+
+fn extract_txt_content(txt: &TXT<'_>) -> Result<String> {
+    let mut out = String::new();
+    for (key, value) in txt.iter_raw() {
+        out.push_str(core::str::from_utf8(key).map_err(|_| PkarrError::InvalidUtf8)?);
+        if let Some(v) = value {
+            out.push('=');
+            out.push_str(core::str::from_utf8(v).map_err(|_| PkarrError::InvalidUtf8)?);
+        }
+    }
+    Ok(out)
 }
 
 fn collect_single_txt(packet: &SignedPacket, name: &str) -> Result<Option<String>> {
