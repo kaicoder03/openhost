@@ -1,0 +1,3 @@
+## 2026-07-20 - O(N) single-pass bucket-sort fragment reassembly optimization
+**Learning:** Reassembling fragmented answer records by sequentially probing for each index `_answer-<client-hash>-<idx>` results in walking the packet's resource records list `chunk_total` times, leading to O(N²) complexity. A single-pass iteration over `packet.all_resource_records()` using bucket sorting via a stack-allocated array of size 256 reduces the complexity to O(N) and avoids unnecessary heap allocation and redundant packet scans.
+**Action:** Always prefer a single-pass iteration over resource records with bucket sorting when reassembling fragmented protocol messages.
