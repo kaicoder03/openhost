@@ -105,15 +105,23 @@ pub async fn load_or_create(store: &dyn KeyStore) -> DaemonResult<SigningKey> {
 /// atomic on POSIX; on Windows the final mode is whatever the parent ACL
 /// grants.
 async fn write_mode_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, bytes).await?;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(&tmp, perms).await?;
+        #[allow(unused_imports)]
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+
+    let mut f = options.open(&tmp).await?;
+    f.write_all(bytes).await?;
+    f.flush().await?;
 
     tokio::fs::rename(&tmp, path).await
 }
