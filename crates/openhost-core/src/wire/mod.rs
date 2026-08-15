@@ -186,11 +186,23 @@ impl Frame {
     /// tests only.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.reserve(FRAME_V2_HEADER_LEN + self.payload.len());
-        out.push(FRAME_V2_VERSION);
-        out.push(self.frame_type.as_u8());
-        out.extend_from_slice(&self.request_id.to_be_bytes());
         let len = u32::try_from(self.payload.len()).expect("length fits in u32 by construction");
-        out.extend_from_slice(&len.to_be_bytes());
+        let id_bytes = self.request_id.to_be_bytes();
+        let len_bytes = len.to_be_bytes();
+        // Construct header on stack array and append in a single extend_from_slice call to eliminate multiple buffer pushes and slice bounds checks.
+        let header = [
+            FRAME_V2_VERSION,
+            self.frame_type.as_u8(),
+            id_bytes[0],
+            id_bytes[1],
+            id_bytes[2],
+            id_bytes[3],
+            len_bytes[0],
+            len_bytes[1],
+            len_bytes[2],
+            len_bytes[3],
+        ];
+        out.extend_from_slice(&header);
         out.extend_from_slice(&self.payload);
     }
 
@@ -200,9 +212,17 @@ impl Frame {
     #[doc(hidden)]
     pub fn encode_v1(&self, out: &mut Vec<u8>) {
         out.reserve(FRAME_HEADER_LEN + self.payload.len());
-        out.push(self.frame_type.as_u8());
         let len = u32::try_from(self.payload.len()).expect("length fits in u32 by construction");
-        out.extend_from_slice(&len.to_le_bytes());
+        let len_bytes = len.to_le_bytes();
+        // Construct header on stack array and append in a single extend_from_slice call to eliminate multiple buffer pushes and slice bounds checks.
+        let header = [
+            self.frame_type.as_u8(),
+            len_bytes[0],
+            len_bytes[1],
+            len_bytes[2],
+            len_bytes[3],
+        ];
+        out.extend_from_slice(&header);
         out.extend_from_slice(&self.payload);
     }
 
@@ -242,8 +262,8 @@ impl Frame {
             return Ok(None);
         }
         let type_byte = buf[0];
-        let len_bytes: [u8; 4] = buf[1..5].try_into().expect("5..5 slice");
-        let length = u32::from_le_bytes(len_bytes) as usize;
+        // Decode length directly using index access to eliminate slice conversion overhead and slice bounds checks.
+        let length = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
 
         if length > MAX_PAYLOAD_LEN {
             return Err(Error::OversizedFrame {
@@ -282,10 +302,9 @@ impl Frame {
         }
         // buf[0] = version (already verified by caller)
         let type_byte = buf[1];
-        let id_bytes: [u8; 4] = buf[2..6].try_into().expect("2..6 slice");
-        let len_bytes: [u8; 4] = buf[6..10].try_into().expect("6..10 slice");
-        let request_id = u32::from_be_bytes(id_bytes);
-        let length = u32::from_be_bytes(len_bytes) as usize;
+        // Decode request_id and length directly using index access to eliminate slice conversion overhead and slice bounds checks.
+        let request_id = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        let length = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]) as usize;
 
         if length > MAX_PAYLOAD_LEN {
             return Err(Error::OversizedFrame {
