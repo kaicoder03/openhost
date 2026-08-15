@@ -184,6 +184,10 @@ fn build_ok_response(blob: &FileBlob) -> Response<Full<Bytes>> {
         HeaderValue::from_static("application/octet-stream"),
     );
     headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
         http::header::CONTENT_LENGTH,
         HeaderValue::from_str(&blob.bytes.len().to_string())
             .expect("numeric length is a valid header value"),
@@ -301,6 +305,24 @@ mod tests {
         assert!(!filename_val.contains('/'));
         assert!(!filename_val.contains(';'));
         assert!(!filename_val.contains(' '));
+    }
+
+    #[test]
+    fn ok_response_carries_nosniff_header() {
+        let blob = FileBlob {
+            bytes: Bytes::from_static(b"test"),
+            sha256: String::from(
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            ),
+            filename: "test.bin".to_owned(),
+            path: PathBuf::new(),
+        };
+        let resp = build_ok_response(&blob);
+        let nosniff = resp
+            .headers()
+            .get(http::header::X_CONTENT_TYPE_OPTIONS)
+            .expect("X-Content-Type-Options header present");
+        assert_eq!(nosniff.to_str().unwrap(), "nosniff");
     }
 
     #[tokio::test]
