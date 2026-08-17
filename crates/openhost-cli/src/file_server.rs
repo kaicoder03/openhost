@@ -212,6 +212,10 @@ fn build_ok_response(blob: &FileBlob) -> Response<Full<Bytes>> {
         FILE_SHA256_HEADER,
         HeaderValue::from_str(&blob.sha256).expect("hex is a valid header value"),
     );
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
@@ -304,7 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ok_response_carries_sha256_header() {
+    async fn ok_response_carries_sha256_and_nosniff_headers() {
         let blob = FileBlob {
             bytes: Bytes::from_static(b"abc"),
             sha256: String::from(
@@ -319,6 +323,8 @@ mod tests {
             sha.to_str().unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         );
+        let nosniff = resp.headers().get(http::header::X_CONTENT_TYPE_OPTIONS).unwrap();
+        assert_eq!(nosniff.to_str().unwrap(), "nosniff");
         let body = collect_body(resp).await;
         assert_eq!(body.as_ref(), b"abc");
     }
