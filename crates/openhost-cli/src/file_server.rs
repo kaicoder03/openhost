@@ -184,6 +184,10 @@ fn build_ok_response(blob: &FileBlob) -> Response<Full<Bytes>> {
         HeaderValue::from_static("application/octet-stream"),
     );
     headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
         http::header::CONTENT_LENGTH,
         HeaderValue::from_str(&blob.bytes.len().to_string())
             .expect("numeric length is a valid header value"),
@@ -319,6 +323,8 @@ mod tests {
             sha.to_str().unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         );
+        let nosniff = resp.headers().get(http::header::X_CONTENT_TYPE_OPTIONS).unwrap();
+        assert_eq!(nosniff.to_str().unwrap(), "nosniff");
         let body = collect_body(resp).await;
         assert_eq!(body.as_ref(), b"abc");
     }
