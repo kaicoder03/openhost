@@ -287,7 +287,11 @@ mod tests {
 
         let mut watcher =
             PairWatcher::spawn(&path, Duration::from_millis(50)).expect("watcher spawns");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Drain any residual events from initial file creation on noisy FS backends (e.g., macOS FSEvents)
+        while tokio::time::timeout(Duration::from_millis(150), watcher.recv())
+            .await
+            .is_ok()
+        {}
 
         fs::write(&sibling, b"unrelated").unwrap();
 

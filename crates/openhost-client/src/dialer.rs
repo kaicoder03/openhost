@@ -689,8 +689,7 @@ impl Drop for PeerConnectionGuard {
 }
 
 async fn send_frame(dc: &RTCDataChannel, frame: Frame) -> Result<()> {
-    let mut buf = Vec::with_capacity(5 + frame.payload.len());
-    frame.encode(&mut buf);
+    let buf = frame.encode_to_vec();
     dc.send(&Bytes::from(buf))
         .await
         .map_err(|e| ClientError::WebRtcSetup(format!("data channel send: {e}")))?;
