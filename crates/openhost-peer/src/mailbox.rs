@@ -36,7 +36,7 @@
 
 use crate::code::PairingCode;
 use crate::error::{PeerError, Result};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use hkdf::Hkdf;
@@ -123,15 +123,19 @@ impl MailboxKey {
     /// does not fail under normal use.
     pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.aead_key));
-        let mut nonce_bytes = [0u8; MAILBOX_NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+        // Allocate a single output buffer holding nonce + ciphertext + 16-byte Poly1305 tag.
+        // Single-pass in-place encryption eliminates intermediate heap allocations for ciphertext.
+        let mut out = Vec::with_capacity(MAILBOX_NONCE_LEN + plaintext.len() + 16);
+        out.extend_from_slice(&[0u8; MAILBOX_NONCE_LEN]);
+        rand::rngs::OsRng.fill_bytes(&mut out[..MAILBOX_NONCE_LEN]);
+        out.extend_from_slice(plaintext);
+
+        let (nonce_bytes, payload) = out.split_at_mut(MAILBOX_NONCE_LEN);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let tag = cipher
+            .encrypt_in_place_detached(nonce, b"", payload)
             .map_err(|_| PeerError::Crypto("seal"))?;
-        let mut out = Vec::with_capacity(MAILBOX_NONCE_LEN + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
-        out.extend_from_slice(&ciphertext);
+        out.extend_from_slice(tag.as_slice());
         Ok(out)
     }
 
