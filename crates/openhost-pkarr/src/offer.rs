@@ -1973,6 +1973,7 @@ pub const DTLS_FP_LEN: usize = 32;
 /// SDP byte-for-byte in the fields the peers actually consume.
 #[must_use]
 pub fn answer_blob_to_sdp(blob: &AnswerBlob, dtls_fp: &[u8; DTLS_FP_LEN]) -> String {
+    use core::fmt::Write as _;
     let fp_hex = colon_hex_upper(dtls_fp);
     let mut s = String::with_capacity(512);
     s.push_str("v=0\r\n");
@@ -1984,18 +1985,24 @@ pub fn answer_blob_to_sdp(blob: &AnswerBlob, dtls_fp: &[u8; DTLS_FP_LEN]) -> Str
     s.push_str("c=IN IP4 0.0.0.0\r\n");
     s.push_str("a=mid:0\r\n");
     s.push_str("a=rtcp-mux\r\n");
-    s.push_str(&format!("a=ice-ufrag:{}\r\n", blob.ice_ufrag));
-    s.push_str(&format!("a=ice-pwd:{}\r\n", blob.ice_pwd));
-    s.push_str(&format!("a=fingerprint:sha-256 {fp_hex}\r\n"));
-    s.push_str(&format!("a=setup:{}\r\n", blob.setup.as_sdp_str()));
-    s.push_str("a=sctp-port:5000\r\n");
+    // Write directly into `s` to avoid intermediate String allocations from `format!`
+    write!(
+        &mut s,
+        "a=ice-ufrag:{}\r\na=ice-pwd:{}\r\na=fingerprint:sha-256 {fp_hex}\r\na=setup:{}\r\na=sctp-port:5000\r\n",
+        blob.ice_ufrag,
+        blob.ice_pwd,
+        blob.setup.as_sdp_str(),
+    )
+    .expect("writing into String never fails");
     for cand in &blob.candidates {
-        s.push_str(&format!(
+        write!(
+            &mut s,
             "a=candidate:1 1 udp 1 {ip} {port} typ {typ} generation 0\r\n",
             ip = cand.ip,
             port = cand.port,
             typ = cand.typ.as_sdp_str(),
-        ));
+        )
+        .expect("writing into String never fails");
     }
     s.push_str("a=end-of-candidates\r\n");
     s
@@ -2168,6 +2175,7 @@ fn parse_sdp_candidate_line(rest: &str) -> Option<BlobCandidate> {
 /// no persistent pkarr record to pin it to).
 #[must_use]
 pub fn offer_blob_to_sdp(blob: &OfferBlob) -> String {
+    use core::fmt::Write as _;
     let fp_hex = colon_hex_upper(&blob.client_dtls_fp);
     let mut s = String::with_capacity(512);
     s.push_str("v=0\r\n");
@@ -2179,18 +2187,24 @@ pub fn offer_blob_to_sdp(blob: &OfferBlob) -> String {
     s.push_str("c=IN IP4 0.0.0.0\r\n");
     s.push_str("a=mid:0\r\n");
     s.push_str("a=rtcp-mux\r\n");
-    s.push_str(&format!("a=ice-ufrag:{}\r\n", blob.ice_ufrag));
-    s.push_str(&format!("a=ice-pwd:{}\r\n", blob.ice_pwd));
-    s.push_str(&format!("a=fingerprint:sha-256 {fp_hex}\r\n"));
-    s.push_str(&format!("a=setup:{}\r\n", blob.setup.as_sdp_str()));
-    s.push_str("a=sctp-port:5000\r\n");
+    // Write directly into `s` to avoid intermediate String allocations from `format!`
+    write!(
+        &mut s,
+        "a=ice-ufrag:{}\r\na=ice-pwd:{}\r\na=fingerprint:sha-256 {fp_hex}\r\na=setup:{}\r\na=sctp-port:5000\r\n",
+        blob.ice_ufrag,
+        blob.ice_pwd,
+        blob.setup.as_sdp_str(),
+    )
+    .expect("writing into String never fails");
     for cand in &blob.candidates {
-        s.push_str(&format!(
+        write!(
+            &mut s,
             "a=candidate:1 1 udp 1 {ip} {port} typ {typ} generation 0\r\n",
             ip = cand.ip,
             port = cand.port,
             typ = cand.typ.as_sdp_str(),
-        ));
+        )
+        .expect("writing into String never fails");
     }
     s.push_str("a=end-of-candidates\r\n");
     s
