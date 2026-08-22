@@ -864,7 +864,10 @@ mod tests {
             websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
-        assert_eq!(fwd.host_override, HeaderValue::from_static("127.0.0.1:8080"));
+        assert_eq!(
+            fwd.host_override,
+            HeaderValue::from_static("127.0.0.1:8080")
+        );
     }
 
     #[test]
@@ -876,7 +879,10 @@ mod tests {
             websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
-        assert_eq!(fwd.host_override, HeaderValue::from_static("my-service.local"));
+        assert_eq!(
+            fwd.host_override,
+            HeaderValue::from_static("my-service.local")
+        );
     }
 
     // --- combine_target_and_path ------------------------------------
