@@ -105,8 +105,8 @@ pub enum ForwardOutcome {
 pub struct Forwarder {
     /// Upstream origin; scheme is guaranteed `http`.
     target: Uri,
-    /// Value the outbound `Host` header is pinned to.
-    host_override: String,
+    /// Pre-parsed value the outbound `Host` header is pinned to.
+    host_override: HeaderValue,
     /// Shared hyper client. Cloneable; we never hold it across requests
     /// so the internal connection pool is the only piece of state that
     /// lives between calls.
@@ -141,10 +141,15 @@ impl Forwarder {
             .ok_or_else(|| ForwardError::TargetParse("target is missing an authority".into()))?
             .to_string();
 
-        let host_override = cfg
+        let host_str = cfg
             .host_override
             .clone()
             .unwrap_or_else(|| authority.clone());
+
+        // Pre-parse host_override into a HeaderValue so we don't re-parse and validate it on every request.
+        let host_override = HeaderValue::from_str(&host_str).map_err(|_| {
+            ForwardError::HeadParse("configured host_override is not a valid header value")
+        })?;
 
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
@@ -403,7 +408,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
 /// before this runs.
 fn sanitize_request_headers(
     headers: &mut HeaderMap,
-    host_override: &str,
+    host_override: &HeaderValue,
 ) -> Result<(), ForwardError> {
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
@@ -412,10 +417,7 @@ fn sanitize_request_headers(
         headers.remove(*name);
     }
 
-    let host_value = HeaderValue::from_str(host_override).map_err(|_| {
-        ForwardError::HeadParse("configured host_override is not a valid header value")
-    })?;
-    headers.insert(http::header::HOST, host_value);
+    headers.insert(http::header::HOST, host_override.clone());
 
     Ok(())
 }
@@ -427,7 +429,7 @@ fn sanitize_request_headers(
 /// through unchanged (Key, Version, Protocol, Extensions).
 fn sanitize_websocket_request_headers(
     headers: &mut HeaderMap,
-    host_override: &str,
+    host_override: &HeaderValue,
 ) -> Result<(), ForwardError> {
     for name in HOP_BY_HOP_HEADERS {
         if *name == "connection" || *name == "upgrade" {
@@ -438,10 +440,7 @@ fn sanitize_websocket_request_headers(
     for name in PROVENANCE_HEADERS {
         headers.remove(*name);
     }
-    let host_value = HeaderValue::from_str(host_override).map_err(|_| {
-        ForwardError::HeadParse("configured host_override is not a valid header value")
-    })?;
-    headers.insert(http::header::HOST, host_value);
+    headers.insert(http::header::HOST, host_override.clone());
     Ok(())
 }
 
@@ -602,7 +601,8 @@ mod tests {
     #[test]
     fn sanitize_strips_all_hop_by_hop_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let host = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &host).unwrap();
         for name in HOP_BY_HOP_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -614,7 +614,8 @@ mod tests {
     #[test]
     fn sanitize_strips_all_provenance_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let host = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &host).unwrap();
         for name in PROVENANCE_HEADERS {
             assert!(
                 !h.contains_key(*name),
@@ -626,7 +627,8 @@ mod tests {
     #[test]
     fn sanitize_preserves_benign_headers() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let host = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &host).unwrap();
         assert_eq!(
             h.get("x-custom").map(|v| v.to_str().unwrap()),
             Some("keep-me")
@@ -636,7 +638,8 @@ mod tests {
     #[test]
     fn sanitize_pins_host() {
         let mut h = fresh_headers();
-        sanitize_request_headers(&mut h, "127.0.0.1:8080").unwrap();
+        let host = HeaderValue::from_static("127.0.0.1:8080");
+        sanitize_request_headers(&mut h, &host).unwrap();
         assert_eq!(
             h.get(http::header::HOST).map(|v| v.to_str().unwrap()),
             Some("127.0.0.1:8080"),
@@ -654,8 +657,9 @@ mod tests {
         // classifier), the header is stripped as hop-by-hop per
         // RFC 7230 §6.1. The upstream never sees it.
         let mut h = HeaderMap::new();
+        let host = HeaderValue::from_static("x");
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
-        sanitize_request_headers(&mut h, "x").unwrap();
+        sanitize_request_headers(&mut h, &host).unwrap();
         assert!(!h.contains_key(http::header::UPGRADE));
     }
 
@@ -690,6 +694,7 @@ mod tests {
     #[test]
     fn sanitize_websocket_preserves_connection_and_upgrade() {
         let mut h = HeaderMap::new();
+        let host = HeaderValue::from_static("upstream.local");
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
         h.insert(
             http::header::CONNECTION,
@@ -703,7 +708,7 @@ mod tests {
             HeaderName::from_static("sec-websocket-version"),
             HeaderValue::from_static("13"),
         );
-        sanitize_websocket_request_headers(&mut h, "upstream.local").unwrap();
+        sanitize_websocket_request_headers(&mut h, &host).unwrap();
         assert!(h.contains_key(http::header::UPGRADE));
         assert!(h.contains_key(http::header::CONNECTION));
         assert!(h.contains_key("sec-websocket-key"));
@@ -717,6 +722,7 @@ mod tests {
     #[test]
     fn sanitize_websocket_still_strips_other_hop_by_hop() {
         let mut h = HeaderMap::new();
+        let host = HeaderValue::from_static("x");
         h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
         h.insert(
             http::header::CONNECTION,
@@ -727,7 +733,7 @@ mod tests {
             http::header::TRANSFER_ENCODING,
             HeaderValue::from_static("chunked"),
         );
-        sanitize_websocket_request_headers(&mut h, "x").unwrap();
+        sanitize_websocket_request_headers(&mut h, &host).unwrap();
         assert!(!h.contains_key(http::header::TE));
         assert!(!h.contains_key(http::header::TRANSFER_ENCODING));
     }
@@ -739,8 +745,9 @@ mod tests {
         // either, but don't treat it as a websocket-specific rejection —
         // just strip it as hop-by-hop so the upstream never sees it.
         let mut h = HeaderMap::new();
+        let host = HeaderValue::from_static("x");
         h.insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
-        sanitize_request_headers(&mut h, "x").unwrap();
+        sanitize_request_headers(&mut h, &host).unwrap();
         assert!(!h.contains_key(http::header::UPGRADE));
     }
 
@@ -857,7 +864,7 @@ mod tests {
             websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
-        assert_eq!(fwd.host_override, "127.0.0.1:8080");
+        assert_eq!(fwd.host_override, HeaderValue::from_static("127.0.0.1:8080"));
     }
 
     #[test]
@@ -869,7 +876,7 @@ mod tests {
             websockets: None,
         };
         let fwd = Forwarder::from_config(&cfg).unwrap().unwrap();
-        assert_eq!(fwd.host_override, "my-service.local");
+        assert_eq!(fwd.host_override, HeaderValue::from_static("my-service.local"));
     }
 
     // --- combine_target_and_path ------------------------------------
