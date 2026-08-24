@@ -383,9 +383,16 @@ fn parse_request_head(bytes: &[u8]) -> Result<(Method, String, HeaderMap), Forwa
         let colon = line
             .find(':')
             .ok_or(ForwardError::HeadParse("header line missing ':'"))?;
-        let name = line[..colon].trim();
-        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value.
-        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let name_raw = &line[..colon];
+        // RFC 7230 §3.2.4: No whitespace is allowed between the header field name and colon, or before the header field name.
+        if name_raw.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
+            return Err(ForwardError::HeadParse(
+                "whitespace surrounding header name is forbidden",
+            ));
+        }
+        let name = name_raw;
+        // RFC 7230 §3.2.4: `OWS = *( SP / HTAB )` between `:` and the value and trailing value.
+        let value = line[colon + 1..].trim_matches([' ', '\t']);
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| ForwardError::HeadParse("invalid header name"))?;
         let header_value = HeaderValue::from_str(value)
@@ -761,6 +768,17 @@ mod tests {
         let raw = b"GET / HTTP/1.0\r\n\r\n";
         let err = parse_request_head(raw).unwrap_err();
         assert!(matches!(err, ForwardError::HeadParse(_)));
+    }
+
+    #[test]
+    fn parse_request_head_rejects_whitespace_surrounding_header_name() {
+        let raw = b"GET / HTTP/1.1\r\nHost : example.com\r\n\r\n";
+        let err = parse_request_head(raw).unwrap_err();
+        assert!(matches!(err, ForwardError::HeadParse(_)));
+
+        let raw_leading = b"GET / HTTP/1.1\r\n Host: example.com\r\n\r\n";
+        let err_leading = parse_request_head(raw_leading).unwrap_err();
+        assert!(matches!(err_leading, ForwardError::HeadParse(_)));
     }
 
     #[test]
