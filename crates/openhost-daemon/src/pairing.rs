@@ -161,6 +161,7 @@ pub fn load(path: &Path) -> Result<PairingDb, PairingError> {
 /// Atomically overwrite the DB at `path`. On Unix the final file mode
 /// is 0600; on Windows the parent directory's ACL applies.
 pub fn save_atomic(path: &Path, db: &PairingDb) -> Result<(), PairingError> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -168,14 +169,17 @@ pub fn save_atomic(path: &Path, db: &PairingDb) -> Result<(), PairingError> {
     }
     let body = toml::to_string_pretty(db)?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, body.as_bytes())?;
-
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&tmp, perms)?;
+        #[allow(unused_imports)]
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut f = options.open(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.flush()?;
 
     std::fs::rename(&tmp, path)?;
     Ok(())
