@@ -212,6 +212,10 @@ fn build_ok_response(blob: &FileBlob) -> Response<Full<Bytes>> {
         FILE_SHA256_HEADER,
         HeaderValue::from_str(&blob.sha256).expect("hex is a valid header value"),
     );
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
@@ -321,5 +325,18 @@ mod tests {
         );
         let body = collect_body(resp).await;
         assert_eq!(body.as_ref(), b"abc");
+    }
+
+    #[test]
+    fn ok_response_carries_nosniff_header() {
+        let blob = FileBlob {
+            bytes: Bytes::from_static(b"abc"),
+            sha256: String::from("0"),
+            filename: "abc.txt".to_owned(),
+            path: PathBuf::new(),
+        };
+        let resp = build_ok_response(&blob);
+        let nosniff = resp.headers().get(http::header::X_CONTENT_TYPE_OPTIONS);
+        assert_eq!(nosniff.and_then(|v| v.to_str().ok()), Some("nosniff"));
     }
 }
