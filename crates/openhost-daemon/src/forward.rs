@@ -462,7 +462,12 @@ fn encode_websocket_response_head(
     }
     let reason = status.canonical_reason().unwrap_or("Switching Protocols");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // Optimize: avoid intermediate `format!` allocation by extending raw byte slices.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(status.as_str().as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
@@ -517,14 +522,21 @@ fn encode_response_head(
     // might have sent `Transfer-Encoding: chunked` (now stripped);
     // without an accurate Content-Length the openhost client can't
     // frame-split the response stream.
+    //
+    // Optimize: HeaderValue::from(u64) constructs ASCII digits without String allocation.
     headers.insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).expect("body_len is ASCII digits"),
+        HeaderValue::from(body_len as u64),
     );
 
     let reason = status.canonical_reason().unwrap_or("Unknown");
     let mut out = Vec::with_capacity(128 + headers.len() * 64);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+    // Optimize: avoid intermediate `format!` allocation by extending raw byte slices.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(status.as_str().as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
     for (name, value) in &headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
