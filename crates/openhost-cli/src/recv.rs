@@ -88,6 +88,10 @@ pub async fn run(code_str: &str, out: Option<PathBuf>) -> Result<()> {
     let filename_hint = filename_from_content_disposition(&headers);
     let expected_sha = sha256_header(&headers);
 
+    // Verify payload SHA-256 before writing to disk to prevent saving
+    // untrusted or corrupted data to the filesystem.
+    verify_sha256(&resp.body, expected_sha.as_deref())?;
+
     let out_path = match out {
         Some(p) => p,
         None => PathBuf::from(filename_hint.as_deref().unwrap_or("openhost-transfer.bin")),
@@ -96,23 +100,6 @@ pub async fn run(code_str: &str, out: Option<PathBuf>) -> Result<()> {
     tokio::fs::write(&out_path, &resp.body)
         .await
         .with_context(|| format!("write {}", out_path.display()))?;
-
-    if let Some(want) = expected_sha.as_deref() {
-        let got = hex::encode({
-            let mut h = Sha256::new();
-            h.update(&resp.body);
-            h.finalize()
-        });
-        if got.eq_ignore_ascii_case(want) {
-            eprintln!("oh recv: sha256 OK ({})", &got[..16]);
-        } else {
-            anyhow::bail!(
-                "sha256 mismatch: expected {}, got {}; file NOT saved at expected integrity",
-                want,
-                got,
-            );
-        }
-    }
 
     eprintln!(
         "oh recv: saved {} ({} bytes) from oh://{}/",
@@ -186,6 +173,26 @@ fn sha256_header(headers: &[(String, String)]) -> Option<String> {
         .iter()
         .find(|(k, _)| k == "x-openhost-file-sha256")
         .map(|(_, v)| v.clone())
+}
+
+/// Verify payload SHA-256 against expected hash. Errors immediately if
+/// the hash mismatches so unverified payload bytes are never saved to disk.
+fn verify_sha256(body: &[u8], expected_sha: Option<&str>) -> Result<()> {
+    if let Some(want) = expected_sha {
+        let got = hex::encode({
+            let mut h = Sha256::new();
+            h.update(body);
+            h.finalize()
+        });
+        if got.eq_ignore_ascii_case(want) {
+            eprintln!("oh recv: sha256 OK ({})", &got[..16]);
+        } else {
+            anyhow::bail!(
+                "sha256 mismatch: expected {want}, got {got}; file was NOT saved due to integrity failure",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Strip directory traversal + shell metacharacters from an
@@ -304,6 +311,28 @@ mod tests {
     fn sha256_header_roundtrip() {
         let hs = vec![hdr("x-openhost-file-sha256", "abc123")];
         assert_eq!(sha256_header(&hs).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn verify_sha256_accepts_matching_hash() {
+        let payload = b"hello world";
+        let valid_hash = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(verify_sha256(payload, Some(valid_hash)).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_rejects_mismatched_hash() {
+        let payload = b"hello world";
+        let invalid_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_sha256(payload, Some(invalid_hash)).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"));
+        assert!(err.to_string().contains("file was NOT saved"));
+    }
+
+    #[test]
+    fn verify_sha256_none_succeeds() {
+        let payload = b"hello world";
+        assert!(verify_sha256(payload, None).is_ok());
     }
 
     #[test]
