@@ -1106,9 +1106,7 @@ pub fn decode_answer_fragments_from_packet(
     let mut count = 0usize;
 
     for rr in packet.all_resource_records() {
-        let first_label = rr.name
-            .get_labels()
-            .first();
+        let first_label = rr.name.get_labels().first();
 
         let label_str = match first_label {
             Some(label) => core::str::from_utf8(label.as_ref()).unwrap_or(""),
@@ -1172,8 +1170,8 @@ pub fn decode_answer_fragments_from_packet(
     }
 
     let mut total_payload_len = 0usize;
-    for i in 0..total as usize {
-        let Some(frag) = &buckets[i] else {
+    for frag_slot in buckets.iter().take(total as usize) {
+        let Some(frag) = frag_slot else {
             return Err(PkarrError::MalformedCanonical(
                 "answer fragment set is missing an idx",
             ));
@@ -1182,8 +1180,8 @@ pub fn decode_answer_fragments_from_packet(
     }
 
     let mut sealed = Vec::with_capacity(total_payload_len);
-    for i in 0..total as usize {
-        let frag = buckets[i].take().expect("verified present above");
+    for frag_slot in buckets.iter_mut().take(total as usize) {
+        let frag = frag_slot.take().expect("verified present above");
         sealed.extend_from_slice(&frag.payload);
     }
 
