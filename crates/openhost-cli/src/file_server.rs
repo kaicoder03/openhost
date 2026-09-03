@@ -163,6 +163,7 @@ async fn handle(
     if req.method() != Method::GET || req.uri().path() != "/" {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
+            .header(http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
             .body(Full::new(Bytes::from_static(b"not found")))
             .expect("static 404 builder is infallible"));
     }
@@ -179,6 +180,10 @@ async fn handle(
 fn build_ok_response(blob: &FileBlob) -> Response<Full<Bytes>> {
     let mut resp = Response::new(Full::new(blob.bytes.clone()));
     let headers: &mut HeaderMap = resp.headers_mut();
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     headers.insert(
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
@@ -321,5 +326,47 @@ mod tests {
         );
         let body = collect_body(resp).await;
         assert_eq!(body.as_ref(), b"abc");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ok_response_carries_nosniff_header() {
+        let tmp = write_temp(b"test content").await;
+        let (server, _served) = FileServer::spawn(tmp.path()).await.unwrap();
+
+        // Check 200 OK
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&buf);
+        assert!(
+            resp_str
+                .to_ascii_lowercase()
+                .contains("x-content-type-options: nosniff"),
+            "200 OK response missing x-content-type-options: nosniff header"
+        );
+
+        // Check 404
+        let mut stream404 = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
+            .await
+            .unwrap();
+        stream404
+            .write_all(b"GET /notfound HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf404 = Vec::new();
+        stream404.read_to_end(&mut buf404).await.unwrap();
+        let resp404_str = String::from_utf8_lossy(&buf404);
+        assert!(
+            resp404_str
+                .to_ascii_lowercase()
+                .contains("x-content-type-options: nosniff"),
+            "404 response missing x-content-type-options: nosniff header"
+        );
     }
 }
